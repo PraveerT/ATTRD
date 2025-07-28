@@ -47,5 +47,4 @@ model_args:
   pts_size: *frame_pts_size
   num_classes: 28
   knn: [16, 24, 48, 12]
-  offsets: False
   topk: 16

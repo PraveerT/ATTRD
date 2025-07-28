@@ -4,11 +4,73 @@ import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
 from models.op import MLPBlock, MotionBlock, GroupOperation
-from models.pointlstm import PointLSTM
+
+# Use installed mamba_ssm for optimal performance
+from mamba_ssm.modules.mamba_simple import Mamba
+
+
+class MambaTemporalEncoder(nn.Module):
+    """Mamba-based temporal encoder for point cloud sequences"""
+    def __init__(self, in_channels, hidden_dim, output_dim=None, num_layers=2, drop_path=0.1):
+        super().__init__()
+        self.in_channels = in_channels
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim if output_dim is not None else hidden_dim
+        
+        # Input projection
+        self.input_proj = nn.Linear(in_channels, hidden_dim)
+        
+        # Mamba blocks - using direct Mamba layers instead of Block wrapper
+        self.mamba_layers = nn.ModuleList([
+            Mamba(
+                d_model=hidden_dim,
+                d_state=16,
+                d_conv=4,
+                expand=2,
+            )
+            for _ in range(num_layers)
+        ])
+        
+        # Layer norms for each block
+        self.norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
+        
+        # Dropout for regularization
+        self.dropout = nn.Dropout(drop_path)
+        
+        # Output projection
+        self.output_proj = nn.Linear(hidden_dim, self.output_dim)
+        self.final_norm = nn.LayerNorm(hidden_dim)
+        
+    def forward(self, x):
+        # x shape: B, C, T, N
+        B, C, T, N = x.shape
+        
+        # Reshape to B*N, T, C for temporal processing
+        x = x.permute(0, 3, 2, 1).reshape(B * N, T, C)
+        
+        # Project to hidden dimension
+        x = self.input_proj(x)
+        
+        # Apply Mamba layers with residual connections
+        for i, (mamba, norm) in enumerate(zip(self.mamba_layers, self.norms)):
+            residual = x
+            x = norm(x)
+            x = mamba(x)
+            x = self.dropout(x)
+            x = x + residual
+            
+        # Output projection and normalization
+        x = self.final_norm(x)
+        x = self.output_proj(x)
+        
+        # Reshape back to B, output_dim, T, N
+        x = x.reshape(B, N, T, self.output_dim).permute(0, 3, 2, 1)
+        
+        return x
 
 
 class Motion(nn.Module):
-    def __init__(self, num_classes, pts_size, offsets, topk=16, downsample=(2, 2, 2),
+    def __init__(self, num_classes, pts_size, topk=16, downsample=(2, 2, 2),
                  knn=(16, 48, 48, 24)):
         super(Motion, self).__init__()
         self.stage1 = MLPBlock([4, 32, 64], 2)
@@ -28,8 +90,9 @@ class Motion(nn.Module):
         self.downsample = downsample
         self.num_classes = num_classes
         self.group = GroupOperation()
-        self.lstm = PointLSTM(offsets=offsets, pts_num=pts_size // downsample[0], in_channels=132, hidden_dim=256,
-                              offset_dim=4, num_layers=1, topk=topk)
+        # Replace LSTM with Mamba temporal encoder
+        # Process features from stage3 (256 channels) with temporal modeling
+        self.mamba = MambaTemporalEncoder(in_channels=256, hidden_dim=256, output_dim=256, num_layers=2, drop_path=0.1)
 
     def forward(self, inputs):
         # B * T * N * D,  e.g. 16 * 32 * 512 * 4
@@ -63,15 +126,17 @@ class Motion(nn.Module):
         fea2 = self.pool2(self.stage2(ret_array2)).view(batchsize, -1, timestep, pts_num)
         fea2 = torch.cat((inputs, fea2), dim=1)
 
-        # stage 3: inter-frame, middle, applying lstm in this stage
+        # stage 3: inter-frame, middle, applying mamba in this stage
         in_dims = fea2.shape[1] * 2 - 4
         pts_num //= self.downsample[1]
-        output = self.lstm(fea2.permute(0, 2, 1, 3))
-        fea3 = output[0][0].squeeze(-1).permute(0, 2, 1, 3)
         ret_group_array3 = self.group.st_group_points(fea2, 3, [0, 1, 2], self.knn[2], 3)
         ret_array3, inputs, ind = self.select_ind(ret_group_array3, inputs,
                                                   batchsize, in_dims, timestep, pts_num)
-        fea3 = fea3.gather(-1, ind.unsqueeze(1).expand(-1, fea3.shape[1], -1, -1))
+        fea3 = self.pool3(self.stage3(ret_array3)).view(batchsize, -1, timestep, pts_num)
+        # Apply Mamba temporal modeling after spatial processing
+        fea3_mamba = self.mamba(fea3)
+        # Concatenate with inputs for next stage
+        fea3 = torch.cat((inputs, fea3_mamba), dim=1)
 
         # stage 4: inter-frame, late
         in_dims = fea3.shape[1] * 2 - 4
