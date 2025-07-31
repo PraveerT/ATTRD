@@ -45,6 +45,6 @@ test_loader_args:
 model: models.motion.Motion
 model_args:
   pts_size: *frame_pts_size
-  num_classes: 28
+  num_classes: 25
   knn: [16, 24, 48, 12]
   topk: 16
