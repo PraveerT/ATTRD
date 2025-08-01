@@ -52,47 +52,154 @@ class MLPBlock(nn.Module):
 class MotionBlock(nn.Module):
     def __init__(self, out_channel, dimension, embedding_dim):
         super(MotionBlock, self).__init__()
+        self.embedding_dim = embedding_dim
+        self.out_channels = out_channel  
+        self.dimension = dimension
+        
+        # Build layers similar to original but with improvements
         self.layer_list = []
+        
         if dimension == 1:
+            # Position embedding layer (processes full input)
             self.layer_list.append(
                 nn.Sequential(
                     nn.Conv1d(embedding_dim, out_channel[-1], kernel_size=1),
                     nn.BatchNorm1d(out_channel[-1]),
-                    nn.ReLU(inplace=True),
+                    nn.GELU(),  # GELU instead of ReLU
                 )
             )
+            # Feature processing layers
             for idx, channels in enumerate(out_channel[:-1]):
                 self.layer_list.append(
                     nn.Sequential(
                         nn.Conv1d(channels, out_channel[idx + 1], kernel_size=1),
                         nn.BatchNorm1d(out_channel[idx + 1]),
-                        nn.ReLU(inplace=True),
+                        nn.GELU(),
                     )
                 )
         elif dimension == 2:
+            # Position embedding layer (processes full input)  
             self.layer_list.append(
                 nn.Sequential(
                     nn.Conv2d(embedding_dim, out_channel[-1], kernel_size=(1, 1)),
                     nn.BatchNorm2d(out_channel[-1]),
-                    nn.ReLU(inplace=True),
+                    nn.GELU(),  # GELU instead of ReLU
                 )
             )
+            # Feature processing layers
             for idx, channels in enumerate(out_channel[:-1]):
                 self.layer_list.append(
                     nn.Sequential(
                         nn.Conv2d(channels, out_channel[idx + 1], kernel_size=(1, 1)),
                         nn.BatchNorm2d(out_channel[idx + 1]),
-                        nn.ReLU(inplace=True),
+                        nn.GELU(),
                     )
                 )
+        
         self.layer_list = nn.ModuleList(self.layer_list)
+        
+        # Enhanced fusion mechanism
+        self.fusion_gate = nn.Parameter(torch.ones(1) * 0.5)  # Learnable gating
+        
+        # Attention mechanism for better feature interaction
+        self.attention = SpatialAttention(out_channel[-1], dimension) if len(out_channel) > 1 else None
+
+    def _build_branch(self, in_channels, out_channels, dimension):
+        """Build improved position encoding branch"""
+        if dimension == 2:
+            return nn.Sequential(
+                nn.Conv2d(in_channels, out_channels // 2, kernel_size=(1, 1)),
+                nn.BatchNorm2d(out_channels // 2),
+                nn.GELU(),
+                nn.Conv2d(out_channels // 2, out_channels, kernel_size=(1, 1)),
+                nn.BatchNorm2d(out_channels),
+                nn.GELU()
+            )
+        else:
+            return nn.Sequential(
+                nn.Conv1d(in_channels, out_channels // 2, kernel_size=1),
+                nn.BatchNorm1d(out_channels // 2),
+                nn.GELU(),
+                nn.Conv1d(out_channels // 2, out_channels, kernel_size=1),
+                nn.BatchNorm1d(out_channels),
+                nn.GELU()
+            )
 
     def forward(self, output):
+        # Position embedding from the first 4 channels (x, y, z, t)
         position_embedding = self.layer_list[0](output[:, :4])
-        feature_embedding = output[:, 4:]
-        for layer in self.layer_list[1:]:
+        
+        # Feature embedding from the remaining channels
+        feature_embedding = output[:, 4:] if output.size(1) > 4 else position_embedding
+        
+        # Process features through remaining layers with residual connections
+        for i, layer in enumerate(self.layer_list[1:], 1):
+            residual = feature_embedding
             feature_embedding = layer(feature_embedding)
-        return position_embedding * feature_embedding
+            
+            # Add residual connection if dimensions match (improved gradient flow)
+            if residual.shape == feature_embedding.shape and i > 1:
+                feature_embedding = feature_embedding + 0.1 * residual  # Scaled residual
+        
+        # Apply attention mechanism if available
+        if self.attention is not None:
+            feature_embedding = self.attention(feature_embedding, position_embedding)
+        
+        # Enhanced fusion with learnable gating instead of simple multiplication
+        if self.fusion_gate is not None:
+            # Learnable combination: α * (pos * feat) + (1-α) * (pos + feat) 
+            multiplicative = position_embedding * feature_embedding
+            additive = position_embedding + feature_embedding
+            output = self.fusion_gate * multiplicative + (1 - self.fusion_gate) * additive
+        else:
+            # Fallback to original multiplication
+            output = position_embedding * feature_embedding
+        
+        return output
+
+
+class SpatialAttention(nn.Module):
+    """Lightweight attention mechanism for position-feature interaction"""
+    def __init__(self, channels, dimension):
+        super().__init__()
+        self.channels = channels
+        self.dimension = dimension
+        
+        # Simplified channel attention instead of spatial attention to save memory
+        if dimension == 2:
+            self.channel_attention = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(channels, channels // 4, kernel_size=1),
+                nn.GELU(),
+                nn.Conv2d(channels // 4, channels, kernel_size=1),
+                nn.Sigmoid()
+            )
+        else:
+            self.channel_attention = nn.Sequential(
+                nn.AdaptiveAvgPool1d(1), 
+                nn.Conv1d(channels, channels // 4, kernel_size=1),
+                nn.GELU(),
+                nn.Conv1d(channels // 4, channels, kernel_size=1),
+                nn.Sigmoid()
+            )
+            
+        self.gamma = nn.Parameter(torch.zeros(1))
+        
+    def forward(self, features, positions):
+        """
+        Lightweight channel attention instead of expensive spatial attention
+        """
+        # Combine features and positions for richer representation
+        combined = features + positions
+        
+        # Apply channel attention to the combined features
+        attention_weights = self.channel_attention(combined)
+        attended_features = features * attention_weights
+        
+        # Apply learnable scaling and residual connection
+        output = self.gamma * attended_features + features
+        
+        return output
 
 
 class GroupOperation(object):
