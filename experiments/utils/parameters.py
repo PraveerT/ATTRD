@@ -133,4 +133,23 @@ def get_parser():
         type=int,
         default=200,
         help='stop training in which epoch')
+    
+    # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+    # soft label / knowledge distillation
+    parser.add_argument(
+        '--use_soft_labels',
+        type=str2bool,
+        default=False,
+        help='use soft labels for knowledge distillation')
+    parser.add_argument(
+        '--temperature',
+        type=float,
+        default=3.0,
+        help='temperature for softmax scaling in knowledge distillation')
+    parser.add_argument(
+        '--alpha',
+        type=float,
+        default=0.7,
+        help='weight for soft label loss (0.0-1.0)')
+    
     return parser

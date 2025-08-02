@@ -8,6 +8,7 @@ import torch
 import random
 import numpy as np
 import torch.nn as nn
+from tqdm import tqdm
 
 sys.path.append("../..")
 from utils import get_parser, import_class, GpuDataParallel, Optimizer, Recorder, Stat, RandomState
@@ -36,9 +37,16 @@ class Processor():
         self.recoder.print_log('Training epoch: {}'.format(epoch + 1))
         loader = self.data_loader['train']
         loss_value = []
+        correct = 0
+        total = 0
         self.recoder.timer_reset()
         current_learning_rate = [group['lr'] for group in self.optimizer.optimizer.param_groups]
-        for batch_idx, data in enumerate(loader):
+        
+        # Add progress bar for training batches
+        loader_with_progress = tqdm(enumerate(loader), total=len(loader), 
+                                   desc=f"Epoch {epoch+1}", leave=False)
+        
+        for batch_idx, data in loader_with_progress:
             self.recoder.record_timer("dataloader")
             image = self.device.data_to_device(data[0])
             label = self.device.data_to_device(data[1])
@@ -51,6 +59,20 @@ class Processor():
             self.optimizer.step()
             self.recoder.record_timer("backward")
             loss_value.append(loss.item())
+            
+            # Calculate accuracy
+            pred = output.argmax(dim=1, keepdim=True)
+            correct += pred.eq(label.view_as(pred)).sum().item()
+            total += label.size(0)
+            current_acc = 100. * correct / total
+            
+            # Update progress bar
+            loader_with_progress.set_postfix({
+                'Loss': f'{loss.item():.4f}',
+                'Acc': f'{current_acc:.2f}%',
+                'LR': f'{current_learning_rate[0]:.6f}'
+            })
+            
             if batch_idx % self.arg.log_interval == 0:
                 # self.viz.append_loss(epoch * len(loader) + batch_idx, loss.item())
                 self.recoder.print_log(
