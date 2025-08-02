@@ -6,9 +6,18 @@ import torch.nn.functional as F
 
 
 class MLPBlock(nn.Module):
-    def __init__(self, out_channel, dimension, with_bn=True):
+    def __init__(self, out_channel, dimension, with_bn=True, activation='gelu'):
         super(MLPBlock, self).__init__()
         self.layer_list = []
+        
+        # Select activation function
+        if activation == 'gelu':
+            act_fn = nn.GELU()
+        elif activation == 'relu':
+            act_fn = nn.ReLU(inplace=True)
+        else:
+            act_fn = nn.ReLU(inplace=True)
+        
         if dimension == 1:
             for idx, channels in enumerate(out_channel[:-1]):
                 if with_bn:
@@ -16,7 +25,7 @@ class MLPBlock(nn.Module):
                         nn.Sequential(
                             nn.Conv1d(channels, out_channel[idx + 1], kernel_size=1),
                             nn.BatchNorm1d(out_channel[idx + 1]),
-                            nn.ReLU(inplace=True),
+                            act_fn,
                         )
                     )
                 else:
@@ -32,7 +41,7 @@ class MLPBlock(nn.Module):
                         nn.Sequential(
                             nn.Conv2d(channels, out_channel[idx + 1], kernel_size=(1, 1)),
                             nn.BatchNorm2d(out_channel[idx + 1]),
-                            nn.ReLU(inplace=True),
+                            act_fn,
                         )
                     )
                 else:
@@ -58,7 +67,7 @@ class MotionBlock(nn.Module):
                 nn.Sequential(
                     nn.Conv1d(embedding_dim, out_channel[-1], kernel_size=1),
                     nn.BatchNorm1d(out_channel[-1]),
-                    nn.ReLU(inplace=True),
+                    nn.GELU(),
                 )
             )
             for idx, channels in enumerate(out_channel[:-1]):
@@ -66,7 +75,7 @@ class MotionBlock(nn.Module):
                     nn.Sequential(
                         nn.Conv1d(channels, out_channel[idx + 1], kernel_size=1),
                         nn.BatchNorm1d(out_channel[idx + 1]),
-                        nn.ReLU(inplace=True),
+                        nn.GELU(),
                     )
                 )
         elif dimension == 2:
@@ -74,7 +83,7 @@ class MotionBlock(nn.Module):
                 nn.Sequential(
                     nn.Conv2d(embedding_dim, out_channel[-1], kernel_size=(1, 1)),
                     nn.BatchNorm2d(out_channel[-1]),
-                    nn.ReLU(inplace=True),
+                    nn.GELU(),
                 )
             )
             for idx, channels in enumerate(out_channel[:-1]):
@@ -82,18 +91,54 @@ class MotionBlock(nn.Module):
                     nn.Sequential(
                         nn.Conv2d(channels, out_channel[idx + 1], kernel_size=(1, 1)),
                         nn.BatchNorm2d(out_channel[idx + 1]),
-                        nn.ReLU(inplace=True),
+                        nn.GELU(),
                     )
                 )
         self.layer_list = nn.ModuleList(self.layer_list)
-
+        
+        # Learnable fusion gate for better position-feature interaction
+        self.fusion_gate = nn.Parameter(torch.ones(1) * 0.5)
+        
+        # Lightweight channel attention
+        if len(out_channel) > 1:
+            final_channels = out_channel[-1]
+            if dimension == 2:
+                self.channel_attention = nn.Sequential(
+                    nn.AdaptiveAvgPool2d(1),
+                    nn.Conv2d(final_channels, final_channels // 4, kernel_size=1),
+                    nn.GELU(),
+                    nn.Conv2d(final_channels // 4, final_channels, kernel_size=1),
+                    nn.Sigmoid()
+                )
+            else:
+                self.channel_attention = nn.Sequential(
+                    nn.AdaptiveAvgPool1d(1),
+                    nn.Conv1d(final_channels, final_channels // 4, kernel_size=1),
+                    nn.GELU(),
+                    nn.Conv1d(final_channels // 4, final_channels, kernel_size=1),
+                    nn.Sigmoid()
+                )
+        else:
+            self.channel_attention = None
 
     def forward(self, output):
         position_embedding = self.layer_list[0](output[:, :4])
         feature_embedding = output[:, 4:]
         for layer in self.layer_list[1:]:
             feature_embedding = layer(feature_embedding)
-        return position_embedding * feature_embedding
+        
+        # Apply channel attention to position embedding
+        if self.channel_attention is not None:
+            attention_weights = self.channel_attention(position_embedding)
+            position_embedding = position_embedding * attention_weights
+        
+        # Enhanced fusion with learnable gating
+        # α * (pos * feat) + (1-α) * (pos + feat)
+        multiplicative = position_embedding * feature_embedding
+        additive = position_embedding + feature_embedding
+        output = self.fusion_gate * multiplicative + (1 - self.fusion_gate) * additive
+        
+        return output
 
 
 class SpatialAttention(nn.Module):
