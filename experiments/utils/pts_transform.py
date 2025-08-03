@@ -114,14 +114,14 @@ class PointcloudJitter(object):
         return points
 
 
-# class PointcloudTranslate(object):
-#     def __init__(self, translate_range=0.1):
-#         self.translate_range = translate_range
-#
-#     def __call__(self, points):
-#         translation = np.random.uniform(-self.translate_range, self.translate_range)
-#         points[:, :3] += translation
-#         return points
+class PointcloudTranslate(object):
+    def __init__(self, translate_range=0.1):
+        self.translate_range = translate_range
+
+    def __call__(self, points):
+        translation = torch.FloatTensor(3).uniform_(-self.translate_range, self.translate_range)
+        points[:, :3] += translation
+        return points
 
 
 class PointcloudToTensor(object):
@@ -141,3 +141,87 @@ class PointcloudRandomInputDropout(object):
             points[drop_idx] = points[drop_idx - 1]  # set to the first point
 
         return points
+
+
+class TemporalSpeedChange(object):
+    """Randomly speed up or slow down temporal sequences."""
+    def __init__(self, speed_range=(0.8, 1.2), prob=0.5):
+        self.speed_range = speed_range
+        self.prob = prob
+        
+    def __call__(self, points):
+        if torch.rand(1) > self.prob:
+            return points
+            
+        # Assume points are flattened: (T*N, C) where we need to identify frames
+        # This is a simplified approach - may need adjustment based on actual data format
+        total_points = points.shape[0]
+        
+        # Sample speed factor
+        speed = torch.rand(1) * (self.speed_range[1] - self.speed_range[0]) + self.speed_range[0]
+        
+        if speed < 1.0:
+            # Slow down: duplicate some frames
+            num_duplicates = int(total_points * (1 - speed) * 0.1)  # Conservative duplication
+            if num_duplicates > 0:
+                duplicate_indices = torch.randperm(total_points)[:num_duplicates]
+                duplicated_points = points[duplicate_indices]
+                points = torch.cat([points, duplicated_points], dim=0)
+                
+                # Truncate to original length
+                points = points[:total_points]
+        else:
+            # Speed up: skip some frames
+            skip_ratio = min(0.2, (speed - 1.0))  # Conservative skipping
+            num_skip = int(total_points * skip_ratio)
+            if num_skip > 0:
+                skip_indices = torch.randperm(total_points)[:num_skip]
+                keep_mask = torch.ones(total_points, dtype=torch.bool)
+                keep_mask[skip_indices] = False
+                kept_points = points[keep_mask]
+                
+                # Pad back to original length by repeating some points
+                while kept_points.shape[0] < total_points:
+                    pad_size = min(kept_points.shape[0], total_points - kept_points.shape[0])
+                    pad_points = kept_points[:pad_size]
+                    kept_points = torch.cat([kept_points, pad_points], dim=0)
+                
+                points = kept_points[:total_points]
+        
+        return points
+
+
+class TemporalTranslate(object):
+    """Randomly shift the action in time by padding/cropping the sequence."""
+    def __init__(self, max_shift_ratio=0.1, prob=0.4):
+        self.max_shift_ratio = max_shift_ratio
+        self.prob = prob
+        
+    def __call__(self, points):
+        if torch.rand(1) > self.prob:
+            return points
+            
+        total_points = points.shape[0]
+        max_shift = int(total_points * self.max_shift_ratio)
+        
+        if max_shift == 0:
+            return points
+            
+        # Random shift amount (positive = delay start, negative = early start)
+        shift = torch.randint(-max_shift, max_shift + 1, (1,)).item()
+        
+        if shift > 0:
+            # Delay start: pad beginning, crop end
+            # Duplicate first few points to pad the beginning
+            pad_points = points[:shift]
+            shifted_points = torch.cat([pad_points, points[:-shift]], dim=0)
+        elif shift < 0:
+            # Early start: crop beginning, pad end
+            # Duplicate last few points to pad the end
+            shift = abs(shift)
+            pad_points = points[-shift:]
+            shifted_points = torch.cat([points[shift:], pad_points], dim=0)
+        else:
+            shifted_points = points
+            
+        return shifted_points

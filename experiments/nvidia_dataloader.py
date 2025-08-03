@@ -84,10 +84,13 @@ class NvidiaLoader(data.Dataset):
         if phase == 'train':
             transform = Compose([
                 PointcloudToTensor(),
-                PointcloudScale(lo=0.9, hi=1.1),
-                PointcloudRotatePerturbation(angle_sigma=0.06, angle_clip=0.18),
-                # PointcloudJitter(std=0.01, clip=0.05),
-                PointcloudRandomInputDropout(max_dropout_ratio=0.2),
+                PointcloudScale(lo=0.85, hi=1.15),
+                PointcloudRotatePerturbation(angle_sigma=0.08, angle_clip=0.22),
+                PointcloudTranslate(translate_range=0.1),
+                PointcloudJitter(std=0.015, clip=0.06),
+                TemporalSpeedChange(speed_range=(0.85, 1.15), prob=0.3),
+                TemporalTranslate(max_shift_ratio=0.2, prob=0.4),
+                PointcloudRandomInputDropout(max_dropout_ratio=0.25),
             ])
         else:
             transform = Compose([
