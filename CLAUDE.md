@@ -35,6 +35,17 @@ This project enhances point cloud-based action recognition by replacing traditio
   - Enforces temporal smoothness within actions
   - Multi-task learning approach
 
+### 5. **Motion Energy Cascade** (Latest) 🌊
+- Physics-inspired energy decomposition of motion
+- Models energy transfer between motion scales (inspired by turbulence theory)
+- **Innovation**:
+  - Multi-scale energy decomposition (fast to slow motions)
+  - Energy cascade modeling (how energy flows between scales)
+  - Kinetic vs Potential energy separation
+  - Energy conservation constraints
+  - Particularly effective for actions with energy transfer patterns
+- **Status**: Just implemented, training pending
+
 ## Technical Details
 
 ### Architecture Changes
@@ -59,6 +70,7 @@ self.mamba = MultiScaleMambaTemporalEncoder(...)  # Linear complexity, multi-sca
 3. **Multi-Scale Temporal Processing**: Process at different frame rates simultaneously (explored)
 4. **Motion Flow Prediction**: Auxiliary task for better motion understanding (explored)
 5. **Graph-Structured Sequences**: Incorporate spatial relationships in temporal modeling (explored)
+6. **Motion Energy Cascade**: Physics-inspired energy transfer modeling between motion scales (latest)
 
 ## Performance Summary
 | Model | Accuracy | Notes |
