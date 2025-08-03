@@ -309,7 +309,7 @@ class Motion(nn.Module):
         if self.training:
             inputs = inputs[:, :, :, torch.randperm(inputs.shape[3])[:self.pts_size]]
         else:
-            inputs = inputs[:, :, :, ::inputs.shape[3] // self.pts_size]
+            inputs = inputs[:, :, :, torch.randperm(inputs.shape[3])[:self.pts_size]]
         # B * (4 + others) * 32 * 128
         inputs = inputs[:, :4]
         # B * 4 * 32 * 128
