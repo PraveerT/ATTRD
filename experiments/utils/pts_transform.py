@@ -225,3 +225,81 @@ class TemporalTranslate(object):
             shifted_points = points
             
         return shifted_points
+
+
+class TemporalCutout(object):
+    """Randomly mask temporal segments to prevent overfitting to specific temporal patterns."""
+    def __init__(self, max_cutout_ratio=0.15, num_holes=(1, 3), prob=0.5):
+        self.max_cutout_ratio = max_cutout_ratio
+        self.num_holes = num_holes  # (min, max) number of holes
+        self.prob = prob
+        
+    def __call__(self, points):
+        if torch.rand(1) > self.prob:
+            return points
+            
+        total_points = points.shape[0]
+        num_holes = torch.randint(self.num_holes[0], self.num_holes[1] + 1, (1,)).item()
+        
+        result = points.clone()
+        
+        for _ in range(num_holes):
+            # Random hole size
+            hole_size = torch.randint(1, int(total_points * self.max_cutout_ratio) + 1, (1,)).item()
+            hole_size = min(hole_size, total_points // 4)  # Don't mask more than 25% at once
+            
+            if hole_size == 0:
+                continue
+                
+            # Random hole position
+            start_idx = torch.randint(0, total_points - hole_size + 1, (1,)).item()
+            end_idx = start_idx + hole_size
+            
+            # Strategy: Replace masked points with interpolated values or nearby points
+            if start_idx > 0 and end_idx < total_points:
+                # Linear interpolation between before and after
+                alpha = torch.linspace(0, 1, hole_size).unsqueeze(1)
+                before_point = result[start_idx - 1:start_idx]
+                after_point = result[end_idx:end_idx + 1]
+                interpolated = before_point * (1 - alpha) + after_point * alpha
+                result[start_idx:end_idx] = interpolated
+            else:
+                # At boundaries, just duplicate nearby points
+                if start_idx == 0:
+                    # At beginning, use points from after the hole
+                    result[start_idx:end_idx] = result[end_idx:end_idx + hole_size]
+                else:
+                    # At end, use points from before the hole
+                    result[start_idx:end_idx] = result[start_idx - hole_size:start_idx]
+        
+        return result
+
+
+class TemporalShuffle(object):
+    """Shuffle small temporal windows to break temporal dependencies."""
+    def __init__(self, window_size=5, num_shuffles=3, prob=0.3):
+        self.window_size = window_size
+        self.num_shuffles = num_shuffles
+        self.prob = prob
+        
+    def __call__(self, points):
+        if torch.rand(1) > self.prob:
+            return points
+            
+        total_points = points.shape[0]
+        result = points.clone()
+        
+        for _ in range(self.num_shuffles):
+            if total_points < self.window_size:
+                continue
+                
+            # Random window position
+            start_idx = torch.randint(0, total_points - self.window_size + 1, (1,)).item()
+            end_idx = start_idx + self.window_size
+            
+            # Shuffle points within the window
+            window = result[start_idx:end_idx]
+            shuffled_indices = torch.randperm(self.window_size)
+            result[start_idx:end_idx] = window[shuffled_indices]
+        
+        return result

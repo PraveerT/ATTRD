@@ -90,6 +90,8 @@ class NvidiaLoader(data.Dataset):
                 PointcloudJitter(std=0.015, clip=0.06),
                 TemporalSpeedChange(speed_range=(0.85, 1.15), prob=0.3),
                 TemporalTranslate(max_shift_ratio=0.2, prob=0.4),
+                TemporalCutout(max_cutout_ratio=0.2, num_holes=(1, 4), prob=0.6),
+                TemporalShuffle(window_size=7, num_shuffles=4, prob=0.4),
                 PointcloudRandomInputDropout(max_dropout_ratio=0.25),
             ])
         else:
