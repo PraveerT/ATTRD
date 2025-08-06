@@ -307,9 +307,12 @@ class Motion(nn.Module):
         # B * T * N * D,  e.g. 16 * 32 * 512 * 4
         inputs = inputs.permute(0, 3, 1, 2)
         if self.training:
-            inputs = inputs[:, :, :, torch.randperm(inputs.shape[3])[:self.pts_size]]
+            # Random sampling during training for augmentation
+            indices = torch.randperm(inputs.shape[3])[:self.pts_size]
         else:
-            inputs = inputs[:, :, :, torch.randperm(inputs.shape[3])[:self.pts_size]]
+            # Deterministic sampling during testing for consistent results
+            indices = torch.linspace(0, inputs.shape[3]-1, self.pts_size, dtype=torch.long)
+        inputs = inputs[:, :, :, indices]
         # B * (4 + others) * 32 * 128
         inputs = inputs[:, :4]
         # B * 4 * 32 * 128
