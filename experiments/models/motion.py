@@ -9,142 +9,97 @@ from models.op import MLPBlock, MotionBlock, GroupOperation
 from mamba_ssm.modules.mamba_simple import Mamba
 
 
-class MotionEnergyCascade(nn.Module):
-    """Novel layer inspired by turbulence theory that decomposes motion into energy scales
-    and models how energy transfers between fast and slow motions."""
+class MultiScaleFeatureProcessor(nn.Module):
+    """Multi-scale feature processing layer that creates diverse representations
+    at different temporal scales and combines them effectively."""
     
-    def __init__(self, in_channels, num_scales=4, energy_dim=32):
+    def __init__(self, in_channels, num_scales=4, feature_dim=32):
         super().__init__()
         self.in_channels = in_channels
         self.num_scales = num_scales
-        self.energy_dim = energy_dim
+        self.feature_dim = feature_dim
         
-        # Learnable wavelet-like filters for multi-scale decomposition
+        # Multi-scale filters for temporal feature extraction
         self.scale_filters = nn.ModuleList([
-            nn.Conv2d(in_channels, energy_dim, kernel_size=(2**i, 1), 
+            nn.Conv2d(in_channels, feature_dim, kernel_size=(2**i, 1), 
                      stride=(2**i, 1), padding=(2**(i-1), 0))
             for i in range(1, num_scales + 1)
         ])
         
-        # Energy transfer network - models how energy flows between scales
-        self.energy_transfer = nn.ModuleList([
+        # Feature interaction network between scales
+        self.scale_interaction = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(energy_dim * 2, energy_dim, 1),
-                nn.BatchNorm2d(energy_dim),
+                nn.Conv2d(feature_dim * 2, feature_dim, 1),
+                nn.BatchNorm2d(feature_dim),
                 nn.GELU(),
-                nn.Conv2d(energy_dim, energy_dim, 1)
+                nn.Conv2d(feature_dim, feature_dim, 1)
             ) for _ in range(num_scales - 1)
         ])
         
-        # Kinetic energy computer
-        self.kinetic_mlp = nn.Sequential(
-            nn.Linear(3, energy_dim),
-            nn.LayerNorm(energy_dim),
-            nn.GELU(),
-            nn.Linear(energy_dim, energy_dim // 2)
-        )
         
-        # Potential energy computer (based on point cloud configuration)
-        self.potential_mlp = nn.Sequential(
-            nn.Linear(in_channels, energy_dim),
-            nn.LayerNorm(energy_dim),
-            nn.GELU(),
-            nn.Linear(energy_dim, energy_dim // 2)
-        )
-        
-        # Energy conservation constraint
-        self.conservation_gate = nn.Sequential(
-            nn.Linear(energy_dim * num_scales, num_scales),
+        # Feature weighting gate
+        self.feature_gate = nn.Sequential(
+            nn.Linear(feature_dim * num_scales, num_scales),
             nn.Softmax(dim=-1)
         )
         
         # Output projection
         self.output_proj = nn.Sequential(
-            nn.Conv2d(energy_dim * num_scales + in_channels, in_channels, 1),
+            nn.Conv2d(feature_dim * num_scales + in_channels, in_channels, 1),
             nn.BatchNorm2d(in_channels),
             nn.GELU()
         )
         
-    def compute_motion_energy(self, x):
-        """Compute kinetic and potential energy from motion."""
-        B, C, T, N = x.shape
-        
-        # Compute velocity (finite differences)
-        velocity = torch.zeros_like(x[:, :3])
-        velocity[:, :, 1:] = x[:, :3, 1:] - x[:, :3, :-1]
-        
-        # Kinetic energy: 0.5 * m * v^2 (assuming unit mass)
-        kinetic = 0.5 * (velocity ** 2).sum(dim=1, keepdim=True)  # (B, 1, T, N)
-        
-        # Process kinetic energy
-        kinetic_flat = kinetic.permute(0, 2, 3, 1).reshape(B * T * N, 1)
-        kinetic_features = self.kinetic_mlp(velocity.permute(0, 2, 3, 1).reshape(B * T * N, 3))
-        kinetic_features = kinetic_features.reshape(B, T, N, -1).permute(0, 3, 1, 2)
-        
-        # Potential energy based on configuration
-        potential_flat = x.permute(0, 2, 3, 1).reshape(B * T * N, C)
-        potential_features = self.potential_mlp(potential_flat)
-        potential_features = potential_features.reshape(B, T, N, -1).permute(0, 3, 1, 2)
-        
-        return kinetic_features, potential_features
     
     def forward(self, x):
         # x shape: B, C, T, N
         B, C, T, N = x.shape
         
-        # 1. Multi-scale decomposition
-        scale_energies = []
+        # 1. Multi-scale feature extraction
+        scale_features = []
         for i, filter in enumerate(self.scale_filters):
             # Apply scale-specific filter
-            scale_energy = filter(x)
-            scale_energies.append(scale_energy)
+            scale_feat = filter(x)
+            scale_features.append(scale_feat)
         
-        # 2. Compute motion energies
-        kinetic_energy, potential_energy = self.compute_motion_energy(x)
-        
-        # 3. Model energy transfer between scales (cascade)
-        transferred_energies = [scale_energies[0]]
-        for i in range(len(scale_energies) - 1):
-            # Energy flows from larger to smaller scales
-            source = F.interpolate(scale_energies[i], size=(scale_energies[i+1].shape[2], N), 
+        # 2. Model feature interaction between scales
+        interacted_features = [scale_features[0]]
+        for i in range(len(scale_features) - 1):
+            # Interpolate features for interaction
+            source = F.interpolate(scale_features[i], size=(scale_features[i+1].shape[2], N), 
                                  mode='bilinear', align_corners=False)
-            target = scale_energies[i + 1]
+            target = scale_features[i + 1]
             
             # Combine source and target
             combined = torch.cat([source, target], dim=1)
             
-            # Model energy transfer
-            transfer = self.energy_transfer[i](combined)
-            transferred_energies.append(target + transfer)
+            # Model feature interaction
+            interaction = self.scale_interaction[i](combined)
+            interacted_features.append(target + interaction)
         
-        # 4. Apply energy conservation constraint
-        # Ensure total energy is conserved across scales
-        all_energies = []
-        for i, energy in enumerate(transferred_energies):
-            # Upsample to original resolution
-            upsampled = F.interpolate(energy, size=(T, N), mode='bilinear', align_corners=False)
-            all_energies.append(upsampled)
-        
-        energy_stack = torch.stack(all_energies, dim=2)  # (B, energy_dim, num_scales, T, N)
-        energy_flat = energy_stack.permute(0, 3, 4, 1, 2).reshape(B * T * N, self.energy_dim, self.num_scales)
-        
-        # Conservation weights
-        conservation_weights = self.conservation_gate(energy_flat.reshape(B * T * N, -1))
-        conservation_weights = conservation_weights.unsqueeze(1)  # (B*T*N, 1, num_scales)
-        
-        # Apply conservation
-        conserved_energy = (energy_flat * conservation_weights).sum(dim=2)  # (B*T*N, energy_dim)
-        conserved_energy = conserved_energy.reshape(B, T, N, self.energy_dim).permute(0, 3, 1, 2)
-        
-        # 5. Combine all energy representations
+        # 3. Apply feature weighting
         all_features = []
-        for energy in all_energies:
-            all_features.append(energy)
+        for i, feat in enumerate(interacted_features):
+            # Upsample to original resolution
+            upsampled = F.interpolate(feat, size=(T, N), mode='bilinear', align_corners=False)
+            all_features.append(upsampled)
         
-        energy_features = torch.cat(all_features, dim=1)  # (B, energy_dim * num_scales, T, N)
+        feature_stack = torch.stack(all_features, dim=2)  # (B, feature_dim, num_scales, T, N)
+        feature_flat = feature_stack.permute(0, 3, 4, 1, 2).reshape(B * T * N, self.feature_dim, self.num_scales)
         
-        # 6. Output projection with residual
-        combined = torch.cat([x, energy_features], dim=1)
+        # Feature weights
+        feature_weights = self.feature_gate(feature_flat.reshape(B * T * N, -1))
+        feature_weights = feature_weights.unsqueeze(1)  # (B*T*N, 1, num_scales)
+        
+        # Apply weighting
+        weighted_features = (feature_flat * feature_weights).sum(dim=2)  # (B*T*N, feature_dim)
+        weighted_features = weighted_features.reshape(B, T, N, self.feature_dim).permute(0, 3, 1, 2)
+        
+        # 4. Combine all feature representations
+        combined_features = torch.cat(all_features, dim=1)  # (B, feature_dim * num_scales, T, N)
+        
+        # 5. Output projection with residual
+        combined = torch.cat([x, combined_features], dim=1)
         output = self.output_proj(combined)
         
         return output + x
@@ -300,8 +255,8 @@ class Motion(nn.Module):
         # Process features from stage3 (256 channels) with temporal modeling
         self.mamba = MambaTemporalEncoder(in_channels=256, hidden_dim=256, output_dim=256, num_layers=2, drop_path=0.1)
         
-        # Add Motion Energy Cascade layer after stage2
-        self.motion_energy = MotionEnergyCascade(in_channels=132, num_scales=4, energy_dim=32)
+        # Add Multi-scale Feature Processor layer after stage2
+        self.multi_scale = MultiScaleFeatureProcessor(in_channels=132, num_scales=4, feature_dim=32)
 
     def forward(self, inputs):
         # B * T * N * D,  e.g. 16 * 32 * 512 * 4
@@ -338,8 +293,8 @@ class Motion(nn.Module):
         fea2 = self.pool2(self.stage2(ret_array2)).view(batchsize, -1, timestep, pts_num)
         fea2 = torch.cat((inputs, fea2), dim=1)
         
-        # Apply motion energy cascade analysis
-        fea2 = self.motion_energy(fea2)
+        # Apply multi-scale feature processing
+        fea2 = self.multi_scale(fea2)
 
         # stage 3: inter-frame, middle, applying mamba in this stage
         in_dims = fea2.shape[1] * 2 - 4
