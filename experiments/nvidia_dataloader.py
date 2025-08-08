@@ -18,6 +18,14 @@ class NvidiaLoader(data.Dataset):
         self.valid_subject = valid_subject
         self.inputs_list = self.get_inputs_list()
         self.r = re.compile('[ \t\n\r:]+')
+        
+        # Load global dataset statistics
+        try:
+            self.dataset_stats = np.load('nvidia_dataset_stats.npy', allow_pickle=True).item()
+            print("Loaded global dataset statistics for consistent normalization")
+        except FileNotFoundError:
+            print("Warning: Global dataset statistics not found, using default normalization")
+            self.dataset_stats = None
 
         print(len(self.inputs_list))
         if phase == "train":
@@ -70,11 +78,21 @@ class NvidiaLoader(data.Dataset):
     def normalize(self, pts, fs):
         timestep, pts_size, channels = pts.shape
         pts = pts.reshape(-1, channels)
-        pts[:, 0] = (pts[:, 0] - np.mean(pts[:, 0])) / 120
-        pts[:, 1] = (pts[:, 1] - np.mean(pts[:, 1])) / 160
-        pts[:, 3] = (pts[:, 3] - fs / 2) / fs * 2
-        if (pts[:, 2].max() - pts[:, 2].min()) != 0:
-            pts[:, 2] = (pts[:, 2] - np.mean(pts[:, 2])) / (pts[:, 2].max() - pts[:, 2].min()) * 2
+        
+        if self.dataset_stats is not None:
+            # Use global dataset statistics for consistent normalization
+            pts[:, 0] = (pts[:, 0] - self.dataset_stats['x_mean']) / self.dataset_stats['x_std']
+            pts[:, 1] = (pts[:, 1] - self.dataset_stats['y_mean']) / self.dataset_stats['y_std']
+            pts[:, 2] = (pts[:, 2] - self.dataset_stats['z_mean']) / self.dataset_stats['z_std']
+            pts[:, 3] = (pts[:, 3] - self.dataset_stats['t_mean']) / self.dataset_stats['t_std']
+        else:
+            # Fallback to original per-sample normalization if stats not available
+            pts[:, 0] = (pts[:, 0] - np.mean(pts[:, 0])) / 120
+            pts[:, 1] = (pts[:, 1] - np.mean(pts[:, 1])) / 160
+            pts[:, 3] = (pts[:, 3] - fs / 2) / fs * 2
+            if (pts[:, 2].max() - pts[:, 2].min()) != 0:
+                pts[:, 2] = (pts[:, 2] - np.mean(pts[:, 2])) / (pts[:, 2].max() - pts[:, 2].min()) * 2
+        
         pts = self.transform(pts)
         pts = pts.reshape(timestep, pts_size, channels)
         return pts

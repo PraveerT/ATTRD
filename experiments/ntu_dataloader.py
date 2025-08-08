@@ -43,6 +43,14 @@ class NTULoader(data.Dataset):
         # Directory cache file
         self.dir_cache_file = os.path.join(os.path.dirname(data_path), f"ntu_dirs_cache_{phase}.pkl")
         
+        # Load global dataset statistics
+        try:
+            self.dataset_stats = np.load('ntu_dataset_stats.npy', allow_pickle=True).item()
+            print("Loaded global NTU dataset statistics for consistent normalization")
+        except FileNotFoundError:
+            print("Warning: Global NTU dataset statistics not found, using default normalization")
+            self.dataset_stats = None
+        
         print("📁 Loading NTU dataset files...")
         self.inputs_list = self.get_inputs_list()
         self.r = re.compile('[ \t\n\r:]+')
@@ -495,20 +503,27 @@ class NTULoader(data.Dataset):
         return len(self.inputs_list)
 
     def normalize(self, pts, fs):
-        """Normalize point cloud coordinates"""
+        """Normalize point cloud coordinates using global dataset statistics"""
         timestep, pts_size, channels = pts.shape
         pts = pts.reshape(-1, channels)
         
-        # Normalize u, v coordinates to [-1, 1]
-        pts[:, 0] = (pts[:, 0] - self.cx) / self.cx  # u coordinate
-        pts[:, 1] = (pts[:, 1] - self.cy) / self.cy  # v coordinate
-        
-        # Normalize depth
-        if (pts[:, 2].max() - pts[:, 2].min()) != 0:
-            pts[:, 2] = (pts[:, 2] - np.mean(pts[:, 2])) / (pts[:, 2].max() - pts[:, 2].min()) * 2
-        
-        # Normalize temporal coordinate
-        pts[:, 3] = (pts[:, 3] - fs / 2) / fs * 2
+        if self.dataset_stats is not None:
+            # Use global dataset statistics for consistent normalization
+            pts[:, 0] = (pts[:, 0] - self.dataset_stats['u_mean']) / self.dataset_stats['u_std']  # u coordinate
+            pts[:, 1] = (pts[:, 1] - self.dataset_stats['v_mean']) / self.dataset_stats['v_std']  # v coordinate  
+            pts[:, 2] = (pts[:, 2] - self.dataset_stats['d_mean']) / self.dataset_stats['d_std']  # depth
+            pts[:, 3] = (pts[:, 3] - self.dataset_stats['t_mean']) / self.dataset_stats['t_std']  # temporal
+        else:
+            # Fallback to original per-sample normalization if stats not available
+            pts[:, 0] = (pts[:, 0] - self.cx) / self.cx  # u coordinate
+            pts[:, 1] = (pts[:, 1] - self.cy) / self.cy  # v coordinate
+            
+            # Normalize depth
+            if (pts[:, 2].max() - pts[:, 2].min()) != 0:
+                pts[:, 2] = (pts[:, 2] - np.mean(pts[:, 2])) / (pts[:, 2].max() - pts[:, 2].min()) * 2
+            
+            # Normalize temporal coordinate
+            pts[:, 3] = (pts[:, 3] - fs / 2) / fs * 2
         
         # Apply transformations
         pts = self.transform(pts)

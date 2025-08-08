@@ -46,6 +46,15 @@ This project enhances point cloud-based action recognition by replacing traditio
   - Particularly effective for actions with energy transfer patterns
 - **Status**: Just implemented, training pending
 
+### 6. **Global Dataset Normalization** (Critical Fix) 🎯
+- **Problem**: Original per-sample normalization caused severe overfitting (98% train vs 89% test)
+- **Solution**: Computed global statistics across entire NVIDIA dataset (1532 files)
+- **Implementation**:
+  - Global stats: X(142.97±39.60), Y(194.73±54.02), Z(129.98±36.43), T(15.34±9.27)
+  - Consistent z-score normalization: `(x - global_mean) / global_std`
+  - Applied uniformly to train/test splits
+- **Impact**: Eliminates normalization-based overfitting, ensures train/test consistency
+
 ## Technical Details
 
 ### Architecture Changes
@@ -71,6 +80,7 @@ self.mamba = MultiScaleMambaTemporalEncoder(...)  # Linear complexity, multi-sca
 4. **Motion Flow Prediction**: Auxiliary task for better motion understanding (explored)
 5. **Graph-Structured Sequences**: Incorporate spatial relationships in temporal modeling (explored)
 6. **Motion Energy Cascade**: Physics-inspired energy transfer modeling between motion scales (latest)
+7. **Global Dataset Normalization**: Consistent normalization across train/test splits to prevent overfitting
 
 ## Performance Summary
 | Model | Accuracy | Notes |

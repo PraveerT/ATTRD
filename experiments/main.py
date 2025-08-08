@@ -29,7 +29,8 @@ class Processor():
         self.loss = self.criterion()
 
     def criterion(self):
-        loss = nn.CrossEntropyLoss(reduction="none")
+        # Add label smoothing for regularization
+        loss = nn.CrossEntropyLoss(label_smoothing=0.1, reduction="none")
         return self.device.criterion_to_device(loss)
 
     def train(self, epoch):

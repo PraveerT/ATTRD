@@ -32,6 +32,7 @@ class MultiScaleFeatureProcessor(nn.Module):
                 nn.Conv2d(feature_dim * 2, feature_dim, 1),
                 nn.BatchNorm2d(feature_dim),
                 nn.GELU(),
+                nn.Dropout(0.2),
                 nn.Conv2d(feature_dim, feature_dim, 1)
             ) for _ in range(num_scales - 1)
         ])
@@ -47,7 +48,8 @@ class MultiScaleFeatureProcessor(nn.Module):
         self.output_proj = nn.Sequential(
             nn.Conv2d(feature_dim * num_scales + in_channels, in_channels, 1),
             nn.BatchNorm2d(in_channels),
-            nn.GELU()
+            nn.GELU(),
+            nn.Dropout(0.2)
         )
         
     
@@ -126,6 +128,9 @@ class QuaternionLinear(nn.Module):
         quat_out_total = quat_out * 4
         self.bias = nn.Parameter(torch.zeros(quat_out_total))
         
+        # Add dropout for regularization
+        self.dropout = nn.Dropout(0.2)
+        
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # For simplicity, treat input as quaternion by splitting into 4 parts
         B, T, C = x.shape
@@ -167,6 +172,9 @@ class QuaternionLinear(nn.Module):
         
         out = out + self.bias[:out.shape[2]]
         
+        # Apply dropout during training
+        out = self.dropout(out)
+        
         return out
 
 
@@ -196,7 +204,7 @@ class MambaTemporalEncoder(nn.Module):
         self.norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
         
         # Dropout for regularization
-        self.dropout = nn.Dropout(drop_path)
+        self.dropout = nn.Dropout(0.3)
         
         # Output projection with quaternion transformation
         self.output_proj = QuaternionLinear(hidden_dim, self.output_dim)
@@ -257,6 +265,9 @@ class Motion(nn.Module):
         
         # Add Multi-scale Feature Processor layer after stage2
         self.multi_scale = MultiScaleFeatureProcessor(in_channels=132, num_scales=4, feature_dim=32)
+        
+        # Temporal noise injection for regularization during training
+        self.temporal_noise_std = 0.02
 
     def forward(self, inputs):
         # B * T * N * D,  e.g. 16 * 32 * 512 * 4
@@ -295,6 +306,11 @@ class Motion(nn.Module):
         
         # Apply multi-scale feature processing
         fea2 = self.multi_scale(fea2)
+        
+        # Apply temporal noise injection during training for regularization
+        if self.training:
+            noise = torch.randn_like(fea2) * self.temporal_noise_std
+            fea2 = fea2 + noise
 
         # stage 3: inter-frame, middle, applying mamba in this stage
         in_dims = fea2.shape[1] * 2 - 4
