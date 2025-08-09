@@ -248,9 +248,8 @@ class Motion(nn.Module):
         self.pool2 = nn.AdaptiveMaxPool2d((None, 1))
         self.stage3 = MotionBlock([256, 256, ], 2, 4)
         self.pool3 = nn.AdaptiveMaxPool2d((None, 1))
-        self.stage4 = MotionBlock([512, 512, ], 2, 4)
-        self.pool4 = nn.AdaptiveMaxPool2d((None, 1))
-        self.stage5 = MLPBlock([512, 1024], 2)
+        # Stage 4 removed to reduce overfitting and improve efficiency
+        self.stage5 = MLPBlock([260, 1024], 2)  # Updated from 512 to 260 (fea3 channels)
         self.pool5 = nn.AdaptiveMaxPool2d((1, 1))
         self.stage6 = MLPBlock([1024, num_classes], 2, with_bn=False)
         self.global_bn = nn.BatchNorm2d(1024)
@@ -324,15 +323,10 @@ class Motion(nn.Module):
         # Concatenate with inputs for next stage
         fea3 = torch.cat((inputs, fea3_mamba), dim=1)
 
-        # stage 4: inter-frame, late
-        in_dims = fea3.shape[1] * 2 - 4
-        pts_num //= self.downsample[2]
-        ret_group_array4 = self.group.st_group_points(fea3, 3, [0, 1, 2], self.knn[3], 3)
-        ret_array4, inputs, _ = self.select_ind(ret_group_array4, inputs,
-                                                batchsize, in_dims, timestep, pts_num)
-        fea4 = self.pool4(self.stage4(ret_array4)).view(batchsize, -1, timestep, pts_num)
-
-        output = self.stage5(fea4)
+        # Stage 4 removed - direct connection from Stage 3+Mamba to Stage 5
+        # fea3 shape: (batchsize, features, timestep, 32 points)
+        
+        output = self.stage5(fea3)
         output = self.pool5(output)
         output = self.global_bn(output)
         output = self.stage6(output)
