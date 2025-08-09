@@ -260,7 +260,7 @@ class Motion(nn.Module):
         self.group = GroupOperation()
         # Replace LSTM with Mamba temporal encoder
         # Process features from stage3 (256 channels) with temporal modeling
-        self.mamba = MambaTemporalEncoder(in_channels=256, hidden_dim=256, output_dim=256, num_layers=2, drop_path=0.1)
+        self.mamba = MambaTemporalEncoder(in_channels=256, hidden_dim=128, output_dim=256, num_layers=2, drop_path=0.1)
         
         # Add Multi-scale Feature Processor layer after stage2
         self.multi_scale = MultiScaleFeatureProcessor(in_channels=132, num_scales=4, feature_dim=32)
