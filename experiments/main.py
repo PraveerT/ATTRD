@@ -128,7 +128,12 @@ class Processor():
                 # Cal.reset()
                 # Cal.calculate_all(self.model, image)
                 with torch.no_grad():
-                    output = self.model(image)
+                    # Test-Time Augmentation: average predictions from 3 runs
+                    outputs = []
+                    for _ in range(3):
+                        output = self.model(image)
+                        outputs.append(output)
+                    output = torch.stack(outputs).mean(dim=0)
                 # loss = torch.mean(self.loss(output, label))
                 loss_mean += self.loss(output, label).cpu().detach().numpy().tolist()
                 self.stat.update_accuracy(output.data.cpu(), label.cpu(), topk=self.topk)
