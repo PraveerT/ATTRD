@@ -27,6 +27,10 @@ class Processor():
         self.stat = Stat(self.arg.model_args['num_classes'], self.topk)
         self.model, self.optimizer = self.Loading()
         self.loss = self.criterion()
+        
+        # Check if pts_size was explicitly provided via command line
+        # by checking if --pts-size appears in sys.argv
+        self.use_static_pts = '--pts-size' in sys.argv
 
     def criterion(self):
         # Add label smoothing for regularization
@@ -35,7 +39,35 @@ class Processor():
 
     def train(self, epoch):
         self.model.train()
-        self.recoder.print_log('Training epoch: {}'.format(epoch + 1))
+        
+        # Check if pts_size was provided as command line argument
+        if self.use_static_pts:
+            # Use static pts_size from command line
+            pts_size = self.arg.pts_size
+            self.model.pts_size = pts_size
+            # Also update model_args to ensure consistency
+            self.arg.model_args['pts_size'] = pts_size
+            self.recoder.print_log('Training epoch: {} | pts_size: {} (static from --pts-size)'.format(epoch + 1, pts_size))
+        else:
+            # Dynamic pts_size scheduling
+            # Epoch 0-50: 96 -> 128 (slow increase)
+            # Epoch 50-100: 128 -> 256 (fast increase)
+            if epoch < 50:
+                # Slow linear increase from 96 to 128 over 50 epochs
+                pts_size = int(48 + (128 - 48) * (epoch / 50))
+            elif epoch < 100:
+                # Fast exponential-like increase from 128 to 256 over 50 epochs
+                progress = (epoch - 50) / 50  # 0 to 1
+                # Use quadratic progression for faster increase
+                pts_size = int(128 + (256 - 128) * (progress ** 2))
+            else:
+                # Keep at maximum after epoch 100
+                pts_size = 256
+            
+            # Update model's pts_size
+            self.model.pts_size = pts_size
+            self.recoder.print_log('Training epoch: {} | pts_size: {} (dynamic)'.format(epoch + 1, pts_size))
+        
         loader = self.data_loader['train']
         loss_value = []
         correct = 0
@@ -71,7 +103,8 @@ class Processor():
             loader_with_progress.set_postfix({
                 'Loss': f'{loss.item():.4f}',
                 'Acc': f'{current_acc:.2f}%',
-                'LR': f'{current_learning_rate[0]:.6f}'
+                'LR': f'{current_learning_rate[0]:.6f}',
+                'PTS': pts_size
             })
             
             if batch_idx % self.arg.log_interval == 0:
@@ -106,6 +139,10 @@ class Processor():
         print("Loading model")
         if self.arg.model:
             model_class = import_class(self.arg.model)
+            # Override pts_size in model_args if provided via command line
+            if '--pts-size' in sys.argv:
+                self.arg.model_args['pts_size'] = self.arg.pts_size
+                print(f"Using pts_size={self.arg.pts_size} from command line")
             model = self.device.model_to_device(model_class(**self.arg.model_args))
             if self.arg.weights:
                 try:
