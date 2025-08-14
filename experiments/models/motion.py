@@ -296,91 +296,135 @@ class EdgeConv(nn.Module):
         return out
 
 
-class SpatialGCNBranch(nn.Module):
-    """True spatial branch using EdgeConv GCN + MLPBlock processing"""
+class PointLSTMBranch(nn.Module):
+    """Original PointLSTM architecture as second branch"""
     
-    def __init__(self, num_classes, pts_size, k_neighbors=16):
+    def __init__(self, num_classes, pts_size, offsets, topk=16, downsample=(2, 2, 2),
+                 knn=(16, 48, 48, 24)):
         super().__init__()
-        self.pts_size = pts_size
-        self.k_neighbors = k_neighbors
+        from .op import MLPBlock, MotionBlock
         
-        # Import MLPBlock from op.py
-        from .op import MLPBlock
-        
-        # EdgeConv layers for spatial relationship modeling
-        self.edge_conv1 = EdgeConv(4, 32, k=k_neighbors)      # 4 (xyzt) -> 32 channels
-        self.edge_conv2 = EdgeConv(32, 64, k=k_neighbors)     # 32 -> 64 channels  
-        self.edge_conv3 = EdgeConv(64, 128, k=k_neighbors)    # 64 -> 128 channels
-        
-        # MLPBlock processing after each EdgeConv
-        self.mlp1 = MLPBlock([32, 64], 2)                     # Process EdgeConv1 output
-        self.mlp2 = MLPBlock([64, 128], 2)                    # Process EdgeConv2 output  
-        self.mlp3 = MLPBlock([128, 256], 2)                   # Process EdgeConv3 output
-        
-        # Temporal pooling for each stage
+        self.stage1 = MLPBlock([4, 32, 64], 2)
         self.pool1 = nn.AdaptiveMaxPool2d((None, 1))
+        self.stage2 = MotionBlock([128, 128, ], 2, 4)
         self.pool2 = nn.AdaptiveMaxPool2d((None, 1))
+        self.stage3 = MotionBlock([256, 256, ], 2, 4)
         self.pool3 = nn.AdaptiveMaxPool2d((None, 1))
-        
-        # Global feature extraction and classification
-        # Combine features: 64 + 128 + 256 = 448 channels
-        self.channel_reducer = nn.Conv1d(448, 512, 1)        
+        self.stage4 = MotionBlock([512, 512, ], 2, 4)
+        self.pool4 = nn.AdaptiveMaxPool2d((None, 1))
         self.stage5 = MLPBlock([512, 1024], 2)
-        self.global_bn = nn.BatchNorm1d(1024)
-        self.stage6 = nn.Linear(1024, num_classes)
+        self.pool5 = nn.AdaptiveMaxPool2d((1, 1))
+        self.stage6 = MLPBlock([1024, num_classes], 2, with_bn=False)
+        self.global_bn = nn.BatchNorm2d(1024)
+        self.knn = knn
+        self.pts_size = pts_size
+        self.downsample = downsample
+        self.num_classes = num_classes
+        self.group = GroupOperation()
         
-    def forward(self, x):
-        # x shape: B, 4, T, N
-        B, C, T, N = x.shape
+        # Import PointLSTM from models
+        from models.pointlstm import PointLSTM
+        # Calculate final point count after two downsampling stages: pts_size // (downsample[0] * downsample[1])
+        # downsample = (2, 2, 2), so after stage2: pts_size//2, after stage3 (LSTM): pts_size//4
+        final_pts_num = max(8, pts_size // (downsample[0] * downsample[1]))  # Minimum 8 points
+        # Adaptive topk: can't have more neighbors than points available
+        adaptive_topk = min(topk, final_pts_num - 1, 16)  # At most 16, at most final_pts_num-1
+        print(f"DEBUG: pts_size={pts_size}, final_pts_num={final_pts_num}, adaptive_topk={adaptive_topk}")
+        self.lstm = PointLSTM(pts_num=final_pts_num, in_channels=132, hidden_dim=256,
+                              offset_dim=4, num_layers=1, topk=adaptive_topk, offsets=offsets)
+        # Override the topk to ensure it's safe for internal operations
+        self.lstm.topk = adaptive_topk
         
-        all_features = []
+    def forward(self, inputs):
+        # inputs shape: B, 4, T, N
+        batchsize, in_dims, timestep, pts_num = inputs.shape
+        original_pts_num = pts_num
+
+        # stage 1: intra-frame
+        ret_array1 = self.group.group_points(distance_dim=[0, 1, 2], array1=inputs, array2=inputs, knn=self.knn[0],
+                                             dim=3)
+        # B * 4 * 32 * N * 16
+        ret_array1 = ret_array1.contiguous().view(batchsize, in_dims, timestep * pts_num, -1)
+        # B * 4 * (32*N) * 16
+        fea1 = self.pool1(self.stage1(ret_array1)).view(batchsize, -1, timestep, pts_num)
+        # B * 64 * 32 * N
+        fea1 = torch.cat((inputs, fea1), dim=1)
+        # B * 68 * 32 * N
+
+        # stage 2: inter-frame, early
+        in_dims = fea1.shape[1] * 2 - 4
+        pts_num //= self.downsample[0]
+        ret_group_array2 = self.group.st_group_points(fea1, 3, [0, 1, 2], self.knn[1], 3)
+        ret_array2, inputs_downsampled, _ = self.select_ind(ret_group_array2, inputs,
+                                                batchsize, in_dims, timestep, pts_num)
+        fea2 = self.pool2(self.stage2(ret_array2)).view(batchsize, -1, timestep, pts_num)
+        fea2 = torch.cat((inputs_downsampled, fea2), dim=1)
+
+        # stage 3: inter-frame, middle, applying lstm in this stage
+        in_dims = fea2.shape[1] * 2 - 4
+        pts_num //= self.downsample[1]
         
-        # Process each timestep with spatial GCN operations
-        for t in range(T):
-            frame = x[:, :, t, :]  # B, 4, N
-            
-            # Stage 1: EdgeConv + MLPBlock
-            spatial_feat1 = self.edge_conv1(frame)           # B, 32, N - spatial relationships
-            processed_feat1 = self.mlp1(spatial_feat1.unsqueeze(-1))  # B, 64, N, 1 - MLPBlock processing
-            processed_feat1 = processed_feat1.squeeze(-1)     # B, 64, N
-            
-            # Stage 2: EdgeConv + MLPBlock  
-            spatial_feat2 = self.edge_conv2(spatial_feat1)   # B, 64, N
-            processed_feat2 = self.mlp2(spatial_feat2.unsqueeze(-1))  # B, 128, N, 1
-            processed_feat2 = processed_feat2.squeeze(-1)     # B, 128, N
-            
-            # Stage 3: EdgeConv + MLPBlock
-            spatial_feat3 = self.edge_conv3(spatial_feat2)   # B, 128, N
-            processed_feat3 = self.mlp3(spatial_feat3.unsqueeze(-1))  # B, 256, N, 1
-            processed_feat3 = processed_feat3.squeeze(-1)     # B, 256, N
-            
-            # Pool each stage spatially (across points)
-            pool1 = processed_feat1.max(dim=-1)[0]           # B, 64
-            pool2 = processed_feat2.max(dim=-1)[0]           # B, 128  
-            pool3 = processed_feat3.max(dim=-1)[0]           # B, 256
-            
-            # Combine features for this timestep
-            frame_features = torch.cat([pool1, pool2, pool3], dim=1)  # B, 448
-            all_features.append(frame_features)
+        # Ensure fea2 is properly downsampled before LSTM
+        if fea2.shape[-1] != pts_num:
+            # Additional downsampling if needed
+            indices = torch.randperm(fea2.shape[-1])[:pts_num] if self.training else \
+                     torch.linspace(0, fea2.shape[-1]-1, pts_num, dtype=torch.long)
+            fea2 = fea2[:, :, :, indices]
         
-        # Stack temporal features: B, T, 448
-        temporal_features = torch.stack(all_features, dim=1)  # B, T, 448
-        temporal_features = temporal_features.permute(0, 2, 1)  # B, 448, T
+        # Check if actual pts_num matches LSTM expectation
+        if pts_num != self.lstm.pts_num:
+            # Adjust points to match LSTM expectation
+            if pts_num > self.lstm.pts_num:
+                # Downsample to match LSTM
+                indices = torch.randperm(pts_num)[:self.lstm.pts_num] if self.training else \
+                         torch.linspace(0, pts_num-1, self.lstm.pts_num, dtype=torch.long)
+                fea2 = fea2[:, :, :, indices]
+            elif pts_num < self.lstm.pts_num:
+                # Upsample by repetition if needed
+                repeat_factor = (self.lstm.pts_num + pts_num - 1) // pts_num
+                indices = torch.cat([torch.arange(pts_num)] * repeat_factor)[:self.lstm.pts_num]
+                fea2 = fea2[:, :, :, indices]
         
-        # Channel reduction
-        output = self.channel_reducer(temporal_features)  # B, 512, T
-        
-        # Final processing - MLPBlock expects 4D input (B, C, T, N)  
-        output = output.unsqueeze(-1)  # B, 512, T, 1
-        output = self.stage5(output)  # B, 1024, T, 1
-        output = output.squeeze(-1)  # B, 1024, T
-        output = output.mean(dim=-1)  # B, 1024 - temporal average
+        output = self.lstm(fea2.permute(0, 2, 1, 3))
+        fea3 = output[0][0].squeeze(-1).permute(0, 2, 1, 3)
+        ret_group_array3 = self.group.st_group_points(fea2, 3, [0, 1, 2], self.knn[2], 3)
+        ret_array3, inputs_downsampled2, ind = self.select_ind(ret_group_array3, inputs_downsampled,
+                                                  batchsize, in_dims, timestep, pts_num)
+        fea3 = fea3.gather(-1, ind.unsqueeze(1).expand(-1, fea3.shape[1], -1, -1))
+
+        # stage 4: inter-frame, late
+        in_dims = fea3.shape[1] * 2 - 4
+        pts_num //= self.downsample[2]
+        ret_group_array4 = self.group.st_group_points(fea3, 3, [0, 1, 2], self.knn[3], 3)
+        ret_array4, inputs_downsampled3, _ = self.select_ind(ret_group_array4, inputs_downsampled2,
+                                                batchsize, in_dims, timestep, pts_num)
+        fea4 = self.pool4(self.stage4(ret_array4)).view(batchsize, -1, timestep, pts_num)
+
+        output = self.stage5(fea4)
+        output = self.pool5(output)
         output = self.global_bn(output)
-        
-        # Classification
-        logits = self.stage6(output)  # B, num_classes
-        
-        return logits
+        output = self.stage6(output)
+        return output.view(batchsize, self.num_classes)
+    
+    def select_ind(self, group_array, inputs, batchsize, in_dim, timestep, pts_num):
+        ind = self.weight_select(group_array, pts_num)
+        ret_group_array = group_array.gather(-2, ind.unsqueeze(1).unsqueeze(-1).
+                                             expand(-1, group_array.shape[1], -1, -1,
+                                                    group_array.shape[-1]))
+        ret_group_array = ret_group_array.view(batchsize, in_dim, timestep * pts_num, -1)
+        inputs = inputs.gather(-1, ind.unsqueeze(1).expand(-1, inputs.shape[1], -1, -1))
+        return ret_group_array, inputs, ind
+
+    @staticmethod
+    def weight_select(position, topk):
+        # select points with larger ranges
+        weights = torch.max(torch.sum(position[:, :3] ** 2, dim=1), dim=-1)[0]
+        # Ensure topk doesn't exceed available points
+        actual_topk = min(topk, weights.shape[-1])
+        if actual_topk <= 0:
+            actual_topk = 1
+        dists, idx = torch.topk(weights, actual_topk, -1, largest=True, sorted=False)
+        return idx
 
 
 class Motion(nn.Module):
@@ -413,11 +457,14 @@ class Motion(nn.Module):
         # Temporal noise injection for regularization during training
         self.temporal_noise_std = 0.02
         
-        # Add spatial GCN branch for late fusion with proper spatial relationship modeling
-        self.spatial_branch = SpatialGCNBranch(num_classes, pts_size, k_neighbors=16)
+        # Add PointLSTM branch for late fusion (original architecture)
+        # Create offsets for PointLSTM
+        offsets = [[0, 0, 0, 0], [0, 0, 0, 1], [0, 0, 0, -1], [0, 0, 0, 2], [0, 0, 0, -2]]
+        self.spatial_branch = PointLSTMBranch(num_classes, pts_size, offsets, topk=topk, 
+                                              downsample=downsample, knn=knn)
         
-        # Learnable fusion weights for combining temporal and spatial branches
-        self.fusion_weight = nn.Parameter(torch.tensor(0.5))  # Initialize at 0.5 for equal weighting
+        # Per-class fusion weights - each class can prefer temporal or spatial
+        self.class_fusion_weights = nn.Parameter(torch.ones(num_classes) * 0.5)  # Initialize at 0.5 for equal weighting
 
     def forward(self, inputs):
         # B * T * N * D,  e.g. 16 * 32 * 512 * 4
@@ -490,17 +537,24 @@ class Motion(nn.Module):
         inputs_for_spatial = inputs_original[:, :4, :, indices]  # Use same indices for consistency
         spatial_logits = self.spatial_branch(inputs_for_spatial)
         
-        # Late fusion with learnable weights
-        # Sigmoid to ensure weight is between 0 and 1
-        alpha = torch.sigmoid(self.fusion_weight)
+        # Softmax fusion - let each class choose its best branch
+        # Convert logits to probabilities
+        temporal_probs = F.softmax(temporal_logits, dim=1)
+        spatial_probs = F.softmax(spatial_logits, dim=1)
         
-        # Combine both branches
-        combined_logits = alpha * temporal_logits + (1 - alpha) * spatial_logits
+        # Per-class weighting with sigmoid for stability
+        alpha = torch.sigmoid(self.class_fusion_weights).unsqueeze(0)  # (1, num_classes)
+        
+        # Weighted combination of probabilities
+        combined_probs = alpha * temporal_probs + (1 - alpha) * spatial_probs
+        
+        # Convert back to logits for loss computation
+        combined_logits = torch.log(combined_probs + 1e-8)
         
         # Store branch logits for separate loss computation (for monitoring)
         self.temporal_logits = temporal_logits
         self.spatial_logits = spatial_logits
-        self.alpha_value = alpha.item()
+        self.alpha_value = alpha.mean().item()  # Average alpha for monitoring
         
         return combined_logits
 
@@ -517,7 +571,11 @@ class Motion(nn.Module):
     def weight_select(position, topk):
         # select points with larger ranges
         weights = torch.max(torch.sum(position[:, :3] ** 2, dim=1), dim=-1)[0]
-        dists, idx = torch.topk(weights, topk, -1, largest=True, sorted=False)
+        # Ensure topk doesn't exceed available points
+        actual_topk = min(topk, weights.shape[-1])
+        if actual_topk <= 0:
+            actual_topk = 1
+        dists, idx = torch.topk(weights, actual_topk, -1, largest=True, sorted=False)
         return idx
 
 

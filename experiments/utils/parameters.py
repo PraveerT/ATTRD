@@ -76,6 +76,12 @@ def get_parser():
         default=128,
         help='the number of sampled points for each frame')
     parser.add_argument(
+        '--freeze',
+        type=str,
+        default=None,
+        choices=['spatial', 'temporal'],
+        help='Freeze spatial or temporal branch during training')
+    parser.add_argument(
         '--train-loader-args',
         default=dict(),
         help='the arguments of data loader for training')

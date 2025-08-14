@@ -198,6 +198,22 @@ class Processor():
                 optimizer = Optimizer(model, self.arg.optimizer_args)
         else:
             raise ValueError("No Models.")
+        
+        # Freeze branches if requested
+        if hasattr(self.arg, 'freeze') and self.arg.freeze:
+            if self.arg.freeze == 'spatial':
+                self.recoder.print_log(f"Freezing spatial branch")
+                for name, param in model.named_parameters():
+                    if 'spatial_branch' in name:
+                        param.requires_grad = False
+                        self.recoder.print_log(f"  Froze: {name}")
+            elif self.arg.freeze == 'temporal':
+                self.recoder.print_log(f"Freezing temporal branch (main branch)")
+                for name, param in model.named_parameters():
+                    if 'spatial_branch' not in name and 'fusion_weight' not in name:
+                        param.requires_grad = False
+                        self.recoder.print_log(f"  Froze: {name}")
+        
         print("Loading model finished.")
         self.load_data()
         return model, optimizer
