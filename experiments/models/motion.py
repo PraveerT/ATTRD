@@ -238,48 +238,95 @@ class MambaTemporalEncoder(nn.Module):
         return x
 
 
-class SpatialConvBranch(nn.Module):
-    """Spatial convolution branch for late fusion with temporal features.
-    Processes point clouds directly with 1D convolutions to capture spatial patterns."""
+class EdgeConv(nn.Module):
+    """Edge convolution layer for graph neural networks.
+    Aggregates features from neighboring points using edge features."""
     
-    def __init__(self, num_classes, pts_size):
+    def __init__(self, in_channels, out_channels, k=20):
+        super().__init__()
+        self.k = k
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels * 2, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(),
+            nn.Dropout(0.2)
+        )
+        
+    def knn_graph(self, x):
+        """Construct k-NN graph dynamically - vectorized version.
+        x: (B, C, N) - batch_size, channels, num_points
+        Returns: (B, C, N, k) - k nearest neighbors for each point
+        """
+        B, C, N = x.shape
+        
+        # Compute pairwise distances using first 3 channels (xyz)
+        inner = -2 * torch.matmul(x[:, :3].transpose(2, 1), x[:, :3])  # (B, N, N)
+        xx = torch.sum(x[:, :3] ** 2, dim=1, keepdim=True)  # (B, 1, N)
+        distances = -xx - inner - xx.transpose(2, 1)  # (B, N, N)
+        
+        # Find k-nearest neighbors (including self)
+        knn_idx = distances.topk(k=self.k, dim=-1)[1]  # (B, N, k)
+        
+        # Vectorized gathering using gather
+        knn_idx_expanded = knn_idx.unsqueeze(1).expand(-1, C, -1, -1)  # (B, C, N, k)
+        neighbors = torch.gather(x.unsqueeze(-1).expand(-1, -1, -1, N), 3, knn_idx_expanded)  # (B, C, N, k)
+        
+        return neighbors, knn_idx
+    
+    def forward(self, x):
+        """
+        x: (B, C, N) - batch_size, channels, num_points
+        Returns: (B, out_channels, N)
+        """
+        B, C, N = x.shape
+        
+        # Construct k-NN graph and get neighbor features
+        neighbors, _ = self.knn_graph(x)  # (B, C, N, k)
+        
+        # Compute edge features: concatenate [point_features, neighbor_features - point_features]
+        x_tiled = x.unsqueeze(-1).repeat(1, 1, 1, self.k)  # (B, C, N, k)
+        edge_features = torch.cat([x_tiled, neighbors - x_tiled], dim=1)  # (B, 2*C, N, k)
+        
+        # Apply convolution on edge features
+        out = self.conv(edge_features)  # (B, out_channels, N, k)
+        
+        # Aggregate neighbor information (max pooling)
+        out = out.max(dim=-1)[0]  # (B, out_channels, N)
+        
+        return out
+
+
+class SpatialGCNBranch(nn.Module):
+    """Spatial Graph Convolutional Network branch for late fusion.
+    Uses dynamic graph construction and edge convolutions to capture spatial relationships."""
+    
+    def __init__(self, num_classes, pts_size, k_neighbors=16):
         super().__init__()
         self.pts_size = pts_size
+        self.k = k_neighbors
         
-        # PointNet-style 1D convolutions for spatial feature extraction
-        self.conv1 = nn.Sequential(
-            nn.Conv1d(4, 64, 1),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Dropout(0.2)
-        )
+        # Edge convolution layers for spatial graph processing
+        self.edge_conv1 = EdgeConv(4, 64, k=k_neighbors)
+        self.edge_conv2 = EdgeConv(64, 128, k=k_neighbors)
+        self.edge_conv3 = EdgeConv(128, 256, k=k_neighbors//2)  # Reduce k for deeper layers
         
-        self.conv2 = nn.Sequential(
-            nn.Conv1d(64, 128, 1),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Dropout(0.2)
-        )
-        
-        self.conv3 = nn.Sequential(
-            nn.Conv1d(128, 256, 1),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(0.3)
-        )
-        
-        self.conv4 = nn.Sequential(
-            nn.Conv1d(256, 512, 1),
+        # Feature transformation after graph convolutions
+        self.transform = nn.Sequential(
+            nn.Conv1d(448, 512, 1),  # 64+128+256=448
             nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Conv1d(512, 256, 1),
+            nn.BatchNorm1d(256),
             nn.ReLU(),
             nn.Dropout(0.3)
         )
         
         # Temporal aggregation with attention
         self.temporal_attention = nn.Sequential(
-            nn.Linear(512, 128),
+            nn.Linear(256, 64),
             nn.ReLU(),
-            nn.Linear(128, 1),
+            nn.Linear(64, 1),
             nn.Softmax(dim=1)
         )
         
@@ -288,35 +335,42 @@ class SpatialConvBranch(nn.Module):
         
         # Final classifier
         self.fc = nn.Sequential(
-            nn.Linear(512, 256),
+            nn.Linear(256, 128),
             nn.ReLU(),
             nn.Dropout(0.4),
-            nn.Linear(256, num_classes)
+            nn.Linear(128, num_classes)
         )
         
     def forward(self, x):
         # x shape: B, 4, T, N
         B, C, T, N = x.shape
         
-        # Process each frame independently first
-        x = x.permute(0, 2, 1, 3).reshape(B * T, C, N)  # (B*T, 4, N)
+        # Reshape to process all frames at once
+        x_reshaped = x.permute(0, 2, 1, 3).reshape(B * T, C, N)  # (B*T, 4, N)
         
-        # Spatial convolutions
-        x = self.conv1(x)  # (B*T, 64, N)
-        x = self.conv2(x)  # (B*T, 128, N)
-        x = self.conv3(x)  # (B*T, 256, N)
-        x = self.conv4(x)  # (B*T, 512, N)
+        # Apply edge convolutions with skip connections (vectorized across all frames)
+        feat1 = self.edge_conv1(x_reshaped)  # (B*T, 64, N)
+        feat2 = self.edge_conv2(feat1)  # (B*T, 128, N)
+        feat3 = self.edge_conv3(feat2)  # (B*T, 256, N)
+        
+        # Concatenate multi-scale features
+        multi_scale = torch.cat([feat1, feat2, feat3], dim=1)  # (B*T, 448, N)
+        
+        # Transform concatenated features
+        transformed = self.transform(multi_scale)  # (B*T, 256, N)
         
         # Global pooling per frame
-        x = self.global_pool(x).squeeze(-1)  # (B*T, 512)
-        x = x.reshape(B, T, 512)  # (B, T, 512)
+        pooled = self.global_pool(transformed).squeeze(-1)  # (B*T, 256)
+        
+        # Reshape back to temporal dimension
+        temporal_features = pooled.reshape(B, T, 256)  # (B, T, 256)
         
         # Temporal aggregation with attention
-        attn_weights = self.temporal_attention(x)  # (B, T, 1)
-        x = (x * attn_weights).sum(dim=1)  # (B, 512)
+        attn_weights = self.temporal_attention(temporal_features)  # (B, T, 1)
+        aggregated = (temporal_features * attn_weights).sum(dim=1)  # (B, 256)
         
         # Classification
-        logits = self.fc(x)  # (B, num_classes)
+        logits = self.fc(aggregated)  # (B, num_classes)
         
         return logits
 
@@ -351,8 +405,8 @@ class Motion(nn.Module):
         # Temporal noise injection for regularization during training
         self.temporal_noise_std = 0.02
         
-        # Add spatial convolution branch for late fusion
-        self.spatial_branch = SpatialConvBranch(num_classes, pts_size)
+        # Add spatial GCN branch for late fusion with proper spatial relationship modeling
+        self.spatial_branch = SpatialGCNBranch(num_classes, pts_size, k_neighbors=16)
         
         # Learnable fusion weights for combining temporal and spatial branches
         self.fusion_weight = nn.Parameter(torch.tensor(0.5))  # Initialize at 0.5 for equal weighting
