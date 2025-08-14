@@ -485,7 +485,15 @@ class Motion(nn.Module):
         # Late fusion with learnable weights
         # Sigmoid to ensure weight is between 0 and 1
         alpha = torch.sigmoid(self.fusion_weight)
-        combined_logits = alpha * temporal_logits + (1 - alpha) * spatial_logits
+        
+        # TEMPORARY: Zero out temporal logits to test spatial branch only
+        temporal_logits_zeroed = torch.zeros_like(temporal_logits)
+        combined_logits = alpha * temporal_logits_zeroed + (1 - alpha) * spatial_logits
+        
+        # Store branch logits for separate loss computation (for monitoring)
+        self.temporal_logits = temporal_logits
+        self.spatial_logits = spatial_logits
+        self.alpha_value = alpha.item()
         
         return combined_logits
 

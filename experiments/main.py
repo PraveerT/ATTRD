@@ -70,6 +70,8 @@ class Processor():
         
         loader = self.data_loader['train']
         loss_value = []
+        temporal_loss_values = []
+        spatial_loss_values = []
         correct = 0
         total = 0
         self.recoder.timer_reset()
@@ -87,6 +89,27 @@ class Processor():
             output = self.model(image)
             self.recoder.record_timer("forward")
             loss = torch.mean(self.loss(output, label))
+            
+            # Compute separate branch losses for monitoring
+            if hasattr(self.model, 'temporal_logits') and hasattr(self.model, 'spatial_logits'):
+                with torch.no_grad():
+                    temporal_loss = torch.mean(self.loss(self.model.temporal_logits, label))
+                    spatial_loss = torch.mean(self.loss(self.model.spatial_logits, label))
+                    
+                    # Track separate losses for epoch mean calculation
+                    temporal_loss_values.append(temporal_loss.item())
+                    spatial_loss_values.append(spatial_loss.item())
+                    
+                    # Print branch losses every 50 batches
+                    if batch_idx % 50 == 0:
+                        # Get current learning rates
+                        temporal_lr = self.optimizer.optimizer.param_groups[0]['lr']
+                        spatial_lr = self.optimizer.optimizer.param_groups[1]['lr'] if len(self.optimizer.optimizer.param_groups) > 1 else temporal_lr
+                        print(f"\n[Branch Losses] Temporal: {temporal_loss.item():.4f} (lr={temporal_lr:.6f}), "
+                              f"Spatial: {spatial_loss.item():.4f} (lr={spatial_lr:.6f}), "
+                              f"Combined: {loss.item():.4f}, "
+                              f"Alpha: {getattr(self.model, 'alpha_value', 'N/A')}")
+            
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
@@ -115,6 +138,11 @@ class Processor():
                 self.recoder.print_time_statistics()
         self.optimizer.scheduler.step()
         self.recoder.print_log('\tMean training loss: {:.10f}.'.format(np.mean(loss_value)))
+        
+        # Print separate branch loss means if available
+        if temporal_loss_values and spatial_loss_values:
+            self.recoder.print_log('\tMean temporal loss: {:.10f}.'.format(np.mean(temporal_loss_values)))
+            self.recoder.print_log('\tMean spatial loss: {:.10f}.'.format(np.mean(spatial_loss_values)))
 
     def eval(self, loader_name):
         self.model.eval()
