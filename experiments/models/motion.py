@@ -297,80 +297,88 @@ class EdgeConv(nn.Module):
 
 
 class SpatialGCNBranch(nn.Module):
-    """Spatial Graph Convolutional Network branch for late fusion.
-    Uses dynamic graph construction and edge convolutions to capture spatial relationships."""
+    """True spatial branch using EdgeConv GCN + MLPBlock processing"""
     
     def __init__(self, num_classes, pts_size, k_neighbors=16):
         super().__init__()
         self.pts_size = pts_size
-        self.k = k_neighbors
+        self.k_neighbors = k_neighbors
         
-        # Edge convolution layers for spatial graph processing
-        self.edge_conv1 = EdgeConv(4, 64, k=k_neighbors)
-        self.edge_conv2 = EdgeConv(64, 128, k=k_neighbors)
-        self.edge_conv3 = EdgeConv(128, 256, k=k_neighbors//2)  # Reduce k for deeper layers
+        # Import MLPBlock from op.py
+        from .op import MLPBlock
         
-        # Feature transformation after graph convolutions
-        self.transform = nn.Sequential(
-            nn.Conv1d(448, 512, 1),  # 64+128+256=448
-            nn.BatchNorm1d(512),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Conv1d(512, 256, 1),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(0.3)
-        )
+        # EdgeConv layers for spatial relationship modeling
+        self.edge_conv1 = EdgeConv(4, 32, k=k_neighbors)      # 4 (xyzt) -> 32 channels
+        self.edge_conv2 = EdgeConv(32, 64, k=k_neighbors)     # 32 -> 64 channels  
+        self.edge_conv3 = EdgeConv(64, 128, k=k_neighbors)    # 64 -> 128 channels
         
-        # Temporal aggregation with attention
-        self.temporal_attention = nn.Sequential(
-            nn.Linear(256, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
-            nn.Softmax(dim=1)
-        )
+        # MLPBlock processing after each EdgeConv
+        self.mlp1 = MLPBlock([32, 64], 2)                     # Process EdgeConv1 output
+        self.mlp2 = MLPBlock([64, 128], 2)                    # Process EdgeConv2 output  
+        self.mlp3 = MLPBlock([128, 256], 2)                   # Process EdgeConv3 output
         
-        # Global feature extraction
-        self.global_pool = nn.AdaptiveMaxPool1d(1)
+        # Temporal pooling for each stage
+        self.pool1 = nn.AdaptiveMaxPool2d((None, 1))
+        self.pool2 = nn.AdaptiveMaxPool2d((None, 1))
+        self.pool3 = nn.AdaptiveMaxPool2d((None, 1))
         
-        # Final classifier
-        self.fc = nn.Sequential(
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(128, num_classes)
-        )
+        # Global feature extraction and classification
+        # Combine features: 64 + 128 + 256 = 448 channels
+        self.channel_reducer = nn.Conv1d(448, 512, 1)        
+        self.stage5 = MLPBlock([512, 1024], 2)
+        self.global_bn = nn.BatchNorm1d(1024)
+        self.stage6 = nn.Linear(1024, num_classes)
         
     def forward(self, x):
         # x shape: B, 4, T, N
         B, C, T, N = x.shape
         
-        # Reshape to process all frames at once
-        x_reshaped = x.permute(0, 2, 1, 3).reshape(B * T, C, N)  # (B*T, 4, N)
+        all_features = []
         
-        # Apply edge convolutions with skip connections (vectorized across all frames)
-        feat1 = self.edge_conv1(x_reshaped)  # (B*T, 64, N)
-        feat2 = self.edge_conv2(feat1)  # (B*T, 128, N)
-        feat3 = self.edge_conv3(feat2)  # (B*T, 256, N)
+        # Process each timestep with spatial GCN operations
+        for t in range(T):
+            frame = x[:, :, t, :]  # B, 4, N
+            
+            # Stage 1: EdgeConv + MLPBlock
+            spatial_feat1 = self.edge_conv1(frame)           # B, 32, N - spatial relationships
+            processed_feat1 = self.mlp1(spatial_feat1.unsqueeze(-1))  # B, 64, N, 1 - MLPBlock processing
+            processed_feat1 = processed_feat1.squeeze(-1)     # B, 64, N
+            
+            # Stage 2: EdgeConv + MLPBlock  
+            spatial_feat2 = self.edge_conv2(spatial_feat1)   # B, 64, N
+            processed_feat2 = self.mlp2(spatial_feat2.unsqueeze(-1))  # B, 128, N, 1
+            processed_feat2 = processed_feat2.squeeze(-1)     # B, 128, N
+            
+            # Stage 3: EdgeConv + MLPBlock
+            spatial_feat3 = self.edge_conv3(spatial_feat2)   # B, 128, N
+            processed_feat3 = self.mlp3(spatial_feat3.unsqueeze(-1))  # B, 256, N, 1
+            processed_feat3 = processed_feat3.squeeze(-1)     # B, 256, N
+            
+            # Pool each stage spatially (across points)
+            pool1 = processed_feat1.max(dim=-1)[0]           # B, 64
+            pool2 = processed_feat2.max(dim=-1)[0]           # B, 128  
+            pool3 = processed_feat3.max(dim=-1)[0]           # B, 256
+            
+            # Combine features for this timestep
+            frame_features = torch.cat([pool1, pool2, pool3], dim=1)  # B, 448
+            all_features.append(frame_features)
         
-        # Concatenate multi-scale features
-        multi_scale = torch.cat([feat1, feat2, feat3], dim=1)  # (B*T, 448, N)
+        # Stack temporal features: B, T, 448
+        temporal_features = torch.stack(all_features, dim=1)  # B, T, 448
+        temporal_features = temporal_features.permute(0, 2, 1)  # B, 448, T
         
-        # Transform concatenated features
-        transformed = self.transform(multi_scale)  # (B*T, 256, N)
+        # Channel reduction
+        output = self.channel_reducer(temporal_features)  # B, 512, T
         
-        # Global pooling per frame
-        pooled = self.global_pool(transformed).squeeze(-1)  # (B*T, 256)
-        
-        # Reshape back to temporal dimension
-        temporal_features = pooled.reshape(B, T, 256)  # (B, T, 256)
-        
-        # Temporal aggregation with attention
-        attn_weights = self.temporal_attention(temporal_features)  # (B, T, 1)
-        aggregated = (temporal_features * attn_weights).sum(dim=1)  # (B, 256)
+        # Final processing - MLPBlock expects 4D input (B, C, T, N)  
+        output = output.unsqueeze(-1)  # B, 512, T, 1
+        output = self.stage5(output)  # B, 1024, T, 1
+        output = output.squeeze(-1)  # B, 1024, T
+        output = output.mean(dim=-1)  # B, 1024 - temporal average
+        output = self.global_bn(output)
         
         # Classification
-        logits = self.fc(aggregated)  # (B, num_classes)
+        logits = self.stage6(output)  # B, num_classes
         
         return logits
 
@@ -486,9 +494,8 @@ class Motion(nn.Module):
         # Sigmoid to ensure weight is between 0 and 1
         alpha = torch.sigmoid(self.fusion_weight)
         
-        # TEMPORARY: Zero out temporal logits to test spatial branch only
-        temporal_logits_zeroed = torch.zeros_like(temporal_logits)
-        combined_logits = alpha * temporal_logits_zeroed + (1 - alpha) * spatial_logits
+        # Combine both branches
+        combined_logits = alpha * temporal_logits + (1 - alpha) * spatial_logits
         
         # Store branch logits for separate loss computation (for monitoring)
         self.temporal_logits = temporal_logits
