@@ -238,6 +238,89 @@ class MambaTemporalEncoder(nn.Module):
         return x
 
 
+class SpatialConvBranch(nn.Module):
+    """Spatial convolution branch for late fusion with temporal features.
+    Processes point clouds directly with 1D convolutions to capture spatial patterns."""
+    
+    def __init__(self, num_classes, pts_size):
+        super().__init__()
+        self.pts_size = pts_size
+        
+        # PointNet-style 1D convolutions for spatial feature extraction
+        self.conv1 = nn.Sequential(
+            nn.Conv1d(4, 64, 1),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(0.2)
+        )
+        
+        self.conv2 = nn.Sequential(
+            nn.Conv1d(64, 128, 1),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.2)
+        )
+        
+        self.conv3 = nn.Sequential(
+            nn.Conv1d(128, 256, 1),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
+        
+        self.conv4 = nn.Sequential(
+            nn.Conv1d(256, 512, 1),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
+        
+        # Temporal aggregation with attention
+        self.temporal_attention = nn.Sequential(
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1),
+            nn.Softmax(dim=1)
+        )
+        
+        # Global feature extraction
+        self.global_pool = nn.AdaptiveMaxPool1d(1)
+        
+        # Final classifier
+        self.fc = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(256, num_classes)
+        )
+        
+    def forward(self, x):
+        # x shape: B, 4, T, N
+        B, C, T, N = x.shape
+        
+        # Process each frame independently first
+        x = x.permute(0, 2, 1, 3).reshape(B * T, C, N)  # (B*T, 4, N)
+        
+        # Spatial convolutions
+        x = self.conv1(x)  # (B*T, 64, N)
+        x = self.conv2(x)  # (B*T, 128, N)
+        x = self.conv3(x)  # (B*T, 256, N)
+        x = self.conv4(x)  # (B*T, 512, N)
+        
+        # Global pooling per frame
+        x = self.global_pool(x).squeeze(-1)  # (B*T, 512)
+        x = x.reshape(B, T, 512)  # (B, T, 512)
+        
+        # Temporal aggregation with attention
+        attn_weights = self.temporal_attention(x)  # (B, T, 1)
+        x = (x * attn_weights).sum(dim=1)  # (B, 512)
+        
+        # Classification
+        logits = self.fc(x)  # (B, num_classes)
+        
+        return logits
+
+
 class Motion(nn.Module):
     def __init__(self, num_classes, pts_size, topk=16, downsample=(2, 2, 2),
                  knn=(16, 48, 48, 24)):
@@ -267,10 +350,20 @@ class Motion(nn.Module):
         
         # Temporal noise injection for regularization during training
         self.temporal_noise_std = 0.02
+        
+        # Add spatial convolution branch for late fusion
+        self.spatial_branch = SpatialConvBranch(num_classes, pts_size)
+        
+        # Learnable fusion weights for combining temporal and spatial branches
+        self.fusion_weight = nn.Parameter(torch.tensor(0.5))  # Initialize at 0.5 for equal weighting
 
     def forward(self, inputs):
         # B * T * N * D,  e.g. 16 * 32 * 512 * 4
         inputs = inputs.permute(0, 3, 1, 2)
+        
+        # Store original inputs for spatial branch before sampling
+        inputs_original = inputs.clone()
+        
         if self.training:
             # Random sampling during training for augmentation
             indices = torch.randperm(inputs.shape[3])[:self.pts_size]
@@ -298,10 +391,10 @@ class Motion(nn.Module):
         in_dims = fea1.shape[1] * 2 - 4
         pts_num //= self.downsample[0]
         ret_group_array2 = self.group.st_group_points(fea1, 3, [0, 1, 2], self.knn[1], 3)
-        ret_array2, inputs, _ = self.select_ind(ret_group_array2, inputs,
+        ret_array2, inputs_downsampled, _ = self.select_ind(ret_group_array2, inputs,
                                                 batchsize, in_dims, timestep, pts_num)
         fea2 = self.pool2(self.stage2(ret_array2)).view(batchsize, -1, timestep, pts_num)
-        fea2 = torch.cat((inputs, fea2), dim=1)
+        fea2 = torch.cat((inputs_downsampled, fea2), dim=1)
         
         # Apply multi-scale feature processing
         fea2 = self.multi_scale(fea2)
@@ -315,13 +408,13 @@ class Motion(nn.Module):
         in_dims = fea2.shape[1] * 2 - 4
         pts_num //= self.downsample[1]
         ret_group_array3 = self.group.st_group_points(fea2, 3, [0, 1, 2], self.knn[2], 3)
-        ret_array3, inputs, ind = self.select_ind(ret_group_array3, inputs,
+        ret_array3, inputs_downsampled2, ind = self.select_ind(ret_group_array3, inputs_downsampled,
                                                   batchsize, in_dims, timestep, pts_num)
         fea3 = self.pool3(self.stage3(ret_array3)).view(batchsize, -1, timestep, pts_num)
         # Apply Mamba temporal modeling after spatial processing
         fea3_mamba = self.mamba(fea3)
         # Concatenate with inputs for next stage
-        fea3 = torch.cat((inputs, fea3_mamba), dim=1)
+        fea3 = torch.cat((inputs_downsampled2, fea3_mamba), dim=1)
 
         # Stage 4 removed - direct connection from Stage 3+Mamba to Stage 5
         # fea3 shape: (batchsize, features, timestep, 32 points)
@@ -329,8 +422,18 @@ class Motion(nn.Module):
         output = self.stage5(fea3)
         output = self.pool5(output)
         output = self.global_bn(output)
-        output = self.stage6(output)
-        return output.view(batchsize, self.num_classes)
+        temporal_logits = self.stage6(output).view(batchsize, self.num_classes)
+        
+        # Spatial branch processing with sampled inputs
+        inputs_for_spatial = inputs_original[:, :4, :, indices]  # Use same indices for consistency
+        spatial_logits = self.spatial_branch(inputs_for_spatial)
+        
+        # Late fusion with learnable weights
+        # Sigmoid to ensure weight is between 0 and 1
+        alpha = torch.sigmoid(self.fusion_weight)
+        combined_logits = alpha * temporal_logits + (1 - alpha) * spatial_logits
+        
+        return combined_logits
 
     def select_ind(self, group_array, inputs, batchsize, in_dim, timestep, pts_num):
         ind = self.weight_select(group_array, pts_num)
