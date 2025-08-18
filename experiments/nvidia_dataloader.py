@@ -79,19 +79,19 @@ class NvidiaLoader(data.Dataset):
         timestep, pts_size, channels = pts.shape
         pts = pts.reshape(-1, channels)
         
-        if self.dataset_stats is not None:
-            # Use global dataset statistics for consistent normalization
-            pts[:, 0] = (pts[:, 0] - self.dataset_stats['x_mean']) / self.dataset_stats['x_std']
-            pts[:, 1] = (pts[:, 1] - self.dataset_stats['y_mean']) / self.dataset_stats['y_std']
-            pts[:, 2] = (pts[:, 2] - self.dataset_stats['z_mean']) / self.dataset_stats['z_std']
-            pts[:, 3] = (pts[:, 3] - self.dataset_stats['t_mean']) / self.dataset_stats['t_std']
-        else:
-            # Fallback to original per-sample normalization if stats not available
-            pts[:, 0] = (pts[:, 0] - np.mean(pts[:, 0])) / 120
-            pts[:, 1] = (pts[:, 1] - np.mean(pts[:, 1])) / 160
-            pts[:, 3] = (pts[:, 3] - fs / 2) / fs * 2
-            if (pts[:, 2].max() - pts[:, 2].min()) != 0:
-                pts[:, 2] = (pts[:, 2] - np.mean(pts[:, 2])) / (pts[:, 2].max() - pts[:, 2].min()) * 2
+        # if self.dataset_stats is not None:
+        # Use global dataset statistics for consistent normalization
+        pts[:, 0] = (pts[:, 0] - self.dataset_stats['x_mean']) / self.dataset_stats['x_std']
+        pts[:, 1] = (pts[:, 1] - self.dataset_stats['y_mean']) / self.dataset_stats['y_std']
+        pts[:, 2] = (pts[:, 2] - self.dataset_stats['z_mean']) / self.dataset_stats['z_std']
+        pts[:, 3] = (pts[:, 3] - self.dataset_stats['t_mean']) / self.dataset_stats['t_std']
+        # else:
+        #     # Fallback to original per-sample normalization if stats not available
+        #     pts[:, 0] = (pts[:, 0] - np.mean(pts[:, 0])) / 120
+        #     pts[:, 1] = (pts[:, 1] - np.mean(pts[:, 1])) / 160
+        #     pts[:, 3] = (pts[:, 3] - fs / 2) / fs * 2
+        #     if (pts[:, 2].max() - pts[:, 2].min()) != 0:
+        #         pts[:, 2] = (pts[:, 2] - np.mean(pts[:, 2])) / (pts[:, 2].max() - pts[:, 2].min()) * 2
         
         pts = self.transform(pts)
         pts = pts.reshape(timestep, pts_size, channels)
@@ -110,7 +110,7 @@ class NvidiaLoader(data.Dataset):
                 TemporalTranslate(max_shift_ratio=0.2, prob=0.4),
                 TemporalCutout(max_cutout_ratio=0.2, num_holes=(1, 4), prob=0.6),
                 TemporalShuffle(window_size=7, num_shuffles=4, prob=0.4),
-                PointcloudRandomInputDropout(max_dropout_ratio=0.25),
+                # PointcloudRandomInputDropout(max_dropout_ratio=0.25),
             ])
         else:
             transform = Compose([
