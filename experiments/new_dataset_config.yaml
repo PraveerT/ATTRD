@@ -1,0 +1,54 @@
+# New Dataset Configuration
+dataloader: ntu_dataloader_fast.NTULoaderFast
+
+# train or test
+phase: train
+num_epoch: 300
+work_dir: ./work_dir/new_dataset/
+batch_size: 16
+test_batch_size: 16
+num_worker: 8  # Can use multiple workers with pre-processed data
+
+# GPU device
+device: 0
+log_interval: 50
+eval_interval: 5
+save_interval: 5
+
+framesize: &framesize 32
+pts_size: &frame_pts_size 128
+
+optimizer_args:
+  optimizer: Adam
+  base_lr: 0.0001
+  step: [ 100, 160, 200, 250]
+  weight_decay: 0.0005
+  start_epoch: 0
+  nesterov: False
+
+train_loader_args:
+  phase: 'train'
+  framerate: *framesize
+  pts_size: *frame_pts_size
+  data_path: "/path/to/your/new/dataset"
+
+test_loader_args:
+  phase: 'test'
+  framerate: *framesize
+  pts_size: *frame_pts_size
+  data_path: "/path/to/your/new/dataset"
+
+model: models.motion.Motion
+model_args:
+  pts_size: *frame_pts_size
+  num_classes: 25  # New dataset has 25 action classes
+  knn: [16, 24, 48, 12]
+  topk: 16
+
+# Soft label parameters for knowledge distillation
+use_soft_labels: false
+temperature: 3.0
+alpha: 0.7
+
+# Pretrain path
+pretrain: ./work_dir/ntu_fast/epoch40_model.pt

@@ -105,7 +105,7 @@ class NvidiaLoader(data.Dataset):
                 PointcloudScale(lo=0.85, hi=1.15),
                 PointcloudRotatePerturbation(angle_sigma=0.08, angle_clip=0.22),
                 PointcloudTranslate(translate_range=0.1),
-                PointcloudJitter(std=0.015, clip=0.06),
+                # PointcloudJitter(std=0.015, clip=0.06),
                 TemporalSpeedChange(speed_range=(0.85, 1.15), prob=0.3),
                 TemporalTranslate(max_shift_ratio=0.2, prob=0.4),
                 TemporalCutout(max_cutout_ratio=0.2, num_holes=(1, 4), prob=0.6),
