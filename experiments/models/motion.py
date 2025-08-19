@@ -249,7 +249,7 @@ class Motion(nn.Module):
         self.stage3 = MotionBlock([256, 256, ], 2, 4)
         self.pool3 = nn.AdaptiveMaxPool2d((None, 1))
         # Stage 4 removed to reduce overfitting and improve efficiency
-        self.stage5 = MLPBlock([260, 1024], 2)
+        self.stage5 = MLPBlock([260, 1024], 2)  # Updated from 512 to 260 (fea3 channels)
         self.pool5 = nn.AdaptiveMaxPool2d((1, 1))
         self.stage6 = MLPBlock([1024, num_classes], 2, with_bn=False)
         self.global_bn = nn.BatchNorm2d(1024)
@@ -267,30 +267,10 @@ class Motion(nn.Module):
         
         # Temporal noise injection for regularization during training
         self.temporal_noise_std = 0.02
-        
-        # Add new convolution branch
-        self.conv_branch = nn.Sequential(
-            nn.Conv2d(4, 64, kernel_size=(3, 3), padding=(1, 1)),
-            nn.BatchNorm2d(64),
-            nn.GELU(),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(64, num_classes)
-        )
-        
-        # Add gating mechanism for branch fusion
-        self.fusion_gate = nn.Sequential(
-            nn.Linear(1024 + num_classes, 512),
-            nn.GELU(),
-            nn.Linear(512, num_classes),
-            nn.Sigmoid()
-        )
 
     def forward(self, inputs):
         # B * T * N * D,  e.g. 16 * 32 * 512 * 4
         inputs = inputs.permute(0, 3, 1, 2)
-        # Store original inputs for convolution branch
-        inputs_raw = inputs.clone()
         if self.training:
             # Random sampling during training for augmentation
             indices = torch.randperm(inputs.shape[3])[:self.pts_size]
@@ -349,21 +329,8 @@ class Motion(nn.Module):
         output = self.stage5(fea3)
         output = self.pool5(output)
         output = self.global_bn(output)
-        main_features = output.view(batchsize, -1)  # This should be [batchsize, 1024]
         output = self.stage6(output)
-        
-        # Get main branch output
-        main_output = output.view(batchsize, self.num_classes)
-        
-        # Process input through convolution branch (using only first 4 channels)
-        conv_output = self.conv_branch(inputs_raw[:, :4])
-        
-        # Gated fusion of both branches
-        gate_input = torch.cat([main_features, conv_output], dim=1)
-        gate_weight = self.fusion_gate(gate_input)
-        combined_output = gate_weight * main_output + (1 - gate_weight) * conv_output
-        
-        return combined_output
+        return output.view(batchsize, self.num_classes)
 
     def select_ind(self, group_array, inputs, batchsize, in_dim, timestep, pts_num):
         ind = self.weight_select(group_array, pts_num)
