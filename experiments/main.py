@@ -276,6 +276,22 @@ class Processor():
                                format(epoch, mode, prec1, prec5),
                                '{}/{}.txt'.format(self.arg.work_dir, self.arg.phase))
         
+        # Display confusion matrix
+        try:
+            import numpy as np
+            cm = self.stat.confusion_mat
+            if cm is not None:
+                self.recoder.print_log(f"Confusion Matrix (epoch {epoch}, {mode}):")
+                # Print a simplified version of the confusion matrix
+                # Show only the diagonal elements (correct predictions) and some key stats
+                diagonal = np.diag(cm)
+                total_correct = np.sum(diagonal)
+                total_samples = np.sum(cm)
+                self.recoder.print_log(f"  Total Correct: {total_correct}/{total_samples}")
+                self.recoder.print_log(f"  Overall Accuracy: {total_correct/total_samples*100:.2f}%")
+        except Exception as e:
+            self.recoder.print_log(f"Failed to display confusion matrix: {e}")
+        
         # Send Telegram message with evaluation results
         try:
             # Check if this is a new best
