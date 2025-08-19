@@ -283,18 +283,17 @@ class Processor():
             if is_new_best:
                 self.best_accuracy = prec1
             
-            # Format message in compact format: Train acc p1 ls  Test acc p1 ls
+            # Format message as: Train: train acc train loss Test: test acc test loss
             if train_acc is not None and train_loss is not None:
                 message = f"📊 Epoch {epoch}\n"
-                message += f"Train: {train_acc:.1f}% p1:{prec1:.1f} ls:{train_loss:.2f}\n"
-                message += f"Test:  {prec1:.1f}% p5:{prec5:.1f}"
+                message += f"Train: {train_acc:.1f} {train_loss:.2f}\n"
+                message += f"Test: {prec1:.1f} {prec5:.1f}"
                 if is_new_best:
                     message += f" 🏆 New Best: {self.best_accuracy:.1f}%"
             else:
                 # For test phase without training data
                 message = f"📊 Epoch {epoch} {mode}\n"
-                message += f"Top-1 Acc: {prec1:.1f}%\n"
-                message += f"Top-5 Acc: {prec5:.1f}%\n"
+                message += f"Test: {prec1:.1f} {prec5:.1f}\n"
                 if is_new_best:
                     message += f"🏆 New Best: {self.best_accuracy:.1f}%\n"
             
