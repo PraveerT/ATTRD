@@ -363,12 +363,7 @@ class Motion(nn.Module):
         gate_weight = self.fusion_gate(gate_input)
         combined_output = gate_weight * main_output + (1 - gate_weight) * conv_output
         
-        # For debugging/analysis, we can return individual branch outputs
-        # In normal operation, we just return the combined output
-        if hasattr(self, 'return_branch_outputs') and self.return_branch_outputs:
-            return combined_output, main_output, conv_output, gate_weight
-        else:
-            return combined_output
+        return combined_output
 
     def select_ind(self, group_array, inputs, batchsize, in_dim, timestep, pts_num):
         ind = self.weight_select(group_array, pts_num)
