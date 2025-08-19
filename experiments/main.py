@@ -9,6 +9,7 @@ import random
 import numpy as np
 import torch.nn as nn
 from tqdm import tqdm
+import requests
 
 sys.path.append("../..")
 from utils import get_parser, import_class, GpuDataParallel, Optimizer, Recorder, Stat, RandomState
@@ -27,6 +28,11 @@ class Processor():
         self.stat = Stat(self.arg.model_args['num_classes'], self.topk)
         self.model, self.optimizer = self.Loading()
         self.loss = self.criterion()
+        
+        # Telegram Bot Configuration
+        self.telegram_bot_token = "8049556095:AAH0c0KB0DmzFtcW0s97ZS_kQ8ux9gX72eE"
+        self.telegram_chat_id = None
+        self.best_accuracy = 0.0  # Track best accuracy within current run
         
         # Check if pts_size was explicitly provided via command line
         # by checking if --pts-size appears in sys.argv
@@ -254,6 +260,29 @@ class Processor():
         self.recoder.print_log("Epoch {}, {}, Evaluation: prec1 {:.4f}, prec5 {:.4f}".
                                format(epoch, mode, prec1, prec5),
                                '{}/{}.txt'.format(self.arg.work_dir, self.arg.phase))
+        
+        # Send Telegram message with evaluation results
+        try:
+            # Check if this is a new best
+            is_new_best = prec1 > self.best_accuracy
+            if is_new_best:
+                self.best_accuracy = prec1
+            
+            # Format message
+            message = f"📊 <b>Epoch {epoch} {mode} Results</b>\n"
+            message += f"├ Top-1 Acc: {prec1:.2f}%\n"
+            message += f"├ Top-5 Acc: {prec5:.2f}%\n"
+            
+            if is_new_best:
+                message += f"🏆 <b>New Best Accuracy!</b>\n"
+                message += f"└ Best: {self.best_accuracy:.2f}%\n"
+            else:
+                message += f"└ Best: {self.best_accuracy:.2f}%\n"
+            
+            # Send message
+            self.send_telegram_message(message)
+        except Exception as e:
+            self.recoder.print_log(f"Failed to send Telegram message: {e}")
 
     def save_model(self, epoch, model, optimizer, save_path):
         torch.save({
@@ -270,6 +299,43 @@ class Processor():
             os.makedirs(self.arg.work_dir)
         with open('{}/config.yaml'.format(self.arg.work_dir), 'w') as f:
             yaml.dump(arg_dict, f)
+
+    def get_telegram_chat_id(self):
+        """Get chat ID from the first message to the bot"""
+        url = f"https://api.telegram.org/bot{self.telegram_bot_token}/getUpdates"
+        try:
+            response = requests.get(url, timeout=10)
+            data = response.json()
+            
+            if data["ok"] and data["result"]:
+                # Get the most recent message
+                chat_id = data["result"][-1]["message"]["chat"]["id"]
+                return chat_id
+        except Exception as e:
+            self.recoder.print_log(f"Failed to get Telegram chat ID: {e}")
+        return None
+
+    def send_telegram_message(self, message):
+        """Send message to Telegram"""
+        if self.telegram_chat_id is None:
+            self.telegram_chat_id = self.get_telegram_chat_id()
+            if self.telegram_chat_id is None:
+                self.recoder.print_log("No Telegram chat ID found. Please send /start to your bot first.")
+                return False
+        
+        url = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
+        data = {
+            "chat_id": self.telegram_chat_id,
+            "text": message,
+            "parse_mode": "HTML"
+        }
+        
+        try:
+            response = requests.post(url, data=data, timeout=10)
+            return response.json()["ok"]
+        except Exception as e:
+            self.recoder.print_log(f"Failed to send Telegram message: {e}")
+            return False
 
 
 if __name__ == '__main__':
