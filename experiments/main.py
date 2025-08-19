@@ -130,6 +130,9 @@ class Processor():
         for l_name in loader_name:
             loader = self.data_loader[l_name]
             loss_mean = []
+            # For tracking branch outputs
+            main_outputs = []
+            conv_outputs = []
             for batch_idx, data in enumerate(loader):
                 image = self.device.data_to_device(data[0])
                 label = self.device.data_to_device(data[1])
@@ -139,14 +142,55 @@ class Processor():
                 with torch.no_grad():
                     # Test-Time Augmentation: average predictions from 3 runs
                     outputs = []
+                    main_branch_outputs = []
+                    conv_branch_outputs = []
+                    
+                    # Enable branch output tracking
+                    self.model.return_branch_outputs = True
+                    
                     for _ in range(3):
-                        output = self.model(image)
-                        outputs.append(output)
+                        output_tuple = self.model(image)
+                        if isinstance(output_tuple, tuple) and len(output_tuple) == 4:
+                            combined_output, main_output, conv_output, gate_weight = output_tuple
+                            outputs.append(combined_output)
+                            main_branch_outputs.append(main_output)
+                            conv_branch_outputs.append(conv_output)
+                        else:
+                            outputs.append(output_tuple)
+                    
+                    # Disable branch output tracking
+                    self.model.return_branch_outputs = False
+                    
                     output = torch.stack(outputs).mean(dim=0)
+                    
+                    # Store branch outputs for analysis
+                    if main_branch_outputs and conv_branch_outputs:
+                        main_output_avg = torch.stack(main_branch_outputs).mean(dim=0)
+                        conv_output_avg = torch.stack(conv_branch_outputs).mean(dim=0)
+                        main_outputs.append(main_output_avg)
+                        conv_outputs.append(conv_output_avg)
+                        
+                        # Log individual branch accuracies occasionally
+                        if batch_idx % 50 == 0:  # Log every 50 batches
+                            main_acc = (main_output_avg.argmax(dim=1) == label).float().mean().item() * 100
+                            conv_acc = (conv_output_avg.argmax(dim=1) == label).float().mean().item() * 100
+                            self.recoder.print_log(f'Branch Accuracies - Main: {main_acc:.2f}%, Conv: {conv_acc:.2f}%')
+                
                 # loss = torch.mean(self.loss(output, label))
                 loss_mean += self.loss(output, label).cpu().detach().numpy().tolist()
                 self.stat.update_accuracy(output.data.cpu(), label.cpu(), topk=self.topk)
             self.recoder.print_log('mean loss: ' + str(np.mean(loss_mean)))
+            
+            # Log overall branch accuracies for this loader
+            if main_outputs and conv_outputs:
+                all_main_outputs = torch.cat(main_outputs, dim=0)
+                all_conv_outputs = torch.cat(conv_outputs, dim=0)
+                all_labels = torch.cat([self.device.data_to_device(data[1]) for data in loader], dim=0)
+                
+                main_accuracy = (all_main_outputs.argmax(dim=1) == all_labels).float().mean().item() * 100
+                conv_accuracy = (all_conv_outputs.argmax(dim=1) == all_labels).float().mean().item() * 100
+                
+                self.recoder.print_log(f'Overall Branch Accuracies - Main: {main_accuracy:.2f}%, Conv: {conv_accuracy:.2f}%')
 
     def Loading(self):
         self.device.set_device(self.arg.device)
