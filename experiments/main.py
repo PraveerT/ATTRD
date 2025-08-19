@@ -301,14 +301,14 @@ class Processor():
             yaml.dump(arg_dict, f)
 
     def get_telegram_chat_id(self):
-        """Get chat ID from the first message to the bot"""
+        """Get chat ID from the most recent message to the bot"""
         url = f"https://api.telegram.org/bot{self.telegram_bot_token}/getUpdates"
         try:
             response = requests.get(url, timeout=10)
             data = response.json()
             
             if data["ok"] and data["result"]:
-                # Get the most recent message
+                # Get the most recent message chat ID (no need for /start command)
                 chat_id = data["result"][-1]["message"]["chat"]["id"]
                 return chat_id
         except Exception as e:
@@ -317,11 +317,13 @@ class Processor():
 
     def send_telegram_message(self, message):
         """Send message to Telegram"""
-        if self.telegram_chat_id is None:
-            self.telegram_chat_id = self.get_telegram_chat_id()
-            if self.telegram_chat_id is None:
-                self.recoder.print_log("No Telegram chat ID found. Please send /start to your bot first.")
-                return False
+        # Always try to get the latest chat ID
+        chat_id = self.get_telegram_chat_id()
+        if chat_id:
+            self.telegram_chat_id = chat_id
+        elif self.telegram_chat_id is None:
+            self.recoder.print_log("No Telegram chat ID available. Send any message to the bot first.")
+            return False
         
         url = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
         data = {
@@ -332,7 +334,12 @@ class Processor():
         
         try:
             response = requests.post(url, data=data, timeout=10)
-            return response.json()["ok"]
+            result = response.json()
+            if result["ok"]:
+                return True
+            else:
+                self.recoder.print_log(f"Telegram API error: {result.get('description', 'Unknown error')}")
+                return False
         except Exception as e:
             self.recoder.print_log(f"Failed to send Telegram message: {e}")
             return False
