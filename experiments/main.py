@@ -120,7 +120,10 @@ class Processor():
                         .format(epoch, batch_idx, len(loader), loss.item(), current_learning_rate[0]))
                 self.recoder.print_time_statistics()
         self.optimizer.scheduler.step()
-        self.recoder.print_log('\tMean training loss: {:.10f}.'.format(np.mean(loss_value)))
+        train_loss = np.mean(loss_value)
+        train_acc = 100. * correct / total
+        self.recoder.print_log('\tMean training loss: {:.10f}.'.format(train_loss))
+        return train_acc, train_loss
 
     def eval(self, loader_name):
         self.model.eval()
@@ -220,12 +223,18 @@ class Processor():
     def start(self):
         if self.arg.phase == 'train':
             self.recoder.print_log('Parameters:\n{}\n'.format(str(vars(self.arg))))
+            # Send initial Telegram message to establish chat
+            try:
+                self.send_initial_telegram_message("🚀 Training started!")
+            except:
+                pass  # Ignore if we can't send the initial message
+            
             for epoch in range(self.arg.optimizer_args['start_epoch'], self.arg.num_epoch):
                 save_model = ((epoch + 1) % self.arg.save_interval == 0) or \
                              (epoch + 1 == self.arg.num_epoch)
                 eval_model = ((epoch + 1) % self.arg.eval_interval == 0) or \
                              (epoch + 1 == self.arg.num_epoch)
-                self.train(epoch)
+                train_acc, train_loss = self.train(epoch)
                 if save_model:
                     model_path = '{}/epoch{}_model.pt'.format(self.arg.work_dir, epoch + 1)
                     self.save_model(epoch, self.model, self.optimizer, model_path)
@@ -233,27 +242,33 @@ class Processor():
                     if self.arg.valid_loader_args != {}:
                         self.stat.reset_statistic()
                         self.eval(loader_name=['valid'])
-                        self.print_inf_log(epoch + 1, "Valid")
+                        self.print_inf_log(epoch + 1, "Valid", train_acc, train_loss)
                     if self.arg.test_loader_args != {}:
                         self.stat.reset_statistic()
                         self.eval(loader_name=['test'])
-                        self.print_inf_log(epoch + 1, "Test")
+                        self.print_inf_log(epoch + 1, "Test", train_acc, train_loss)
         elif self.arg.phase == 'test':
             if self.arg.weights is None:
                 raise ValueError('Please appoint --weights.')
             self.recoder.print_log('Model:   {}.'.format(self.arg.model))
             self.recoder.print_log('Weights: {}.'.format(self.arg.weights))
+            # Send initial Telegram message to establish chat
+            try:
+                self.send_initial_telegram_message("🚀 Testing started!")
+            except:
+                pass  # Ignore if we can't send the initial message
+            
             if self.arg.valid_loader_args != {}:
                 self.stat.reset_statistic()
                 self.eval(loader_name=['valid'])
-                self.print_inf_log(self.arg.optimizer_args['start_epoch'], "Valid")
+                self.print_inf_log(self.arg.optimizer_args['start_epoch'], "Valid", None, None)
             if self.arg.test_loader_args != {}:
                 self.stat.reset_statistic()
                 self.eval(loader_name=['test'])
-                self.print_inf_log(self.arg.optimizer_args['start_epoch'], "Test")
+                self.print_inf_log(self.arg.optimizer_args['start_epoch'], "Test", None, None)
             self.recoder.print_log('Evaluation Done.\n')
 
-    def print_inf_log(self, epoch, mode):
+    def print_inf_log(self, epoch, mode, train_acc=None, train_loss=None):
         static = self.stat.show_accuracy('{}/{}_confusion_mat'.format(self.arg.work_dir, mode))
         prec1 = static[str(self.topk[0])] / self.stat.test_size * 100
         prec5 = static[str(self.topk[1])] / self.stat.test_size * 100
@@ -268,16 +283,20 @@ class Processor():
             if is_new_best:
                 self.best_accuracy = prec1
             
-            # Format message
-            message = f"📊 <b>Epoch {epoch} {mode} Results</b>\n"
-            message += f"├ Top-1 Acc: {prec1:.2f}%\n"
-            message += f"├ Top-5 Acc: {prec5:.2f}%\n"
-            
-            if is_new_best:
-                message += f"🏆 <b>New Best Accuracy!</b>\n"
-                message += f"└ Best: {self.best_accuracy:.2f}%\n"
+            # Format message in compact format: Train acc p1 ls  Test acc p1 ls
+            if train_acc is not None and train_loss is not None:
+                message = f"📊 Epoch {epoch}\n"
+                message += f"Train: {train_acc:.1f}% p1:{prec1:.1f} ls:{train_loss:.2f}\n"
+                message += f"Test:  {prec1:.1f}% p5:{prec5:.1f}"
+                if is_new_best:
+                    message += f" 🏆 New Best: {self.best_accuracy:.1f}%"
             else:
-                message += f"└ Best: {self.best_accuracy:.2f}%\n"
+                # For test phase without training data
+                message = f"📊 Epoch {epoch} {mode}\n"
+                message += f"Top-1 Acc: {prec1:.1f}%\n"
+                message += f"Top-5 Acc: {prec5:.1f}%\n"
+                if is_new_best:
+                    message += f"🏆 New Best: {self.best_accuracy:.1f}%\n"
             
             # Send message
             self.send_telegram_message(message)
@@ -316,33 +335,31 @@ class Processor():
         return None
 
     def send_telegram_message(self, message):
-        """Send message to Telegram"""
-        # Always try to get the latest chat ID
-        chat_id = self.get_telegram_chat_id()
-        if chat_id:
-            self.telegram_chat_id = chat_id
-        elif self.telegram_chat_id is None:
-            self.recoder.print_log("No Telegram chat ID available. Send any message to the bot first.")
-            return False
-        
-        url = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
-        data = {
-            "chat_id": self.telegram_chat_id,
-            "text": message,
-            "parse_mode": "HTML"
-        }
-        
+        """Send message to Telegram - simplified version"""
         try:
-            response = requests.post(url, data=data, timeout=10)
-            result = response.json()
-            if result["ok"]:
-                return True
-            else:
-                self.recoder.print_log(f"Telegram API error: {result.get('description', 'Unknown error')}")
-                return False
-        except Exception as e:
-            self.recoder.print_log(f"Failed to send Telegram message: {e}")
-            return False
+            # Just try to send the message - if there's no chat, it will fail silently
+            url = f"https://api.telegram.org/bot{self.telegram_bot_token}/getUpdates"
+            response = requests.get(url, timeout=5)
+            data = response.json()
+            
+            if data["ok"] and data["result"]:
+                # Get the most recent chat ID
+                chat_id = data["result"][-1]["message"]["chat"]["id"]
+                
+                # Send the actual message
+                send_url = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
+                send_data = {
+                    "chat_id": chat_id,
+                    "text": message,
+                    "parse_mode": "HTML"
+                }
+                
+                send_response = requests.post(send_url, data=send_data, timeout=10)
+                return send_response.json()["ok"]
+        except:
+            # If anything fails, just silently continue without sending message
+            pass
+        return False
 
 
 if __name__ == '__main__':
