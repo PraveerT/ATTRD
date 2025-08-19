@@ -133,6 +133,7 @@ class Processor():
             # For tracking branch outputs
             main_outputs = []
             conv_outputs = []
+            gate_weights = []
             for batch_idx, data in enumerate(loader):
                 image = self.device.data_to_device(data[0])
                 label = self.device.data_to_device(data[1])
@@ -144,6 +145,7 @@ class Processor():
                     outputs = []
                     main_branch_outputs = []
                     conv_branch_outputs = []
+                    gate_weight_outputs = []
                     
                     # Enable branch output tracking
                     self.model.return_branch_outputs = True
@@ -155,6 +157,7 @@ class Processor():
                             outputs.append(combined_output)
                             main_branch_outputs.append(main_output)
                             conv_branch_outputs.append(conv_output)
+                            gate_weight_outputs.append(gate_weight)
                         else:
                             outputs.append(output_tuple)
                     
@@ -167,14 +170,22 @@ class Processor():
                     if main_branch_outputs and conv_branch_outputs:
                         main_output_avg = torch.stack(main_branch_outputs).mean(dim=0)
                         conv_output_avg = torch.stack(conv_branch_outputs).mean(dim=0)
+                        gate_weight_avg = torch.stack(gate_weight_outputs).mean(dim=0) if gate_weight_outputs else None
                         main_outputs.append(main_output_avg)
                         conv_outputs.append(conv_output_avg)
+                        if gate_weight_avg is not None:
+                            gate_weights.append(gate_weight_avg)
                         
                         # Log individual branch accuracies occasionally
                         if batch_idx % 50 == 0:  # Log every 50 batches
                             main_acc = (main_output_avg.argmax(dim=1) == label).float().mean().item() * 100
                             conv_acc = (conv_output_avg.argmax(dim=1) == label).float().mean().item() * 100
-                            self.recoder.print_log(f'Branch Accuracies - Main: {main_acc:.2f}%, Conv: {conv_acc:.2f}%')
+                            gate_info = ""
+                            if gate_weight_avg is not None:
+                                # Average gate weight across batch and classes
+                                avg_gate_weight = gate_weight_avg.mean().item()
+                                gate_info = f", Gate: {avg_gate_weight:.2f}"
+                            self.recoder.print_log(f'Branch Accuracies - Main: {main_acc:.2f}%, Conv: {conv_acc:.2f}%{gate_info}')
                 
                 # loss = torch.mean(self.loss(output, label))
                 loss_mean += self.loss(output, label).cpu().detach().numpy().tolist()
@@ -191,6 +202,12 @@ class Processor():
                 conv_accuracy = (all_conv_outputs.argmax(dim=1) == all_labels).float().mean().item() * 100
                 
                 self.recoder.print_log(f'Overall Branch Accuracies - Main: {main_accuracy:.2f}%, Conv: {conv_accuracy:.2f}%')
+                
+                # Log average gate weights
+                if gate_weights:
+                    all_gate_weights = torch.cat(gate_weights, dim=0)
+                    avg_gate_weight = all_gate_weights.mean().item()
+                    self.recoder.print_log(f'Average Gate Weight (Main branch contribution): {avg_gate_weight:.3f}')
 
     def Loading(self):
         self.device.set_device(self.arg.device)
