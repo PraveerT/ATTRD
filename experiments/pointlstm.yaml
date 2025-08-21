@@ -47,4 +47,4 @@ model_args:
   pts_size: *frame_pts_size
   num_classes: 25
   knn: [32, 24, 48, 24]
-  topk: 16
+  topk: 8

@@ -9,6 +9,7 @@ import random
 import numpy as np
 import torch.nn as nn
 from tqdm import tqdm
+import requests
 
 sys.path.append("../..")
 from utils import get_parser, import_class, GpuDataParallel, Optimizer, Recorder, Stat, RandomState
@@ -27,6 +28,11 @@ class Processor():
         self.stat = Stat(self.arg.model_args['num_classes'], self.topk)
         self.model, self.optimizer = self.Loading()
         self.loss = self.criterion()
+        
+        # Telegram Bot Configuration
+        self.telegram_bot_token = "8049556095:AAH0c0KB0DmzFtcW0s97ZS_kQ8ux9gX72eE"
+        self.telegram_chat_id = None
+        self.best_accuracy = 0.0  # Track best accuracy within current run
         
         # Check if pts_size was explicitly provided via command line
         # by checking if --pts-size appears in sys.argv
@@ -137,12 +143,10 @@ class Processor():
                         .format(epoch, batch_idx, len(loader), loss.item(), current_learning_rate[0]))
                 self.recoder.print_time_statistics()
         self.optimizer.scheduler.step()
-        self.recoder.print_log('\tMean training loss: {:.10f}.'.format(np.mean(loss_value)))
-        
-        # Print separate branch loss means if available
-        if temporal_loss_values and spatial_loss_values:
-            self.recoder.print_log('\tMean temporal loss: {:.10f}.'.format(np.mean(temporal_loss_values)))
-            self.recoder.print_log('\tMean spatial loss: {:.10f}.'.format(np.mean(spatial_loss_values)))
+        train_loss = np.mean(loss_value)
+        train_acc = 100. * correct / total
+        self.recoder.print_log('\tMean training loss: {:.10f}.'.format(train_loss))
+        return train_acc, train_loss
 
     def eval(self, loader_name):
         self.model.eval()
@@ -156,7 +160,12 @@ class Processor():
                 # Cal.reset()
                 # Cal.calculate_all(self.model, image)
                 with torch.no_grad():
-                    output = self.model(image)
+                    # Test-Time Augmentation: average predictions from 3 runs
+                    outputs = []
+                    for _ in range(3):
+                        output = self.model(image)
+                        outputs.append(output)
+                    output = torch.stack(outputs).mean(dim=0)
                 # loss = torch.mean(self.loss(output, label))
                 loss_mean += self.loss(output, label).cpu().detach().numpy().tolist()
                 self.stat.update_accuracy(output.data.cpu(), label.cpu(), topk=self.topk)
@@ -253,12 +262,18 @@ class Processor():
     def start(self):
         if self.arg.phase == 'train':
             self.recoder.print_log('Parameters:\n{}\n'.format(str(vars(self.arg))))
+            # Send initial Telegram message to establish chat
+            try:
+                self.send_initial_telegram_message("🚀 Training started!")
+            except:
+                pass  # Ignore if we can't send the initial message
+            
             for epoch in range(self.arg.optimizer_args['start_epoch'], self.arg.num_epoch):
                 save_model = ((epoch + 1) % self.arg.save_interval == 0) or \
                              (epoch + 1 == self.arg.num_epoch)
                 eval_model = ((epoch + 1) % self.arg.eval_interval == 0) or \
                              (epoch + 1 == self.arg.num_epoch)
-                self.train(epoch)
+                train_acc, train_loss = self.train(epoch)
                 if save_model:
                     model_path = '{}/epoch{}_model.pt'.format(self.arg.work_dir, epoch + 1)
                     self.save_model(epoch, self.model, self.optimizer, model_path)
@@ -266,33 +281,81 @@ class Processor():
                     if self.arg.valid_loader_args != {}:
                         self.stat.reset_statistic()
                         self.eval(loader_name=['valid'])
-                        self.print_inf_log(epoch + 1, "Valid")
+                        self.print_inf_log(epoch + 1, "Valid", train_acc, train_loss)
                     if self.arg.test_loader_args != {}:
                         self.stat.reset_statistic()
                         self.eval(loader_name=['test'])
-                        self.print_inf_log(epoch + 1, "Test")
+                        self.print_inf_log(epoch + 1, "Test", train_acc, train_loss)
         elif self.arg.phase == 'test':
             if self.arg.weights is None:
                 raise ValueError('Please appoint --weights.')
             self.recoder.print_log('Model:   {}.'.format(self.arg.model))
             self.recoder.print_log('Weights: {}.'.format(self.arg.weights))
+            # Send initial Telegram message to establish chat
+            try:
+                self.send_initial_telegram_message("🚀 Testing started!")
+            except:
+                pass  # Ignore if we can't send the initial message
+            
             if self.arg.valid_loader_args != {}:
                 self.stat.reset_statistic()
                 self.eval(loader_name=['valid'])
-                self.print_inf_log(self.arg.optimizer_args['start_epoch'], "Valid")
+                self.print_inf_log(self.arg.optimizer_args['start_epoch'], "Valid", None, None)
             if self.arg.test_loader_args != {}:
                 self.stat.reset_statistic()
                 self.eval(loader_name=['test'])
-                self.print_inf_log(self.arg.optimizer_args['start_epoch'], "Test")
+                self.print_inf_log(self.arg.optimizer_args['start_epoch'], "Test", None, None)
             self.recoder.print_log('Evaluation Done.\n')
 
-    def print_inf_log(self, epoch, mode):
+    def print_inf_log(self, epoch, mode, train_acc=None, train_loss=None):
         static = self.stat.show_accuracy('{}/{}_confusion_mat'.format(self.arg.work_dir, mode))
         prec1 = static[str(self.topk[0])] / self.stat.test_size * 100
         prec5 = static[str(self.topk[1])] / self.stat.test_size * 100
         self.recoder.print_log("Epoch {}, {}, Evaluation: prec1 {:.4f}, prec5 {:.4f}".
                                format(epoch, mode, prec1, prec5),
                                '{}/{}.txt'.format(self.arg.work_dir, self.arg.phase))
+        
+        # Display confusion matrix
+        try:
+            import numpy as np
+            cm = self.stat.confusion_mat
+            if cm is not None:
+                self.recoder.print_log(f"Confusion Matrix (epoch {epoch}, {mode}):")
+                # Print a simplified version of the confusion matrix
+                # Show only the diagonal elements (correct predictions) and some key stats
+                diagonal = np.diag(cm)
+                total_correct = np.sum(diagonal)
+                total_samples = np.sum(cm)
+                self.recoder.print_log(f"  Total Correct: {total_correct}/{total_samples}")
+                self.recoder.print_log(f"  Overall Accuracy: {total_correct/total_samples*100:.2f}%")
+        except Exception as e:
+            self.recoder.print_log(f"Failed to display confusion matrix: {e}")
+        
+        # Send Telegram message with evaluation results
+        try:
+            # Check if this is a new best
+            is_new_best = prec1 > self.best_accuracy
+            if is_new_best:
+                self.best_accuracy = prec1
+            
+            # Format message as: Train: train acc train loss Test: test acc test loss
+            if train_acc is not None and train_loss is not None:
+                message = f"📊 Epoch {epoch}\n"
+                message += f"Train: {train_acc:.1f} {train_loss:.2f}\n"
+                message += f"Test: {prec1:.1f} {prec5:.1f}"
+                if is_new_best:
+                    message += f" 🏆 New Best: {self.best_accuracy:.1f}%"
+            else:
+                # For test phase without training data
+                message = f"📊 Epoch {epoch} {mode}\n"
+                message += f"Test: {prec1:.1f} {prec5:.1f}\n"
+                if is_new_best:
+                    message += f"🏆 New Best: {self.best_accuracy:.1f}%\n"
+            
+            # Send message
+            self.send_telegram_message(message)
+        except Exception as e:
+            self.recoder.print_log(f"Failed to send Telegram message: {e}")
 
     def save_model(self, epoch, model, optimizer, save_path):
         torch.save({
@@ -309,6 +372,48 @@ class Processor():
             os.makedirs(self.arg.work_dir)
         with open('{}/config.yaml'.format(self.arg.work_dir), 'w') as f:
             yaml.dump(arg_dict, f)
+
+    def get_telegram_chat_id(self):
+        """Get chat ID from the most recent message to the bot"""
+        url = f"https://api.telegram.org/bot{self.telegram_bot_token}/getUpdates"
+        try:
+            response = requests.get(url, timeout=10)
+            data = response.json()
+            
+            if data["ok"] and data["result"]:
+                # Get the most recent message chat ID (no need for /start command)
+                chat_id = data["result"][-1]["message"]["chat"]["id"]
+                return chat_id
+        except Exception as e:
+            self.recoder.print_log(f"Failed to get Telegram chat ID: {e}")
+        return None
+
+    def send_telegram_message(self, message):
+        """Send message to Telegram - simplified version"""
+        try:
+            # Just try to send the message - if there's no chat, it will fail silently
+            url = f"https://api.telegram.org/bot{self.telegram_bot_token}/getUpdates"
+            response = requests.get(url, timeout=5)
+            data = response.json()
+            
+            if data["ok"] and data["result"]:
+                # Get the most recent chat ID
+                chat_id = data["result"][-1]["message"]["chat"]["id"]
+                
+                # Send the actual message
+                send_url = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
+                send_data = {
+                    "chat_id": chat_id,
+                    "text": message,
+                    "parse_mode": "HTML"
+                }
+                
+                send_response = requests.post(send_url, data=send_data, timeout=10)
+                return send_response.json()["ok"]
+        except:
+            # If anything fails, just silently continue without sending message
+            pass
+        return False
 
 
 if __name__ == '__main__':
