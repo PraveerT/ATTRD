@@ -306,10 +306,10 @@ class Motion(nn.Module):
         # Apply multi-scale feature processing
         fea2 = self.multi_scale(fea2)
         
-        # Apply temporal noise injection during training for regularization
-        if self.training:
-            noise = torch.randn_like(fea2) * self.temporal_noise_std
-            fea2 = fea2 + noise
+        # # Apply temporal noise injection during training for regularization
+        # if self.training:
+        #     noise = torch.randn_like(fea2) * self.temporal_noise_std
+        #     fea2 = fea2 + noise
 
         # stage 3: inter-frame, middle, applying mamba in this stage
         in_dims = fea2.shape[1] * 2 - 4
@@ -333,19 +333,101 @@ class Motion(nn.Module):
         return output.view(batchsize, self.num_classes)
 
     def select_ind(self, group_array, inputs, batchsize, in_dim, timestep, pts_num):
+        """
+        Select indices and apply them to group_array and inputs tensors.
+        
+        Args:
+            group_array: Tensor of shape (B, C, T*P, K) - grouped points
+            inputs: Tensor of shape (B, C, T, P) - input points
+            batchsize: Batch size
+            in_dim: Input dimension
+            timestep: Number of timesteps
+            pts_num: Number of points to select
+            
+        Returns:
+            ret_group_array: Selected grouped points
+            inputs: Selected input points
+            ind: Selected indices
+        """
+        # Validate inputs
+        if pts_num <= 0:
+            raise ValueError("pts_num must be positive")
+        
+        # Select indices based on point weights
         ind = self.weight_select(group_array, pts_num)
-        ret_group_array = group_array.gather(-2, ind.unsqueeze(1).unsqueeze(-1).
-                                             expand(-1, group_array.shape[1], -1, -1,
-                                                    group_array.shape[-1]))
+        
+        # Apply indices to group_array
+        # Optimize tensor operations by precomputing shapes
+        ind_expanded = ind.unsqueeze(1).unsqueeze(-1).expand(
+            -1, group_array.shape[1], -1, -1, group_array.shape[-1])
+        ret_group_array = group_array.gather(-2, ind_expanded)
         ret_group_array = ret_group_array.view(batchsize, in_dim, timestep * pts_num, -1)
+        
+        # Apply indices to inputs
         inputs = inputs.gather(-1, ind.unsqueeze(1).expand(-1, inputs.shape[1], -1, -1))
+        
         return ret_group_array, inputs, ind
 
     @staticmethod
     def weight_select(position, topk):
-        # select points with larger ranges
-        weights = torch.max(torch.sum(position[:, :3] ** 2, dim=1), dim=-1)[0]
-        dists, idx = torch.topk(weights, topk, -1, largest=True, sorted=False)
+        """
+        Select points with larger ranges based on a hybrid metric combining distance and variance.
+        
+        This function computes a weighted score for each point based on:
+        1. Distance from origin (encourages selecting distant points)
+        2. Feature variance (encourages selecting points with high variation)
+        
+        Args:
+            position: Tensor of shape (B, C, T*P, K) where first 3 channels are x,y,z coordinates
+            topk: Number of points to select
+            
+        Returns:
+            idx: Indices of selected points
+        """
+        # Validate inputs
+        if topk <= 0:
+            raise ValueError("topk must be positive")
+        if position.shape[1] < 3:
+            raise ValueError("position tensor must have at least 3 channels for x,y,z coordinates")
+            
+        # Compute squared Euclidean distances for first 3 dimensions (x,y,z)
+        # position[:, :3] selects x,y,z coordinates
+        # **2 computes squared distances
+        # sum(dim=1) sums across x,y,z dimensions -> (B, T*P, K)
+        # max(dim=-1)[0] takes maximum across K neighbors -> (B, T*P)
+        distances = torch.max(torch.sum(position[:, :3] ** 2, dim=1), dim=-1)[0]
+        
+        # Normalize distances to [0, 1] range
+        dist_min = distances.min(dim=-1, keepdim=True)[0]
+        dist_max = distances.max(dim=-1, keepdim=True)[0]
+        dist_range = dist_max - dist_min
+        # Avoid division by zero
+        dist_range = torch.where(dist_range == 0, torch.ones_like(dist_range), dist_range)
+        normalized_distances = (distances - dist_min) / dist_range
+        
+        # Compute feature variance across neighbors if we have more than 3 channels
+        if position.shape[1] > 3:
+            # Compute variance for feature channels (channels 3 onwards)
+            feature_var = torch.var(position[:, 3:], dim=-1).mean(dim=1)  # Mean variance across time
+            # Normalize feature variance
+            var_min = feature_var.min(dim=-1, keepdim=True)[0]
+            var_max = feature_var.max(dim=-1, keepdim=True)[0]
+            var_range = var_max - var_min
+            # Avoid division by zero
+            var_range = torch.where(var_range == 0, torch.ones_like(var_range), var_range)
+            normalized_variance = (feature_var - var_min) / var_range
+        else:
+            # If no feature channels, use zeros
+            normalized_variance = torch.zeros_like(normalized_distances)
+        
+        # Combine distance and variance metrics with weighted sum
+        # Weight distance more heavily (0.7) as it's more important for coverage
+        # Weight variance less (0.3) as a secondary factor
+        weights = 0.7 * normalized_distances + 0.3 * normalized_variance
+        
+        # Select topk points with largest combined weights
+        # Using sorted=False for better performance when order doesn't matter
+        _, idx = torch.topk(weights, min(topk, weights.shape[-1]), -1, largest=True, sorted=False)
         return idx
 
 
