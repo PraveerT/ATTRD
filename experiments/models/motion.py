@@ -376,6 +376,7 @@ class Motion(nn.Module):
         This function computes a weighted score for each point based on:
         1. Distance from origin (encourages selecting distant points)
         2. Feature variance (encourages selecting points with high variation)
+        3. Spatial coverage (encourages selecting spatially diverse points)
         
         Args:
             position: Tensor of shape (B, C, T*P, K) where first 3 channels are x,y,z coordinates
@@ -420,10 +421,43 @@ class Motion(nn.Module):
             # If no feature channels, use zeros
             normalized_variance = torch.zeros_like(normalized_distances)
         
-        # Combine distance and variance metrics with weighted sum
-        # Weight distance more heavily (0.7) as it's more important for coverage
-        # Weight variance less (0.3) as a secondary factor
-        weights = 0.7 * normalized_distances + 0.3 * normalized_variance
+        # Compute spatial coverage metric to encourage diversity
+        # Points that are spatially isolated from other selected points are preferred
+        # Simplified approach: use distance to centroid of all points as diversity measure
+        if position.shape[2] > 1:  # If we have more than one point
+            # Extract spatial coordinates of centroids (first neighbor for each point)
+            # The shape is (B, 3, T*P) - we need to be careful with dimensions
+            coords = position[:, :3, :, 0]  # (B, 3, T*P)
+            
+            # Compute centroid of all points for each batch
+            # We need to compute centroid across the T*P dimension (dim=2)
+            centroid = torch.mean(coords, dim=2, keepdim=True)  # (B, 3, 1)
+            
+            # Compute distance of each point to the centroid
+            # Points farther from centroid are more diverse
+            # coords: (B, 3, T*P), centroid: (B, 3, 1)
+            diversity_measure = torch.sqrt(torch.sum((coords - centroid) ** 2, dim=1))  # (B, T*P)
+            
+            # Normalize diversity measure
+            div_min = diversity_measure.min(dim=-1, keepdim=True)[0]
+            div_max = diversity_measure.max(dim=-1, keepdim=True)[0]
+            div_range = div_max - div_min
+            div_range = torch.where(div_range == 0, torch.ones_like(div_range), div_range)
+            normalized_diversity = (diversity_measure - div_min) / div_range
+        else:
+            normalized_diversity = torch.zeros_like(normalized_distances)
+        
+        # Ensure all metrics have the same shape
+        # All should be (B, T*P)
+        if not (normalized_distances.shape == normalized_variance.shape == normalized_diversity.shape):
+            # If there's a shape mismatch, fall back to just distance + variance
+            weights = 0.7 * normalized_distances + 0.3 * normalized_variance
+        else:
+            # Combine metrics with weighted sum
+            # Distance: 0.4 (coverage is still important)
+            # Variance: 0.3 (as you added)
+            # Spatial diversity: 0.3 (diverse point selection)
+            weights = 0.4 * normalized_distances + 0.3 * normalized_variance + 0.3 * normalized_diversity
         
         # Select topk points with largest combined weights
         # Using sorted=False for better performance when order doesn't matter
