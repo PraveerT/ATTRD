@@ -23,7 +23,7 @@ pts_size: &frame_pts_size 96  # Will increase dynamically: 96->128 (epochs 0-50)
 
 optimizer_args:
   optimizer: Adam
-  base_lr: 0.0001
+  base_lr: 0.00012
   step: [ 100, 160, 180]
   weight_decay: 0.03
   start_epoch: 0
