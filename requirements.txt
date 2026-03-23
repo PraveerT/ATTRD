@@ -1,0 +1,22 @@
+# Core ML dependencies
+torch>=2.0.0
+torchvision
+numpy>=1.21.0
+
+# Data processing
+opencv-python
+Pillow
+matplotlib
+
+# Progress bars and utilities
+tqdm
+
+# Configuration parsing
+PyYAML
+
+# HTTP requests
+requests
+
+# Additional utilities
+scipy
+scikit-learn
