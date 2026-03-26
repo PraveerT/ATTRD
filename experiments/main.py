@@ -492,9 +492,10 @@ class Processor():
                 pass  # Ignore if we can't send the initial message
             
             for epoch in range(self.arg.optimizer_args['start_epoch'], self.arg.num_epoch):
+                eval_interval = 10 if (epoch + 1) < 100 else 1
                 save_model = ((epoch + 1) % self.arg.save_interval == 0) or \
                              (epoch + 1 == self.arg.num_epoch)
-                eval_model = ((epoch + 1) % self.arg.eval_interval == 0) or \
+                eval_model = ((epoch + 1) % eval_interval == 0) or \
                              (epoch + 1 == self.arg.num_epoch)
                 train_acc, train_loss = self.train(epoch)
                 if save_model:
