@@ -1,8 +1,5 @@
-import pdb
 import torch
 import torch.nn as nn
-import numpy as np
-import torch.nn.functional as F
 
 
 class MLPBlock(nn.Module):
@@ -140,62 +137,15 @@ class MotionBlock(nn.Module):
         
         return output
 
-
-class SpatialAttention(nn.Module):
-    """Lightweight attention mechanism for position-feature interaction"""
-    def __init__(self, channels, dimension):
-        super().__init__()
-        self.channels = channels
-        self.dimension = dimension
-        
-        # Simplified channel attention instead of spatial attention to save memory
-        if dimension == 2:
-            self.channel_attention = nn.Sequential(
-                nn.AdaptiveAvgPool2d(1),
-                nn.Conv2d(channels, channels // 4, kernel_size=1),
-                nn.GELU(),
-                nn.Conv2d(channels // 4, channels, kernel_size=1),
-                nn.Sigmoid()
-            )
-        else:
-            self.channel_attention = nn.Sequential(
-                nn.AdaptiveAvgPool1d(1), 
-                nn.Conv1d(channels, channels // 4, kernel_size=1),
-                nn.GELU(),
-                nn.Conv1d(channels // 4, channels, kernel_size=1),
-                nn.Sigmoid()
-            )
-            
-        self.gamma = nn.Parameter(torch.zeros(1))
-        
-    def forward(self, features, positions):
-        """
-        Lightweight channel attention instead of expensive spatial attention
-        """
-        # Combine features and positions for richer representation
-        combined = features + positions
-        
-        # Apply channel attention to the combined features
-        attention_weights = self.channel_attention(combined)
-        attended_features = features * attention_weights
-        
-        # Apply learnable scaling and residual connection
-        output = self.gamma * attended_features + features
-        
-        return output
-
-
 class GroupOperation(object):
-    def __init__(self, distance_metric='l2', normalize_offsets=True, eps=1e-8):
+    def __init__(self, normalize_offsets=True, eps=1e-8):
         """
-        Improved GroupOperation with configurable distance metrics and optimizations.
+        GroupOperation with normalized spatial offsets for neighborhood features.
         
         Args:
-            distance_metric: 'l2', 'l1', or 'cosine'
             normalize_offsets: Whether to normalize spatial offsets
             eps: Small value for numerical stability
         """
-        self.distance_metric = distance_metric
         self.normalize_offsets = normalize_offsets
         self.eps = eps
 
@@ -204,7 +154,7 @@ class GroupOperation(object):
         Group points based on k-nearest neighbors with improved memory efficiency.
         """
         # Use the array_distance method for all cases to ensure compatibility
-        matrix, a1, a2 = self.array_distance(array1, array2, distance_dim, dim)
+        matrix, a2 = self.array_distance(array1, array2, distance_dim, dim)
         
         # Get k-nearest neighbors
         dists, inputs_idx = torch.topk(matrix, knn, -1, largest=False, sorted=True)
@@ -242,13 +192,14 @@ class GroupOperation(object):
         else:
             array_padded = array
         
-        # Use original neighbor point extraction method
-        neighbor_points = torch.zeros(batchsize, channels, timestep, num_pts * interval).to(array.device)
-        for i in range(timestep):
-            neighbor_points[:, :, i] = array_padded[:, :, i:i + interval].view(batchsize, channels, -1)
+        # Vectorize temporal window extraction instead of building it timestep-by-timestep.
+        windows = array_padded.unfold(2, interval, 1)
+        neighbor_points = windows.permute(0, 1, 2, 4, 3).reshape(
+            batchsize, channels, timestep, num_pts * interval
+        )
         
         # Use array_distance for compatibility
-        matrix, a1, a2 = self.array_distance(array, neighbor_points, distance_dim, dim)
+        matrix, a2 = self.array_distance(array, neighbor_points, distance_dim, dim)
         
         # Get k-nearest neighbors
         dists, inputs_idx = torch.topk(matrix, knn, -1, largest=False, sorted=True)
@@ -275,61 +226,6 @@ class GroupOperation(object):
             
         return ret_features
 
-    def _compute_l2_distance_efficient(self, array1, array2, distance_dim, dim):
-        """
-        Efficient L2 distance computation - for now using original method for compatibility.
-        """
-        # Use the original computation method to ensure compatibility
-        distance_mat = array1.unsqueeze(dim + 1)[:, distance_dim] - array2.unsqueeze(dim)[:, distance_dim]
-        matrix = torch.sqrt((distance_mat ** 2).sum(1) + self.eps)
-        return matrix
-
-    def _compute_l1_distance(self, array1, array2, distance_dim, dim):
-        """Compute L1 (Manhattan) distance."""
-        distance_mat = array1.unsqueeze(dim + 1)[:, distance_dim] - array2.unsqueeze(dim)[:, distance_dim]
-        matrix = torch.abs(distance_mat).sum(1)
-        return matrix
-
-    def _compute_cosine_distance(self, array1, array2, distance_dim, dim):
-        """Compute cosine distance (1 - cosine similarity)."""
-        # Extract features for similarity
-        feat1 = array1[:, distance_dim]
-        feat2 = array2[:, distance_dim]
-        
-        # Normalize features
-        feat1_norm = F.normalize(feat1, p=2, dim=1)
-        feat2_norm = F.normalize(feat2, p=2, dim=1)
-        
-        # Compute cosine similarity
-        if dim == 3:
-            similarity = torch.einsum('bctn,bctm->btnm', feat1_norm, feat2_norm)
-        else:
-            # General case
-            feat1_exp = feat1_norm.unsqueeze(dim + 1)
-            feat2_exp = feat2_norm.unsqueeze(dim)
-            similarity = (feat1_exp * feat2_exp).sum(1)
-        
-        # Convert to distance
-        matrix = 1.0 - similarity
-        return matrix
-
-    def _gather_neighbors_efficient(self, array, indices, dim):
-        """
-        Efficient neighbor gathering with minimal memory overhead.
-        """
-        # Use the same expansion logic as the original implementation
-        # indices shape: (batch, ..., knn)
-        # array shape: (batch, channels, ..., num_points)
-        
-        # Expand indices to match array dimensions
-        expand_shape = list(indices.shape[:1]) + [array.shape[1]] + list(indices.shape[1:])
-        indices_expanded = indices.unsqueeze(1).expand(expand_shape)
-        
-        # Gather neighbors along the last dimension
-        neighbor = array.gather(-1, indices_expanded)
-        
-        return neighbor
-
     def array_distance(self, array1, array2, dist, dim):
         """
         Legacy method kept for compatibility.
@@ -337,7 +233,6 @@ class GroupOperation(object):
         distance_mat = array1.unsqueeze(dim + 1)[:, dist] - array2.unsqueeze(dim)[:, dist]
         mat_shape = distance_mat.shape
         mat_shape = mat_shape[:1] + (array1.shape[1],) + mat_shape[2:]
-        array1 = array1.unsqueeze(dim + 1).expand(mat_shape)
         array2 = array2.unsqueeze(dim).expand(mat_shape)
         distance_mat = torch.sqrt((distance_mat ** 2).sum(1) + self.eps)
-        return distance_mat, array1, array2
+        return distance_mat, array2

@@ -1,7 +1,5 @@
-import pdb
 import torch
 import torch.nn as nn
-import numpy as np
 import torch.nn.functional as F
 from models.op import MLPBlock, MotionBlock, GroupOperation
 
@@ -36,13 +34,6 @@ class MultiScaleFeatureProcessor(nn.Module):
                 nn.Conv2d(feature_dim, feature_dim, 1)
             ) for _ in range(num_scales - 1)
         ])
-        
-        
-        # Feature weighting gate
-        self.feature_gate = nn.Sequential(
-            nn.Linear(feature_dim * num_scales, num_scales),
-            nn.Softmax(dim=-1)
-        )
         
         # Output projection
         self.output_proj = nn.Sequential(
@@ -79,24 +70,13 @@ class MultiScaleFeatureProcessor(nn.Module):
             interaction = self.scale_interaction[i](combined)
             interacted_features.append(target + interaction)
         
-        # 3. Apply feature weighting
+        # 3. Upsample each scale back to the original resolution
         all_features = []
         for i, feat in enumerate(interacted_features):
             # Upsample to original resolution
             upsampled = F.interpolate(feat, size=(T, N), mode='bilinear', align_corners=False)
             all_features.append(upsampled)
-        
-        feature_stack = torch.stack(all_features, dim=2)  # (B, feature_dim, num_scales, T, N)
-        feature_flat = feature_stack.permute(0, 3, 4, 1, 2).reshape(B * T * N, self.feature_dim, self.num_scales)
-        
-        # Feature weights
-        feature_weights = self.feature_gate(feature_flat.reshape(B * T * N, -1))
-        feature_weights = feature_weights.unsqueeze(1)  # (B*T*N, 1, num_scales)
-        
-        # Apply weighting
-        weighted_features = (feature_flat * feature_weights).sum(dim=2)  # (B*T*N, feature_dim)
-        weighted_features = weighted_features.reshape(B, T, N, self.feature_dim).permute(0, 3, 1, 2)
-        
+
         # 4. Combine all feature representations
         combined_features = torch.cat(all_features, dim=1)  # (B, feature_dim * num_scales, T, N)
         
@@ -180,7 +160,7 @@ class QuaternionLinear(nn.Module):
 
 class MambaTemporalEncoder(nn.Module):
     """Mamba-based temporal encoder for point cloud sequences"""
-    def __init__(self, in_channels, hidden_dim, output_dim=None, num_layers=2, drop_path=0.1):
+    def __init__(self, in_channels, hidden_dim, output_dim=None, num_layers=2):
         super().__init__()
         self.in_channels = in_channels
         self.hidden_dim = hidden_dim
@@ -260,13 +240,10 @@ class Motion(nn.Module):
         self.group = GroupOperation()
         # Replace LSTM with Mamba temporal encoder
         # Process features from stage3 (256 channels) with temporal modeling
-        self.mamba = MambaTemporalEncoder(in_channels=256, hidden_dim=128, output_dim=256, num_layers=2, drop_path=0.1)
+        self.mamba = MambaTemporalEncoder(in_channels=256, hidden_dim=128, output_dim=256, num_layers=2)
         
         # Add Multi-scale Feature Processor layer after stage2
         self.multi_scale = MultiScaleFeatureProcessor(in_channels=132, num_scales=4, feature_dim=32)
-        
-        # Temporal noise injection for regularization during training
-        self.temporal_noise_std = 0.02
 
     def forward(self, inputs):
         # B * T * N * D,  e.g. 16 * 32 * 512 * 4
@@ -298,25 +275,18 @@ class Motion(nn.Module):
         in_dims = fea1.shape[1] * 2 - 4
         pts_num //= self.downsample[0]
         ret_group_array2 = self.group.st_group_points(fea1, 3, [0, 1, 2], self.knn[1], 3)
-        ret_array2, inputs, _ = self.select_ind(ret_group_array2, inputs,
-                                                batchsize, in_dims, timestep, pts_num)
+        ret_array2, inputs = self.select_ind(ret_group_array2, inputs, batchsize, in_dims, timestep, pts_num)
         fea2 = self.pool2(self.stage2(ret_array2)).view(batchsize, -1, timestep, pts_num)
         fea2 = torch.cat((inputs, fea2), dim=1)
         
         # Apply multi-scale feature processing
         fea2 = self.multi_scale(fea2)
-        
-        # # Apply temporal noise injection during training for regularization
-        # if self.training:
-        #     noise = torch.randn_like(fea2) * self.temporal_noise_std
-        #     fea2 = fea2 + noise
 
         # stage 3: inter-frame, middle, applying mamba in this stage
         in_dims = fea2.shape[1] * 2 - 4
         pts_num //= self.downsample[1]
         ret_group_array3 = self.group.st_group_points(fea2, 3, [0, 1, 2], self.knn[2], 3)
-        ret_array3, inputs, ind = self.select_ind(ret_group_array3, inputs,
-                                                  batchsize, in_dims, timestep, pts_num)
+        ret_array3, inputs = self.select_ind(ret_group_array3, inputs, batchsize, in_dims, timestep, pts_num)
         fea3 = self.pool3(self.stage3(ret_array3)).view(batchsize, -1, timestep, pts_num)
         # Apply Mamba temporal modeling after spatial processing
         fea3_mamba = self.mamba(fea3)
@@ -347,7 +317,6 @@ class Motion(nn.Module):
         Returns:
             ret_group_array: Selected grouped points
             inputs: Selected input points
-            ind: Selected indices
         """
         # Validate inputs
         if pts_num <= 0:
@@ -366,7 +335,7 @@ class Motion(nn.Module):
         # Apply indices to inputs
         inputs = inputs.gather(-1, ind.unsqueeze(1).expand(-1, inputs.shape[1], -1, -1))
         
-        return ret_group_array, inputs, ind
+        return ret_group_array, inputs
 
     @staticmethod
     def weight_select(position, topk):
