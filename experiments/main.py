@@ -1,4 +1,5 @@
 import os
+from collections import OrderedDict
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 import sys
@@ -42,6 +43,192 @@ class Processor():
         # Add label smoothing for regularization
         loss = nn.CrossEntropyLoss(label_smoothing=0.1, reduction="none")
         return self.device.criterion_to_device(loss)
+
+    @staticmethod
+    def _normalize_key(key):
+        return key[7:] if key.startswith('module.') else key
+
+    @staticmethod
+    def _normalize_prefix(prefix):
+        if prefix is None:
+            return None
+        prefix = prefix.strip('.')
+        return prefix or None
+
+    def _extract_model_state_dict(self, payload):
+        if isinstance(payload, dict) and 'model_state_dict' in payload:
+            return payload['model_state_dict']
+        return payload
+
+    def _should_ignore_weight(self, key):
+        normalized_key = self._normalize_key(key)
+        for ignore_key in self.arg.ignore_weights:
+            normalized_ignore = self._normalize_key(ignore_key)
+            if normalized_key == normalized_ignore or normalized_key.startswith(normalized_ignore + '.'):
+                return True
+        return False
+
+    def _prepare_state_dict(self, model, source_state, source_prefix=None, target_prefix=None):
+        source_prefix = self._normalize_prefix(source_prefix)
+        target_prefix = self._normalize_prefix(target_prefix)
+        target_state = model.state_dict()
+        normalized_target_keys = {
+            self._normalize_key(key): key for key in target_state.keys()
+        }
+
+        prepared_state = OrderedDict()
+        ignored_keys = []
+        unexpected_keys = []
+        prefix_skipped_keys = []
+        shape_mismatches = []
+
+        for source_key, tensor in source_state.items():
+            if self._should_ignore_weight(source_key):
+                ignored_keys.append(source_key)
+                continue
+
+            normalized_key = self._normalize_key(source_key)
+            if source_prefix:
+                if normalized_key == source_prefix:
+                    normalized_key = ''
+                elif normalized_key.startswith(source_prefix + '.'):
+                    normalized_key = normalized_key[len(source_prefix) + 1:]
+                else:
+                    prefix_skipped_keys.append(source_key)
+                    continue
+
+            target_key = normalized_key
+            if target_prefix:
+                target_key = target_prefix if not target_key else f"{target_prefix}.{target_key}"
+
+            actual_target_key = normalized_target_keys.get(target_key)
+            if actual_target_key is None:
+                unexpected_keys.append(source_key)
+                continue
+
+            if target_state[actual_target_key].shape != tensor.shape:
+                shape_mismatches.append(
+                    (source_key, actual_target_key, tuple(tensor.shape), tuple(target_state[actual_target_key].shape))
+                )
+                continue
+
+            prepared_state[actual_target_key] = tensor
+
+        if target_prefix:
+            target_scope = [
+                actual_key
+                for normalized_key, actual_key in normalized_target_keys.items()
+                if normalized_key == target_prefix or normalized_key.startswith(target_prefix + '.')
+            ]
+        else:
+            target_scope = list(target_state.keys())
+
+        missing_keys = [key for key in target_scope if key not in prepared_state]
+        return {
+            'state_dict': prepared_state,
+            'loaded_keys': list(prepared_state.keys()),
+            'ignored_keys': ignored_keys,
+            'unexpected_keys': unexpected_keys,
+            'prefix_skipped_keys': prefix_skipped_keys,
+            'shape_mismatches': shape_mismatches,
+            'missing_keys': missing_keys,
+        }
+
+    def _apply_prepared_state(self, model, prepared_state):
+        merged_state = model.state_dict()
+        merged_state.update(prepared_state)
+        model.load_state_dict(merged_state, strict=True)
+
+    def _log_weight_summary(self, label, summary):
+        self.recoder.print_log(
+            '{}: loaded {}, missing {}, unexpected {}, mismatched {}, ignored {}.'.format(
+                label,
+                len(summary['loaded_keys']),
+                len(summary['missing_keys']),
+                len(summary['unexpected_keys']),
+                len(summary['shape_mismatches']),
+                len(summary['ignored_keys']),
+            )
+        )
+        if summary['shape_mismatches']:
+            source_key, target_key, source_shape, target_shape = summary['shape_mismatches'][0]
+            self.recoder.print_log(
+                '  First shape mismatch: {} -> {} ({} vs {}).'.format(
+                    source_key, target_key, source_shape, target_shape
+                )
+            )
+
+    def _load_weights_into_model(self, model, weights_path, label, strict=True, source_prefix=None, target_prefix=None):
+        payload = torch.load(weights_path, map_location=torch.device('cpu'))
+        source_state = self._extract_model_state_dict(payload)
+        if not isinstance(source_state, dict):
+            raise ValueError('Weights at {} do not contain a valid state_dict.'.format(weights_path))
+
+        summary = self._prepare_state_dict(
+            model,
+            source_state,
+            source_prefix=source_prefix,
+            target_prefix=target_prefix,
+        )
+        if not summary['loaded_keys']:
+            raise RuntimeError('No compatible parameters were loaded from {}.'.format(weights_path))
+        if strict and (
+            summary['missing_keys'] or summary['unexpected_keys'] or summary['shape_mismatches']
+        ):
+            raise RuntimeError(
+                'Strict load failed for {}: missing {}, unexpected {}, mismatched {}.'.format(
+                    weights_path,
+                    len(summary['missing_keys']),
+                    len(summary['unexpected_keys']),
+                    len(summary['shape_mismatches']),
+                )
+            )
+
+        self._apply_prepared_state(model, summary['state_dict'])
+        self._log_weight_summary(label, summary)
+        return payload
+
+    def _set_requires_grad_by_prefix(self, model, prefix, requires_grad):
+        normalized_prefix = self._normalize_prefix(prefix)
+        if not normalized_prefix:
+            return 0
+
+        updated = 0
+        for name, param in model.named_parameters():
+            normalized_name = self._normalize_key(name)
+            if normalized_name == normalized_prefix or normalized_name.startswith(normalized_prefix + '.'):
+                param.requires_grad = requires_grad
+                updated += 1
+        return updated
+
+    def _apply_freeze(self, model):
+        if not hasattr(self.arg, 'freeze') or not self.arg.freeze:
+            return
+
+        if self.arg.freeze == 'spatial':
+            frozen = self._set_requires_grad_by_prefix(model, self.arg.spatial_target_prefix, False)
+            if frozen == 0:
+                self.recoder.print_log(
+                    'Requested spatial freeze, but no parameters matched prefix {}.'.format(
+                        self.arg.spatial_target_prefix
+                    )
+                )
+            else:
+                self.recoder.print_log(
+                    'Froze {} parameter tensors under {}.'.format(frozen, self.arg.spatial_target_prefix)
+                )
+        elif self.arg.freeze == 'temporal':
+            frozen = self._set_requires_grad_by_prefix(model, self.arg.temporal_target_prefix, False)
+            if frozen == 0:
+                self.recoder.print_log(
+                    'Requested temporal freeze, but no parameters matched prefix {}.'.format(
+                        self.arg.temporal_target_prefix
+                    )
+                )
+            else:
+                self.recoder.print_log(
+                    'Froze {} parameter tensors under {}.'.format(frozen, self.arg.temporal_target_prefix)
+                )
 
     def train(self, epoch):
         self.model.train()
@@ -108,9 +295,12 @@ class Processor():
                     
                     # Print branch losses every 50 batches
                     if batch_idx % 50 == 0:
-                        # Get current learning rates
-                        temporal_lr = self.optimizer.optimizer.param_groups[0]['lr']
-                        spatial_lr = self.optimizer.optimizer.param_groups[1]['lr'] if len(self.optimizer.optimizer.param_groups) > 1 else temporal_lr
+                        lr_by_name = {
+                            group.get('name', f'group_{idx}'): group['lr']
+                            for idx, group in enumerate(self.optimizer.optimizer.param_groups)
+                        }
+                        temporal_lr = lr_by_name.get('temporal', current_learning_rate[0])
+                        spatial_lr = lr_by_name.get('spatial', temporal_lr)
                         print(f"\n[Branch Losses] Temporal: {temporal_loss.item():.4f} (lr={temporal_lr:.6f}), "
                               f"Spatial: {spatial_loss.item():.4f} (lr={spatial_lr:.6f}), "
                               f"Combined: {loss.item():.4f}, "
@@ -175,54 +365,86 @@ class Processor():
         self.device.set_device(self.arg.device)
         print("Loading model")
         if self.arg.model:
+            if self.arg.resume and self.arg.weights is None:
+                raise ValueError('--resume requires --weights to point to a checkpoint.')
+            if self.arg.resume and (self.arg.temporal_weights or self.arg.spatial_weights):
+                raise ValueError('Do not combine --resume with branch-specific weight initialization.')
+            if self.arg.resume and self.arg.freeze:
+                raise ValueError('Do not combine --resume with --freeze. Start a new phase from --weights instead.')
+
             model_class = import_class(self.arg.model)
             # Override pts_size in model_args if provided via command line
             if '--pts-size' in sys.argv:
                 self.arg.model_args['pts_size'] = self.arg.pts_size
                 print(f"Using pts_size={self.arg.pts_size} from command line")
             model = self.device.model_to_device(model_class(**self.arg.model_args))
-            if self.arg.weights:
-                try:
-                    print("Loading pretrained model...")
-                    state_dict = torch.load(self.arg.weights)
-                    for w in self.arg.ignore_weights:
-                        if state_dict.pop(w, None) is not None:
-                            print('Sucessfully Remove Weights: {}.'.format(w))
-                        else:
-                            print('Can Not Remove Weights: {}.'.format(w))
-                    model.load_state_dict(state_dict, strict=True)
-                    optimizer = Optimizer(model, self.arg.optimizer_args)
-                except RuntimeError:
-                    print("Loading from checkpoint...")
-                    state_dict = torch.load(self.arg.weights)
-                    self.rng.set_rng_state(state_dict['rng_state'])
-                    self.arg.optimizer_args['start_epoch'] = state_dict["epoch"] + 1
-                    self.recoder.print_log("Resuming from checkpoint: epoch {}".
-                                           format(self.arg.optimizer_args['start_epoch']))
-                    model = self.device.load_weights(model, self.arg.weights, self.arg.ignore_weights)
-                    optimizer = Optimizer(model, self.arg.optimizer_args)
-                    optimizer.optimizer.load_state_dict(state_dict["optimizer_state_dict"])
-                    optimizer.scheduler.load_state_dict(state_dict["scheduler_state_dict"])
+            optimizer_args = dict(self.arg.optimizer_args)
+            optimizer_args.setdefault('spatial_prefix', self.arg.spatial_target_prefix)
+
+            if self.arg.resume:
+                self.recoder.print_log('Resuming full training state from {}.'.format(self.arg.weights))
+                checkpoint = torch.load(self.arg.weights, map_location=torch.device('cpu'))
+                if 'model_state_dict' not in checkpoint:
+                    raise ValueError('Resume requires a checkpoint with model_state_dict.')
+                self._load_weights_into_model(
+                    model,
+                    self.arg.weights,
+                    label='Resume model state',
+                    strict=self.arg.strict_load,
+                )
+                if 'rng_state' in checkpoint and hasattr(self, 'rng'):
+                    self.rng.set_rng_state(checkpoint['rng_state'])
+                self.arg.optimizer_args['start_epoch'] = checkpoint["epoch"] + 1
+                optimizer_args['start_epoch'] = self.arg.optimizer_args['start_epoch']
+                self.recoder.print_log(
+                    "Resuming from checkpoint: epoch {}".format(self.arg.optimizer_args['start_epoch'])
+                )
+                optimizer = Optimizer(model, optimizer_args)
+                optimizer.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                optimizer.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
             else:
-                optimizer = Optimizer(model, self.arg.optimizer_args)
+                if self.arg.weights:
+                    self.recoder.print_log('Initializing model weights from {}.'.format(self.arg.weights))
+                    self._load_weights_into_model(
+                        model,
+                        self.arg.weights,
+                        label='Initial model weights',
+                        strict=self.arg.strict_load,
+                    )
+                if self.arg.temporal_weights:
+                    self.recoder.print_log(
+                        'Initializing temporal branch from {} -> {}.'.format(
+                            self.arg.temporal_weights, self.arg.temporal_target_prefix
+                        )
+                    )
+                    self._load_weights_into_model(
+                        model,
+                        self.arg.temporal_weights,
+                        label='Temporal branch weights',
+                        strict=False,
+                        source_prefix=self.arg.temporal_source_prefix,
+                        target_prefix=self.arg.temporal_target_prefix,
+                    )
+                if self.arg.spatial_weights:
+                    self.recoder.print_log(
+                        'Initializing spatial branch from {} -> {}.'.format(
+                            self.arg.spatial_weights, self.arg.spatial_target_prefix
+                        )
+                    )
+                    self._load_weights_into_model(
+                        model,
+                        self.arg.spatial_weights,
+                        label='Spatial branch weights',
+                        strict=False,
+                        source_prefix=self.arg.spatial_source_prefix,
+                        target_prefix=self.arg.spatial_target_prefix,
+                    )
+
+                self._apply_freeze(model)
+                optimizer = Optimizer(model, optimizer_args)
         else:
             raise ValueError("No Models.")
-        
-        # Freeze branches if requested
-        if hasattr(self.arg, 'freeze') and self.arg.freeze:
-            if self.arg.freeze == 'spatial':
-                self.recoder.print_log(f"Freezing spatial branch")
-                for name, param in model.named_parameters():
-                    if 'spatial_branch' in name:
-                        param.requires_grad = False
-                        self.recoder.print_log(f"  Froze: {name}")
-            elif self.arg.freeze == 'temporal':
-                self.recoder.print_log(f"Freezing temporal branch (main branch)")
-                for name, param in model.named_parameters():
-                    if 'spatial_branch' not in name and 'fusion_weight' not in name:
-                        param.requires_grad = False
-                        self.recoder.print_log(f"  Froze: {name}")
-        
+
         print("Loading model finished.")
         self.load_data()
         return model, optimizer
@@ -358,13 +580,15 @@ class Processor():
             self.recoder.print_log(f"Failed to send Telegram message: {e}")
 
     def save_model(self, epoch, model, optimizer, save_path):
-        torch.save({
+        state = {
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.optimizer.state_dict(),
             'scheduler_state_dict': optimizer.scheduler.state_dict(),
-            'rng_state': self.rng.save_rng_state()
-        }, save_path)
+        }
+        if hasattr(self, 'rng'):
+            state['rng_state'] = self.rng.save_rng_state()
+        torch.save(state, save_path)
 
     def save_arg(self):
         arg_dict = vars(self.arg)

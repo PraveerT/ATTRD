@@ -107,6 +107,44 @@ def get_parser():
         default=None,
         help='the weights for network initialization')
     parser.add_argument(
+        '--resume',
+        type=str2bool,
+        default=False,
+        help='resume optimizer, scheduler, and RNG state from --weights checkpoint')
+    parser.add_argument(
+        '--strict-load',
+        type=str2bool,
+        default=True,
+        help='require exact key coverage and shape compatibility when loading --weights')
+    parser.add_argument(
+        '--temporal-weights',
+        default=None,
+        help='optional checkpoint used to initialize the temporal branch of a fused model')
+    parser.add_argument(
+        '--spatial-weights',
+        default=None,
+        help='optional checkpoint used to initialize the spatial branch of a fused model')
+    parser.add_argument(
+        '--temporal-source-prefix',
+        type=str,
+        default='',
+        help='prefix to strip from keys loaded via --temporal-weights before remapping')
+    parser.add_argument(
+        '--spatial-source-prefix',
+        type=str,
+        default='',
+        help='prefix to strip from keys loaded via --spatial-weights before remapping')
+    parser.add_argument(
+        '--temporal-target-prefix',
+        type=str,
+        default='temporal_branch',
+        help='target branch prefix inside the fused model for --temporal-weights')
+    parser.add_argument(
+        '--spatial-target-prefix',
+        type=str,
+        default='spatial_branch',
+        help='target branch prefix inside the fused model for --spatial-weights')
+    parser.add_argument(
         '--ignore-weights',
         type=str,
         default=[],

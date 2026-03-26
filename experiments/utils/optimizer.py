@@ -7,13 +7,20 @@ import torch.optim as optim
 class Optimizer(object):
     def __init__(self, model, optim_dict):
         self.optim_dict = optim_dict
+        self.spatial_prefix = self.optim_dict.get('spatial_prefix', 'spatial_branch').strip('.')
         
         # Separate parameter groups for different learning rates
         spatial_params = []
         temporal_params = []
         
         for name, param in model.named_parameters():
-            if 'spatial_branch' in name:
+            if not param.requires_grad:
+                continue
+            normalized_name = name[7:] if name.startswith('module.') else name
+            if self.spatial_prefix and (
+                normalized_name == self.spatial_prefix
+                or normalized_name.startswith(self.spatial_prefix + '.')
+            ):
                 spatial_params.append(param)
             else:
                 temporal_params.append(param)
@@ -22,10 +29,13 @@ class Optimizer(object):
         spatial_lr = self.optim_dict['base_lr'] * 1.0  # Same as temporal
         temporal_lr = self.optim_dict['base_lr']
         
-        param_groups = [
-            {'params': temporal_params, 'lr': temporal_lr, 'name': 'temporal'},
-            {'params': spatial_params, 'lr': spatial_lr, 'name': 'spatial'}
-        ]
+        param_groups = []
+        if temporal_params:
+            param_groups.append({'params': temporal_params, 'lr': temporal_lr, 'name': 'temporal'})
+        if spatial_params:
+            param_groups.append({'params': spatial_params, 'lr': spatial_lr, 'name': 'spatial'})
+        if not param_groups:
+            raise ValueError("No trainable parameters were found for optimizer setup.")
         
         if self.optim_dict["optimizer"] == 'SGD':
             self.optimizer = optim.SGD(
