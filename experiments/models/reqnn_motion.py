@@ -159,10 +159,20 @@ class REQNNFrameEncoder(nn.Module):
 
 
 class REQNNMotion(nn.Module):
-    def __init__(self, num_classes, pts_size, reqnn_k=20, reqnn_emb_dims=256, temporal_hidden=256, dropout=0.3):
+    def __init__(
+        self,
+        num_classes,
+        pts_size,
+        reqnn_k=20,
+        reqnn_emb_dims=256,
+        temporal_hidden=256,
+        dropout=0.3,
+        sample_mode="uniform",
+    ):
         super().__init__()
         self.num_classes = num_classes
         self.pts_size = pts_size
+        self.sample_mode = sample_mode
         self.frame_encoder = REQNNFrameEncoder(k=reqnn_k, emb_dims=reqnn_emb_dims)
         self.temporal_model = nn.Sequential(
             nn.Conv1d(self.frame_encoder.feature_dim, temporal_hidden, kernel_size=1, bias=False),
@@ -187,10 +197,13 @@ class REQNNMotion(nn.Module):
         batch_size, timestep, point_count, _ = xyz.shape
         sample_size = min(self.pts_size, point_count)
 
-        if self.training:
+        if self.sample_mode == "random" and self.training:
             scores = torch.rand(batch_size, timestep, point_count, device=xyz.device)
             indices = scores.topk(sample_size, dim=-1).indices
         else:
+            # The stored point order is already randomized during preprocessing, so
+            # a deterministic strided subset removes the train/test mismatch without
+            # depending on per-epoch randomness.
             indices = torch.linspace(0, point_count - 1, sample_size, device=xyz.device).long()
             indices = indices.view(1, 1, sample_size).expand(batch_size, timestep, -1)
 

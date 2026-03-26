@@ -2,11 +2,13 @@ import re
 import pdb
 import sys
 import numpy as np
+
+sys.path.append("..")
+
 from utils import *
 import torch.utils.data as data
 from utils.pts_transform import *
-
-sys.path.append("..")
+from dataset import utils as dataset_utils
 
 
 class NvidiaLoader(data.Dataset):
@@ -123,6 +125,49 @@ class NvidiaLoader(data.Dataset):
         factor = frame_size * 1.0 / key_cnt
         index = [int(j / factor) for j in range(frame_size)]
         return index
+
+
+class NvidiaREQNNLoader(NvidiaLoader):
+    """REQNN-specific Nvidia loader that keeps branch-1 data untouched.
+
+    This loader reads the SHREC-style xyz+t representation already stored for the
+    Nvidia dataset, and applies light xyz-space augmentations intended for the
+    geometry branch only.
+    """
+
+    def normalize(self, pts, fs):
+        timestep, pts_size, channels = pts.shape
+
+        if channels >= 8:
+            xyzt = pts[..., 4:8].astype(np.float32)
+        else:
+            raw_uvdt = pts[..., :4].astype(np.float32)
+            xyzt = np.zeros((timestep, pts_size, 4), dtype=np.float32)
+            for frame_idx in range(timestep):
+                xyzt[frame_idx] = dataset_utils.uvd2xyz_sherc(raw_uvdt[frame_idx].copy()).astype(np.float32)
+
+        # Keep time as a centered sequence coordinate in [-1, 1].
+        time_center = max((fs - 1) / 2.0, 1.0)
+        xyzt[..., 3] = (xyzt[..., 3] - time_center) / time_center
+
+        xyzt = self.transform(xyzt.reshape(-1, 4))
+        return xyzt.reshape(timestep, pts_size, 4)
+
+    @staticmethod
+    def transform_init(phase):
+        if phase == 'train':
+            transform = Compose([
+                PointcloudToTensor(),
+                PointcloudScale(lo=0.9, hi=1.1),
+                PointcloudRotatePerturbation(angle_sigma=0.06, angle_clip=0.18),
+                PointcloudTranslate(translate_range=0.05),
+                PointcloudJitter(std=0.01, clip=0.03),
+            ])
+        else:
+            transform = Compose([
+                PointcloudToTensor(),
+            ])
+        return transform
 
 
 if __name__ == "__main__":
