@@ -46,14 +46,10 @@ class MultiScaleFeatureProcessor(nn.Module):
     
     def forward(self, x):
         # x shape: B, C, T, N
-        B, C, T, N = x.shape
+        B, _, T, N = x.shape
         
         # 1. Multi-scale feature extraction
-        scale_features = []
-        for i, filter in enumerate(self.scale_filters):
-            # Apply scale-specific filter
-            scale_feat = filter(x)
-            scale_features.append(scale_feat)
+        scale_features = [scale_filter(x) for scale_filter in self.scale_filters]
         
         # 2. Model feature interaction between scales
         interacted_features = [scale_features[0]]
@@ -71,11 +67,10 @@ class MultiScaleFeatureProcessor(nn.Module):
             interacted_features.append(target + interaction)
         
         # 3. Upsample each scale back to the original resolution
-        all_features = []
-        for i, feat in enumerate(interacted_features):
-            # Upsample to original resolution
-            upsampled = F.interpolate(feat, size=(T, N), mode='bilinear', align_corners=False)
-            all_features.append(upsampled)
+        all_features = [
+            F.interpolate(feat, size=(T, N), mode='bilinear', align_corners=False)
+            for feat in interacted_features
+        ]
 
         # 4. Combine all feature representations
         combined_features = torch.cat(all_features, dim=1)  # (B, feature_dim * num_scales, T, N)
@@ -201,7 +196,7 @@ class MambaTemporalEncoder(nn.Module):
         x = self.input_proj(x)
         
         # Apply Mamba layers with residual connections
-        for i, (mamba, norm) in enumerate(zip(self.mamba_layers, self.norms)):
+        for mamba, norm in zip(self.mamba_layers, self.norms):
             residual = x
             x = norm(x)
             x = mamba(x)
@@ -247,37 +242,39 @@ class Motion(nn.Module):
 
     def forward(self, inputs):
         # B * T * N * D,  e.g. 16 * 32 * 512 * 4
-        inputs = inputs.permute(0, 3, 1, 2)
+        points = inputs.permute(0, 3, 1, 2)
+        point_count = points.shape[3]
+        device = points.device
         if self.training:
             # Random sampling during training for augmentation
-            indices = torch.randperm(inputs.shape[3])[:self.pts_size]
+            indices = torch.randperm(point_count, device=device)[:self.pts_size]
         else:
             # Deterministic sampling during testing for consistent results
-            indices = torch.linspace(0, inputs.shape[3]-1, self.pts_size, dtype=torch.long)
-        inputs = inputs[:, :, :, indices]
+            indices = torch.linspace(0, point_count - 1, self.pts_size, device=device).long()
+        points = points[:, :, :, indices]
         # B * (4 + others) * 32 * 128
-        inputs = inputs[:, :4]
+        coords = points[:, :4]
         # B * 4 * 32 * 128
-        batchsize, in_dims, timestep, pts_num = inputs.shape
+        batchsize, in_dims, timestep, pts_num = coords.shape
 
         # stage 1: intra-frame
-        ret_array1 = self.group.group_points(distance_dim=[0, 1, 2], array1=inputs, array2=inputs, knn=self.knn[0],
+        ret_array1 = self.group.group_points(distance_dim=[0, 1, 2], array1=coords, array2=coords, knn=self.knn[0],
                                              dim=3)
         # B * 4 * 32 * 128 * 16
-        ret_array1 = ret_array1.contiguous().view(batchsize, in_dims, timestep * pts_num, -1)
+        ret_array1 = ret_array1.reshape(batchsize, in_dims, timestep * pts_num, -1)
         # B * 4 * 4096 * 16
-        fea1 = self.pool1(self.stage1(ret_array1)).view(batchsize, -1, timestep, pts_num)
+        fea1 = self.pool1(self.stage1(ret_array1)).reshape(batchsize, -1, timestep, pts_num)
         # B * 64 * 32 * 128
-        fea1 = torch.cat((inputs, fea1), dim=1)
+        fea1 = torch.cat((coords, fea1), dim=1)
         # B * 68 * 32 * 128
 
         # stage 2: inter-frame, early
         in_dims = fea1.shape[1] * 2 - 4
         pts_num //= self.downsample[0]
         ret_group_array2 = self.group.st_group_points(fea1, 3, [0, 1, 2], self.knn[1], 3)
-        ret_array2, inputs = self.select_ind(ret_group_array2, inputs, batchsize, in_dims, timestep, pts_num)
-        fea2 = self.pool2(self.stage2(ret_array2)).view(batchsize, -1, timestep, pts_num)
-        fea2 = torch.cat((inputs, fea2), dim=1)
+        ret_array2, coords = self.select_ind(ret_group_array2, coords, batchsize, in_dims, timestep, pts_num)
+        fea2 = self.pool2(self.stage2(ret_array2)).reshape(batchsize, -1, timestep, pts_num)
+        fea2 = torch.cat((coords, fea2), dim=1)
         
         # Apply multi-scale feature processing
         fea2 = self.multi_scale(fea2)
@@ -286,12 +283,12 @@ class Motion(nn.Module):
         in_dims = fea2.shape[1] * 2 - 4
         pts_num //= self.downsample[1]
         ret_group_array3 = self.group.st_group_points(fea2, 3, [0, 1, 2], self.knn[2], 3)
-        ret_array3, inputs = self.select_ind(ret_group_array3, inputs, batchsize, in_dims, timestep, pts_num)
-        fea3 = self.pool3(self.stage3(ret_array3)).view(batchsize, -1, timestep, pts_num)
+        ret_array3, coords = self.select_ind(ret_group_array3, coords, batchsize, in_dims, timestep, pts_num)
+        fea3 = self.pool3(self.stage3(ret_array3)).reshape(batchsize, -1, timestep, pts_num)
         # Apply Mamba temporal modeling after spatial processing
         fea3_mamba = self.mamba(fea3)
         # Concatenate with inputs for next stage
-        fea3 = torch.cat((inputs, fea3_mamba), dim=1)
+        fea3 = torch.cat((coords, fea3_mamba), dim=1)
 
         # Stage 4 removed - direct connection from Stage 3+Mamba to Stage 5
         # fea3 shape: (batchsize, features, timestep, 32 points)
@@ -330,12 +327,20 @@ class Motion(nn.Module):
         ind_expanded = ind.unsqueeze(1).unsqueeze(-1).expand(
             -1, group_array.shape[1], -1, -1, group_array.shape[-1])
         ret_group_array = group_array.gather(-2, ind_expanded)
-        ret_group_array = ret_group_array.view(batchsize, in_dim, timestep * pts_num, -1)
+        ret_group_array = ret_group_array.reshape(batchsize, in_dim, timestep * pts_num, -1)
         
         # Apply indices to inputs
         inputs = inputs.gather(-1, ind.unsqueeze(1).expand(-1, inputs.shape[1], -1, -1))
         
         return ret_group_array, inputs
+
+    @staticmethod
+    def _normalize_scores(values):
+        values_min = values.min(dim=-1, keepdim=True)[0]
+        values_max = values.max(dim=-1, keepdim=True)[0]
+        values_range = values_max - values_min
+        values_range = torch.where(values_range == 0, torch.ones_like(values_range), values_range)
+        return (values - values_min) / values_range
 
     @staticmethod
     def weight_select(position, topk):
@@ -368,24 +373,14 @@ class Motion(nn.Module):
         distances = torch.max(torch.sum(position[:, :3] ** 2, dim=1), dim=-1)[0]
         
         # Normalize distances to [0, 1] range
-        dist_min = distances.min(dim=-1, keepdim=True)[0]
-        dist_max = distances.max(dim=-1, keepdim=True)[0]
-        dist_range = dist_max - dist_min
-        # Avoid division by zero
-        dist_range = torch.where(dist_range == 0, torch.ones_like(dist_range), dist_range)
-        normalized_distances = (distances - dist_min) / dist_range
+        normalized_distances = Motion._normalize_scores(distances)
         
         # Compute feature variance across neighbors if we have more than 3 channels
         if position.shape[1] > 3:
             # Compute variance for feature channels (channels 3 onwards)
             feature_var = torch.var(position[:, 3:], dim=-1).mean(dim=1)  # Mean variance across time
             # Normalize feature variance
-            var_min = feature_var.min(dim=-1, keepdim=True)[0]
-            var_max = feature_var.max(dim=-1, keepdim=True)[0]
-            var_range = var_max - var_min
-            # Avoid division by zero
-            var_range = torch.where(var_range == 0, torch.ones_like(var_range), var_range)
-            normalized_variance = (feature_var - var_min) / var_range
+            normalized_variance = Motion._normalize_scores(feature_var)
         else:
             # If no feature channels, use zeros
             normalized_variance = torch.zeros_like(normalized_distances)
@@ -408,11 +403,7 @@ class Motion(nn.Module):
             diversity_measure = torch.sqrt(torch.sum((coords - centroid) ** 2, dim=1))  # (B, T*P)
             
             # Normalize diversity measure
-            div_min = diversity_measure.min(dim=-1, keepdim=True)[0]
-            div_max = diversity_measure.max(dim=-1, keepdim=True)[0]
-            div_range = div_max - div_min
-            div_range = torch.where(div_range == 0, torch.ones_like(div_range), div_range)
-            normalized_diversity = (diversity_measure - div_min) / div_range
+            normalized_diversity = Motion._normalize_scores(diversity_measure)
         else:
             normalized_diversity = torch.zeros_like(normalized_distances)
         
