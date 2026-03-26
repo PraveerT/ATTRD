@@ -76,6 +76,11 @@ def get_parser():
         default=128,
         help='the number of sampled points for each frame')
     parser.add_argument(
+        '--dynamic-pts-size',
+        type=str2bool,
+        default=True,
+        help='dynamically schedule pts_size during training instead of keeping it fixed')
+    parser.add_argument(
         '--freeze',
         type=str,
         default=None,
@@ -195,5 +200,4 @@ def get_parser():
         type=float,
         default=0.7,
         help='weight for soft label loss (0.0-1.0)')
-    
     return parser

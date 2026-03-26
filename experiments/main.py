@@ -35,9 +35,8 @@ class Processor():
         self.telegram_chat_id = None
         self.best_accuracy = 0.0  # Track best accuracy within current run
         
-        # Check if pts_size was explicitly provided via command line
-        # by checking if --pts-size appears in sys.argv
-        self.use_static_pts = '--pts-size' in sys.argv
+        # A fixed point count can be requested either from the CLI or directly in config.
+        self.use_static_pts = ('--pts-size' in sys.argv) or (not getattr(self.arg, 'dynamic_pts_size', True))
 
     def criterion(self):
         # Add label smoothing for regularization
@@ -234,20 +233,23 @@ class Processor():
         self.model.train()
         model_ref = self.model.module if hasattr(self.model, 'module') else self.model
         
-        # Check if pts_size was provided as command line argument
+        # Check if a fixed pts_size was requested.
         if self.use_static_pts:
-            # Use static pts_size from command line
+            # Use a fixed pts_size from CLI or config.
             pts_size = self.arg.pts_size
             model_ref.pts_size = pts_size
             # Also update model_args to ensure consistency
             self.arg.model_args['pts_size'] = pts_size
-            self.recoder.print_log('Training epoch: {} | pts_size: {} (static from --pts-size)'.format(epoch + 1, pts_size))
+            static_source = '--pts-size' if '--pts-size' in sys.argv else 'config'
+            self.recoder.print_log(
+                'Training epoch: {} | pts_size: {} (static from {})'.format(epoch + 1, pts_size, static_source)
+            )
         else:
             # Dynamic pts_size scheduling
-            # Epoch 0-50: 96 -> 128 (slow increase)
+            # Epoch 0-50: 48 -> 128 (slow increase)
             # Epoch 50-100: 128 -> 256 (fast increase)
             if epoch < 50:
-                # Slow linear increase from 96 to 128 over 50 epochs
+                # Slow linear increase from 48 to 128 over 50 epochs
                 pts_size = int(48 + (128 - 48) * (epoch / 50))
             elif epoch < 100:
                 # Fast exponential-like increase from 128 to 256 over 50 epochs

@@ -2,16 +2,17 @@
 # - temporal_branch: Motion
 # - spatial_branch: REQNNMotion
 #
-# Later fine-tuning example:
+# Fine-tuning continuation example:
 # python main.py --config motion_reqnn_fusion.yaml \
+#   --work-dir ./work_dir/motion_reqnn_fusion_e120_continue \
 #   --temporal-weights ./work_dir/baseline/epoch300_model.pt \
 #   --spatial-weights ./work_dir/reqnn_motion/epoch300_model.pt
 
 dataloader: nvidia_dataloader.NvidiaLoader
 
 phase: train
-num_epoch: 300
-work_dir: ./work_dir/motion_reqnn_fusion/
+num_epoch: 240
+work_dir: ./work_dir/motion_reqnn_fusion_e120_continue/
 batch_size: 4
 test_batch_size: 1
 num_worker: 4
@@ -23,14 +24,15 @@ eval_interval: 1
 save_interval: 5
 
 framesize: &framesize 32
-pts_size: &frame_pts_size 96
+pts_size: &frame_pts_size 256
+dynamic_pts_size: False
 
 optimizer_args:
   optimizer: Adam
-  base_lr: 0.00012
+  base_lr: 0.000012
   step: [100, 160, 180]
   weight_decay: 0.03
-  start_epoch: 0
+  start_epoch: 120
   nesterov: False
 
 train_loader_args:
