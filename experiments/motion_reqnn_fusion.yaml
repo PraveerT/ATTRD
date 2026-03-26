@@ -1,0 +1,54 @@
+# Two-branch fusion model:
+# - temporal_branch: Motion
+# - spatial_branch: REQNNMotion
+#
+# Later fine-tuning example:
+# python main.py --config motion_reqnn_fusion.yaml \
+#   --temporal-weights ./work_dir/baseline/epoch300_model.pt \
+#   --spatial-weights ./work_dir/reqnn_motion/epoch300_model.pt
+
+dataloader: nvidia_dataloader.NvidiaLoader
+
+phase: train
+num_epoch: 300
+work_dir: ./work_dir/motion_reqnn_fusion/
+batch_size: 8
+test_batch_size: 1
+num_worker: 8
+
+device: 1
+log_interval: 50
+eval_interval: 1
+save_interval: 5
+
+framesize: &framesize 32
+pts_size: &frame_pts_size 96
+
+optimizer_args:
+  optimizer: Adam
+  base_lr: 0.00012
+  step: [100, 160, 180]
+  weight_decay: 0.03
+  start_epoch: 0
+  nesterov: False
+
+train_loader_args:
+  phase: 'train'
+  framerate: *framesize
+
+test_loader_args:
+  phase: 'test'
+  framerate: *framesize
+
+model: models.reqnn_motion.MotionREQNNFusion
+model_args:
+  pts_size: *frame_pts_size
+  num_classes: 25
+  knn: [32, 24, 48, 24]
+  topk: 8
+  reqnn_k: 20
+  reqnn_emb_dims: 256
+  spatial_temporal_hidden: 256
+  spatial_dropout: 0.3
+  fusion_hidden: 512
+  fusion_dropout: 0.3

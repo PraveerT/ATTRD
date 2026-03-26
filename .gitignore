@@ -3,6 +3,7 @@ dataset/Nvidia
 
 # Work directories
 experiments/work_dir/
+external/REQNN/
 
 # Python
 __pycache__/

@@ -239,34 +239,32 @@ class Motion(nn.Module):
         
         # Add Multi-scale Feature Processor layer after stage2
         self.multi_scale = MultiScaleFeatureProcessor(in_channels=132, num_scales=4, feature_dim=32)
+        self.feature_dim = 1024
 
-    def forward(self, inputs):
-        # B * T * N * D,  e.g. 16 * 32 * 512 * 4
+    def _sample_points(self, inputs):
         points = inputs.permute(0, 3, 1, 2)
         point_count = points.shape[3]
         device = points.device
+        sample_size = min(self.pts_size, point_count)
+
         if self.training:
             # Random sampling during training for augmentation
-            indices = torch.randperm(point_count, device=device)[:self.pts_size]
+            indices = torch.randperm(point_count, device=device)[:sample_size]
         else:
             # Deterministic sampling during testing for consistent results
-            indices = torch.linspace(0, point_count - 1, self.pts_size, device=device).long()
+            indices = torch.linspace(0, point_count - 1, sample_size, device=device).long()
         points = points[:, :, :, indices]
-        # B * (4 + others) * 32 * 128
-        coords = points[:, :4]
-        # B * 4 * 32 * 128
+        return points[:, :4]
+
+    def _encode_sampled_points(self, coords):
         batchsize, in_dims, timestep, pts_num = coords.shape
 
         # stage 1: intra-frame
         ret_array1 = self.group.group_points(distance_dim=[0, 1, 2], array1=coords, array2=coords, knn=self.knn[0],
                                              dim=3)
-        # B * 4 * 32 * 128 * 16
         ret_array1 = ret_array1.reshape(batchsize, in_dims, timestep * pts_num, -1)
-        # B * 4 * 4096 * 16
         fea1 = self.pool1(self.stage1(ret_array1)).reshape(batchsize, -1, timestep, pts_num)
-        # B * 64 * 32 * 128
         fea1 = torch.cat((coords, fea1), dim=1)
-        # B * 68 * 32 * 128
 
         # stage 2: inter-frame, early
         in_dims = fea1.shape[1] * 2 - 4
@@ -275,8 +273,6 @@ class Motion(nn.Module):
         ret_array2, coords = self.select_ind(ret_group_array2, coords, batchsize, in_dims, timestep, pts_num)
         fea2 = self.pool2(self.stage2(ret_array2)).reshape(batchsize, -1, timestep, pts_num)
         fea2 = torch.cat((coords, fea2), dim=1)
-        
-        # Apply multi-scale feature processing
         fea2 = self.multi_scale(fea2)
 
         # stage 3: inter-frame, middle, applying mamba in this stage
@@ -285,19 +281,24 @@ class Motion(nn.Module):
         ret_group_array3 = self.group.st_group_points(fea2, 3, [0, 1, 2], self.knn[2], 3)
         ret_array3, coords = self.select_ind(ret_group_array3, coords, batchsize, in_dims, timestep, pts_num)
         fea3 = self.pool3(self.stage3(ret_array3)).reshape(batchsize, -1, timestep, pts_num)
-        # Apply Mamba temporal modeling after spatial processing
         fea3_mamba = self.mamba(fea3)
-        # Concatenate with inputs for next stage
-        fea3 = torch.cat((coords, fea3_mamba), dim=1)
+        return torch.cat((coords, fea3_mamba), dim=1)
 
-        # Stage 4 removed - direct connection from Stage 3+Mamba to Stage 5
-        # fea3 shape: (batchsize, features, timestep, 32 points)
-        
+    def extract_features(self, inputs):
+        coords = self._sample_points(inputs)
+        fea3 = self._encode_sampled_points(coords)
         output = self.stage5(fea3)
         output = self.pool5(output)
         output = self.global_bn(output)
-        output = self.stage6(output)
-        return output.view(batchsize, self.num_classes)
+        return output.flatten(1)
+
+    def classify_features(self, features):
+        logits = self.stage6(features.unsqueeze(-1).unsqueeze(-1))
+        return logits.view(features.shape[0], self.num_classes)
+
+    def forward(self, inputs):
+        features = self.extract_features(inputs)
+        return self.classify_features(features)
 
     def select_ind(self, group_array, inputs, batchsize, in_dim, timestep, pts_num):
         """

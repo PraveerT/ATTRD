@@ -232,12 +232,13 @@ class Processor():
 
     def train(self, epoch):
         self.model.train()
+        model_ref = self.model.module if hasattr(self.model, 'module') else self.model
         
         # Check if pts_size was provided as command line argument
         if self.use_static_pts:
             # Use static pts_size from command line
             pts_size = self.arg.pts_size
-            self.model.pts_size = pts_size
+            model_ref.pts_size = pts_size
             # Also update model_args to ensure consistency
             self.arg.model_args['pts_size'] = pts_size
             self.recoder.print_log('Training epoch: {} | pts_size: {} (static from --pts-size)'.format(epoch + 1, pts_size))
@@ -258,7 +259,7 @@ class Processor():
                 pts_size = 256
             
             # Update model's pts_size
-            self.model.pts_size = pts_size
+            model_ref.pts_size = pts_size
             self.recoder.print_log('Training epoch: {} | pts_size: {} (dynamic)'.format(epoch + 1, pts_size))
         
         loader = self.data_loader['train']
@@ -284,10 +285,10 @@ class Processor():
             loss = torch.mean(self.loss(output, label))
             
             # Compute separate branch losses for monitoring
-            if hasattr(self.model, 'temporal_logits') and hasattr(self.model, 'spatial_logits'):
+            if hasattr(model_ref, 'temporal_logits') and hasattr(model_ref, 'spatial_logits'):
                 with torch.no_grad():
-                    temporal_loss = torch.mean(self.loss(self.model.temporal_logits, label))
-                    spatial_loss = torch.mean(self.loss(self.model.spatial_logits, label))
+                    temporal_loss = torch.mean(self.loss(model_ref.temporal_logits, label))
+                    spatial_loss = torch.mean(self.loss(model_ref.spatial_logits, label))
                     
                     # Track separate losses for epoch mean calculation
                     temporal_loss_values.append(temporal_loss.item())
@@ -304,7 +305,7 @@ class Processor():
                         print(f"\n[Branch Losses] Temporal: {temporal_loss.item():.4f} (lr={temporal_lr:.6f}), "
                               f"Spatial: {spatial_loss.item():.4f} (lr={spatial_lr:.6f}), "
                               f"Combined: {loss.item():.4f}, "
-                              f"Alpha: {getattr(self.model, 'alpha_value', 'N/A')}")
+                              f"Alpha: {getattr(model_ref, 'alpha_value', 'N/A')}")
             
             self.optimizer.zero_grad()
             loss.backward()
