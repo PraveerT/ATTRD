@@ -76,6 +76,17 @@ python main.py \
   --device 0
 ```
 
+## Fine-Tune Branch 2 (Stacked weighted-rms from epoch110 at static 256)
+
+```bash
+python main.py \
+  --config linear_branch_stacked_quat_weighted_rmsmerge_ft256.yaml \
+  --work-dir ./work_dir/linear_branch_edgeconv_quatstack_weighted_rms_ft256_from110_e60 \
+  --weights ./work_dir/linear_branch_edgeconv_quatstack_weighted_rms_h256_e120/epoch110_model.pt \
+  --num-epoch 60 \
+  --device 0
+```
+
 ## Notes
 
 - `epoch120_model.pt` is saved because the configs use `save_interval: 5`.
