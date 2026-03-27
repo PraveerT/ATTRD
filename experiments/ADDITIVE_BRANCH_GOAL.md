@@ -28,8 +28,8 @@ actually improve accuracy on this dataset.
   `56.8465%` at epoch `80` in `work_dir/linear_branch_edgeconv_quatmerge_e120/`
   This is the committed winner from `509bdc6`.
 - Current best known branch-2 result:
-  `69.5021%` at epoch `110` in
-  `work_dir/linear_branch_edgeconv_quatmerge_rms_h256_e120/`
+  `71.5768%` at epoch `110` in
+  `work_dir/linear_branch_edgeconv_quatmerge_weighted_rms_h256_e120/`
 
 ## What Worked
 
@@ -39,6 +39,7 @@ actually improve accuracy on this dataset.
 4. Widen the winning quaternion-merge model from `hidden_dims [64, 128]` to
    `hidden_dims [64, 256]`.
 5. Use RMS quaternion collapse instead of raw squared-energy summation before pooling.
+6. Let the RMS collapse learn small component-specific weights over `r/i/j/k`.
 
 ## What Did Not Help
 
@@ -60,12 +61,32 @@ machinery. The useful part so far is:
 
 ## Next Steps
 
-1. Keep the `EdgeConvQuaternionRMSMergeMotion` path as the reference architecture.
+1. Keep the `EdgeConvQuaternionWeightedRMSMergeMotion` path as the reference architecture.
 2. Continue changing only one thing at a time from this `h256` winner.
 3. Prefer small, local changes over large architecture swaps.
 4. Only return to fusion after branch 2 is consistently strong on its own.
 
 ## Latest Completed Trial
+
+The learned-weight RMS variant completed through epoch `120`:
+
+- keep EdgeConv
+- keep the quaternion point mixer
+- keep the post-merge projection
+- keep RMS collapse as the base behavior
+- replace fixed equal RMS weights with learned component weights over `r/i/j/k`
+
+This stayed within the same local merge-path change budget and started exactly at
+the equal-weight RMS winner. It improved over the fixed RMS version.
+
+- best observed test accuracy: `71.5768%` at epoch `110`
+- final epoch-120 test accuracy: `68.2573%`
+- learned merge weights at epoch `110`: approximately
+  `r=0.2572, i=0.2471, j=0.2515, k=0.2443`
+- config/work dir: `linear_branch_weighted_rmsmerge.yaml` ->
+  `work_dir/linear_branch_edgeconv_quatmerge_weighted_rms_h256_e120/`
+
+## Previous Completed Trial
 
 The RMS-collapse variant completed through epoch `120`:
 
@@ -95,8 +116,8 @@ The resumed `h256` winner completed through epoch `120`.
 ```bash
 cd /notebooks/PMamba/experiments
 python main.py \
-  --config linear_branch_rmsmerge.yaml \
-  --work-dir ./work_dir/linear_branch_edgeconv_quatmerge_rms_h256_e120 \
+  --config linear_branch_weighted_rmsmerge.yaml \
+  --work-dir ./work_dir/linear_branch_edgeconv_quatmerge_weighted_rms_h256_e120 \
   --num-epoch 120 \
   --device 0
 ```

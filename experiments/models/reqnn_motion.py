@@ -142,6 +142,14 @@ def quaternion_rms_merge(x, eps=1e-6):
     return torch.sqrt(torch.mean(grouped * grouped, dim=2) + eps)
 
 
+def quaternion_weighted_rms_merge(x, component_weights, eps=1e-6):
+    grouped = _reshape_quaternion_groups(x)
+    weight_shape = [1] * grouped.dim()
+    weight_shape[2] = 4
+    normalized_weights = torch.softmax(component_weights, dim=-1).view(*weight_shape)
+    return torch.sqrt(torch.sum(grouped * grouped * normalized_weights, dim=2) + eps)
+
+
 def _reshape_quaternion_groups(x):
     if x.size(1) % 4 != 0:
         raise ValueError("Quaternion merge expects channel count divisible by 4.")
@@ -241,6 +249,29 @@ class EdgeConvQuaternionRMSMergeMotion(EdgeConvQuaternionMergeMotion):
 
     def merge_quaternions(self, encoded):
         return quaternion_rms_merge(encoded, eps=self.merge_eps)
+
+
+class EdgeConvQuaternionWeightedRMSMergeMotion(EdgeConvQuaternionRMSMergeMotion):
+    """RMS winner with learnable per-component weights in the quaternion collapse."""
+
+    def __init__(self, num_classes, pts_size, hidden_dims=(64, 128), dropout=0.1, edgeconv_k=20, merge_eps=1e-6):
+        super().__init__(
+            num_classes=num_classes,
+            pts_size=pts_size,
+            hidden_dims=hidden_dims,
+            dropout=dropout,
+            edgeconv_k=edgeconv_k,
+            merge_eps=merge_eps,
+        )
+        # Start from the current RMS winner: equal weights over r, i, j, k.
+        self.merge_component_logits = nn.Parameter(torch.zeros(4))
+
+    def merge_quaternions(self, encoded):
+        return quaternion_weighted_rms_merge(
+            encoded,
+            component_weights=self.merge_component_logits,
+            eps=self.merge_eps,
+        )
 
 
 # Keep the legacy class name so older configs still resolve.
