@@ -544,7 +544,7 @@ class Processor():
         # Display confusion matrix
         try:
             import numpy as np
-            cm = self.stat.confusion_mat
+            cm = getattr(self.stat, 'confusion_matrix', None)
             if cm is not None:
                 self.recoder.print_log(f"Confusion Matrix (epoch {epoch}, {mode}):")
                 # Print a simplified version of the confusion matrix
@@ -553,7 +553,8 @@ class Processor():
                 total_correct = np.sum(diagonal)
                 total_samples = np.sum(cm)
                 self.recoder.print_log(f"  Total Correct: {total_correct}/{total_samples}")
-                self.recoder.print_log(f"  Overall Accuracy: {total_correct/total_samples*100:.2f}%")
+                if total_samples > 0:
+                    self.recoder.print_log(f"  Overall Accuracy: {total_correct/total_samples*100:.2f}%")
         except Exception as e:
             self.recoder.print_log(f"Failed to display confusion matrix: {e}")
         

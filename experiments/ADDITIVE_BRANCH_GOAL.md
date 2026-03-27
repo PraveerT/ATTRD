@@ -28,7 +28,8 @@ actually improve accuracy on this dataset.
   `56.8465%` at epoch `80` in `work_dir/linear_branch_edgeconv_quatmerge_e120/`
   This is the committed winner from `509bdc6`.
 - Current best known branch-2 result:
-  `67.8423%` at epoch `102` in `work_dir/linear_branch_edgeconv_quatmerge_h256_e120/`
+  `69.5021%` at epoch `110` in
+  `work_dir/linear_branch_edgeconv_quatmerge_rms_h256_e120/`
 
 ## What Worked
 
@@ -37,6 +38,7 @@ actually improve accuracy on this dataset.
 3. Merge quaternion groups before global pooling.
 4. Widen the winning quaternion-merge model from `hidden_dims [64, 128]` to
    `hidden_dims [64, 256]`.
+5. Use RMS quaternion collapse instead of raw squared-energy summation before pooling.
 
 ## What Did Not Help
 
@@ -58,18 +60,43 @@ machinery. The useful part so far is:
 
 ## Next Steps
 
-1. Keep the `EdgeConvQuaternionMergeMotion` path as the reference architecture.
+1. Keep the `EdgeConvQuaternionRMSMergeMotion` path as the reference architecture.
 2. Continue changing only one thing at a time from this `h256` winner.
 3. Prefer small, local changes over large architecture swaps.
 4. Only return to fusion after branch 2 is consistently strong on its own.
+
+## Latest Completed Trial
+
+The RMS-collapse variant completed through epoch `120`:
+
+- keep EdgeConv
+- keep the quaternion point mixer
+- keep the post-merge projection
+- replace the current quaternion collapse from raw squared-energy sum to RMS magnitude
+
+This isolates whether the winner is benefiting from quaternion-aware collapse itself
+while reducing the scale growth introduced by summing squared components before the
+global pooling path. It improved over the previous `h256` winner.
+
+- best observed test accuracy: `69.5021%` at epoch `110`
+- final epoch-120 test accuracy: `65.9751%`
+- config/work dir: `linear_branch_rmsmerge.yaml` ->
+  `work_dir/linear_branch_edgeconv_quatmerge_rms_h256_e120/`
+
+## Latest Reference Run
+
+The resumed `h256` winner completed through epoch `120`.
+
+- best observed test accuracy: `68.2573%` at epoch `113`
+- final epoch-120 test accuracy: `67.8423%`
 
 ## Run Command
 
 ```bash
 cd /notebooks/PMamba/experiments
 python main.py \
-  --config linear_branch.yaml \
-  --work-dir ./work_dir/linear_branch_edgeconv_quatmerge_h256_e120 \
+  --config linear_branch_rmsmerge.yaml \
+  --work-dir ./work_dir/linear_branch_edgeconv_quatmerge_rms_h256_e120 \
   --num-epoch 120 \
   --device 0
 ```

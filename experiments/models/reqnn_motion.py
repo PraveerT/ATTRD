@@ -133,11 +133,20 @@ class QuaternionPointLinear(nn.Module):
 
 
 def quaternion_merge(x):
+    grouped = _reshape_quaternion_groups(x)
+    return torch.sum(grouped * grouped, dim=2)
+
+
+def quaternion_rms_merge(x, eps=1e-6):
+    grouped = _reshape_quaternion_groups(x)
+    return torch.sqrt(torch.mean(grouped * grouped, dim=2) + eps)
+
+
+def _reshape_quaternion_groups(x):
     if x.size(1) % 4 != 0:
         raise ValueError("Quaternion merge expects channel count divisible by 4.")
     batch_size, channels, num_points = x.shape
-    grouped = x.view(batch_size, channels // 4, 4, num_points)
-    return torch.sum(grouped * grouped, dim=2)
+    return x.view(batch_size, channels // 4, 4, num_points)
 
 
 class EdgeConvLinearMotion(SimpleLinearMotion):
@@ -196,6 +205,9 @@ class EdgeConvQuaternionMergeMotion(EdgeConvLinearMotion):
             nn.GELU(),
         )
 
+    def merge_quaternions(self, encoded):
+        return quaternion_merge(encoded)
+
     def extract_features(self, inputs):
         points = self._sample_points(inputs)
         batch_size = points.shape[0]
@@ -207,11 +219,28 @@ class EdgeConvQuaternionMergeMotion(EdgeConvLinearMotion):
         encoded = self.quaternion_encoder(edge_features.transpose(1, 2).contiguous())
         encoded = self.encoder_norm(encoded.transpose(1, 2).contiguous())
         encoded = self.encoder_activation(encoded)
-        encoded = self.merge_proj(quaternion_merge(encoded))
+        encoded = self.merge_proj(self.merge_quaternions(encoded))
 
         pooled_max = encoded.max(dim=-1).values
         pooled_mean = encoded.mean(dim=-1)
         return torch.cat((pooled_max, pooled_mean), dim=1)
+
+
+class EdgeConvQuaternionRMSMergeMotion(EdgeConvQuaternionMergeMotion):
+    """Winner path with RMS quaternion collapse instead of raw squared-energy collapse."""
+
+    def __init__(self, num_classes, pts_size, hidden_dims=(64, 128), dropout=0.1, edgeconv_k=20, merge_eps=1e-6):
+        super().__init__(
+            num_classes=num_classes,
+            pts_size=pts_size,
+            hidden_dims=hidden_dims,
+            dropout=dropout,
+            edgeconv_k=edgeconv_k,
+        )
+        self.merge_eps = merge_eps
+
+    def merge_quaternions(self, encoded):
+        return quaternion_rms_merge(encoded, eps=self.merge_eps)
 
 
 # Keep the legacy class name so older configs still resolve.
