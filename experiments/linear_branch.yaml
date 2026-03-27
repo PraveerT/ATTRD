@@ -1,13 +1,13 @@
-# Additive branch-2 stage 1:
-# - same Nvidia loader as branch 1
-# - same first four channels as branch 1
-# - add one DGCNN-style local-neighborhood block ahead of the pooled classifier
+# Additive branch-2 stage 1qm:
+# - keep the EdgeConv baseline geometry intact
+# - replace the post-EdgeConv pointwise mixer with a quaternion layer
+# - merge quaternion groups before the pooled classifier
 
 dataloader: nvidia_dataloader.NvidiaLoader
 
 phase: train
 num_epoch: 120
-work_dir: ./work_dir/linear_branch_edgeconv1_e120/
+work_dir: ./work_dir/linear_branch_edgeconv_quatmerge_e120/
 batch_size: 8
 test_batch_size: 1
 num_worker: 8
@@ -37,7 +37,7 @@ test_loader_args:
   phase: 'test'
   framerate: *framesize
 
-model: models.reqnn_motion.EdgeConvLinearMotion
+model: models.reqnn_motion.EdgeConvQuaternionMergeMotion
 model_args:
   pts_size: *frame_pts_size
   num_classes: 25
