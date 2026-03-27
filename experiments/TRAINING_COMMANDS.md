@@ -46,12 +46,32 @@ python main.py \
   --device 0
 ```
 
+## Train Branch 2 (Additive stage 1qm-h256-stacked-weighted-rms previous best 71.7842)
+
+```bash
+python main.py \
+  --config linear_branch_stacked_quat_weighted_rmsmerge.yaml \
+  --work-dir ./work_dir/linear_branch_edgeconv_quatstack_weighted_rms_h256_e120 \
+  --num-epoch 120 \
+  --device 0
+```
+
 ## Train Branch 2 (Additive stage 1qm-h384-weighted-rmsmerge width continuation)
 
 ```bash
 python main.py \
   --config linear_branch_weighted_rmsmerge_h384.yaml \
   --work-dir ./work_dir/linear_branch_edgeconv_quatmerge_weighted_rms_h384_e120 \
+  --num-epoch 120 \
+  --device 0
+```
+
+## Train Branch 2 (Additive stage 1qm-h256-stacked-weighted-rms on xyz+t)
+
+```bash
+python main.py \
+  --config linear_branch_stacked_quat_weighted_rmsmerge_xyz.yaml \
+  --work-dir ./work_dir/linear_branch_edgeconv_quatstack_weighted_rms_xyz_h256_e120 \
   --num-epoch 120 \
   --device 0
 ```

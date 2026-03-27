@@ -28,8 +28,8 @@ actually improve accuracy on this dataset.
   `56.8465%` at epoch `80` in `work_dir/linear_branch_edgeconv_quatmerge_e120/`
   This is the committed winner from `509bdc6`.
 - Current best known branch-2 result:
-  `71.5768%` at epoch `110` in
-  `work_dir/linear_branch_edgeconv_quatmerge_weighted_rms_h256_e120/`
+  `71.7842%` at epoch `116` in
+  `work_dir/linear_branch_edgeconv_quatstack_weighted_rms_h256_e120/`
 
 ## What Worked
 
@@ -61,10 +61,27 @@ machinery. The useful part so far is:
 
 ## Next Steps
 
-1. Keep the `EdgeConvQuaternionWeightedRMSMergeMotion` path as the reference architecture.
+1. Keep the `EdgeConvQuaternionStackedWeightedRMSMergeMotion` path as the reference architecture.
 2. Continue changing only one thing at a time from this `h256` winner.
 3. Prefer small, local changes over large architecture swaps.
 4. Only return to fusion after branch 2 is consistently strong on its own.
+
+## Current Reference Run
+
+The stacked weighted-RMS variant completed through epoch `120`.
+
+- keep EdgeConv
+- keep the quaternion point mixer
+- keep the post-merge projection
+- keep learnable weighted RMS collapse
+- add one extra quaternion refinement stage before collapse
+
+This is the current best standalone branch-2 run.
+
+- best observed test accuracy: `71.7842%` at epoch `116`
+- final epoch-120 test accuracy: `69.2946%`
+- config/work dir: `linear_branch_stacked_quat_weighted_rmsmerge.yaml` ->
+  `work_dir/linear_branch_edgeconv_quatstack_weighted_rms_h256_e120/`
 
 ## Latest Completed Trial
 
@@ -76,8 +93,8 @@ The learned-weight RMS variant completed through epoch `120`:
 - keep RMS collapse as the base behavior
 - replace fixed equal RMS weights with learned component weights over `r/i/j/k`
 
-This stayed within the same local merge-path change budget and started exactly at
-the equal-weight RMS winner. It improved over the fixed RMS version.
+This stayed within the same local merge-path change budget and improved over the
+fixed RMS version, but it is now the second-best reference after the stacked run.
 
 - best observed test accuracy: `71.5768%` at epoch `110`
 - final epoch-120 test accuracy: `68.2573%`
@@ -116,8 +133,8 @@ The resumed `h256` winner completed through epoch `120`.
 ```bash
 cd /notebooks/PMamba/experiments
 python main.py \
-  --config linear_branch_weighted_rmsmerge.yaml \
-  --work-dir ./work_dir/linear_branch_edgeconv_quatmerge_weighted_rms_h256_e120 \
+  --config linear_branch_stacked_quat_weighted_rmsmerge.yaml \
+  --work-dir ./work_dir/linear_branch_edgeconv_quatstack_weighted_rms_h256_e120 \
   --num-epoch 120 \
   --device 0
 ```
