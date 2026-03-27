@@ -26,7 +26,7 @@ python main.py \
   --device 0
 ```
 
-## Train Branch 2 (Next trial: stacked attention readout)
+## Train Branch 2 (Current best so far, stacked attention readout)
 
 ```bash
 python main.py \
