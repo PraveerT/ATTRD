@@ -16,12 +16,12 @@ python main.py \
   --device 0
 ```
 
-## Train Branch 2 (Reset linear baseline)
+## Train Branch 2 (Additive stage 1: single EdgeConv block)
 
 ```bash
 python main.py \
   --config linear_branch.yaml \
-  --work-dir ./work_dir/linear_branch_e120 \
+  --work-dir ./work_dir/linear_branch_edgeconv1_e120 \
   --num-epoch 120 \
   --device 0
 ```
