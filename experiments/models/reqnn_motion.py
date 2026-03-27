@@ -144,9 +144,14 @@ def quaternion_rms_merge(x, eps=1e-6):
 
 def quaternion_weighted_rms_merge(x, component_weights, eps=1e-6):
     grouped = _reshape_quaternion_groups(x)
-    weight_shape = [1] * grouped.dim()
-    weight_shape[2] = 4
-    normalized_weights = torch.softmax(component_weights, dim=-1).view(*weight_shape)
+    if component_weights.dim() == 1:
+        normalized_weights = torch.softmax(component_weights, dim=-1).view(1, 1, 4, 1)
+    elif component_weights.dim() == 2:
+        normalized_weights = torch.softmax(component_weights, dim=-1).unsqueeze(1).unsqueeze(-1)
+    elif component_weights.dim() == 3:
+        normalized_weights = torch.softmax(component_weights, dim=1).unsqueeze(1)
+    else:
+        raise ValueError("component_weights must have 1, 2, or 3 dimensions.")
     return torch.sqrt(torch.sum(grouped * grouped * normalized_weights, dim=2) + eps)
 
 
@@ -355,6 +360,49 @@ class EdgeConvQuaternionStackedWeightedRMSAttentionReadoutMotion(EdgeConvQuatern
         attention = torch.softmax(self.readout_attention(encoded), dim=-1)
         pooled_attn = torch.sum(encoded * attention, dim=-1)
         return torch.cat((pooled_max, pooled_attn), dim=1)
+
+
+class EdgeConvQuaternionStackedAdaptiveWeightedRMSAttentionReadoutMotion(
+    EdgeConvQuaternionStackedWeightedRMSAttentionReadoutMotion
+):
+    """Winner path with sample-conditioned quaternion merge weights."""
+
+    def __init__(
+        self,
+        num_classes,
+        pts_size,
+        hidden_dims=(64, 128),
+        dropout=0.1,
+        edgeconv_k=20,
+        merge_eps=1e-6,
+        merge_hidden=16,
+    ):
+        super().__init__(
+            num_classes=num_classes,
+            pts_size=pts_size,
+            hidden_dims=hidden_dims,
+            dropout=dropout,
+            edgeconv_k=edgeconv_k,
+            merge_eps=merge_eps,
+        )
+        self.merge_weight_hidden = nn.Linear(4, merge_hidden)
+        self.merge_weight_activation = nn.GELU()
+        self.merge_weight_out = nn.Linear(merge_hidden, 4)
+        nn.init.zeros_(self.merge_weight_out.weight)
+        nn.init.zeros_(self.merge_weight_out.bias)
+
+    def merge_quaternions(self, encoded):
+        grouped = _reshape_quaternion_groups(encoded)
+        component_energy = torch.mean(grouped * grouped, dim=(1, 3))
+        adaptive_logits = self.merge_weight_out(
+            self.merge_weight_activation(self.merge_weight_hidden(component_energy))
+        )
+        component_logits = self.merge_component_logits.unsqueeze(0) + adaptive_logits
+        return quaternion_weighted_rms_merge(
+            encoded,
+            component_weights=component_logits,
+            eps=self.merge_eps,
+        )
 
 
 # Keep the legacy class name so older configs still resolve.
