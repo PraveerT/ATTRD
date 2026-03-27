@@ -1,13 +1,12 @@
-# Additive branch-2 stage 1qm:
-# - keep the EdgeConv baseline geometry intact
-# - replace the post-EdgeConv pointwise mixer with a quaternion layer
-# - merge quaternion groups before the pooled classifier
+# Additive branch-2 stage 1qm-h256:
+# - keep the committed quaternion-merge winner architecture
+# - widen the winner from hidden_dims [64, 128] to [64, 256]
 
 dataloader: nvidia_dataloader.NvidiaLoader
 
 phase: train
 num_epoch: 120
-work_dir: ./work_dir/linear_branch_edgeconv_quatmerge_e120/
+work_dir: ./work_dir/linear_branch_edgeconv_quatmerge_h256_e120/
 batch_size: 8
 test_batch_size: 1
 num_worker: 8
@@ -41,6 +40,6 @@ model: models.reqnn_motion.EdgeConvQuaternionMergeMotion
 model_args:
   pts_size: *frame_pts_size
   num_classes: 25
-  hidden_dims: [64, 128]
+  hidden_dims: [64, 256]
   dropout: 0.1
   edgeconv_k: 20
