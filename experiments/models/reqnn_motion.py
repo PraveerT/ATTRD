@@ -162,6 +162,25 @@ def _reshape_quaternion_groups(x):
     return x.view(batch_size, channels // 4, 4, num_points)
 
 
+class QuaternionGroupNorm1d(nn.Module):
+    """Quaternion RMS normalization that scales each 4D group as a unit."""
+
+    def __init__(self, channels, eps=1e-5):
+        super().__init__()
+        if channels % 4 != 0:
+            raise ValueError("QuaternionGroupNorm1d expects channel count divisible by 4.")
+        self.channels = channels
+        self.eps = eps
+        self.group_gain = nn.Parameter(torch.ones(channels // 4))
+
+    def forward(self, x):
+        grouped = _reshape_quaternion_groups(x)
+        group_scale = torch.rsqrt(torch.mean(grouped * grouped, dim=2, keepdim=True) + self.eps)
+        normalized = grouped * group_scale
+        gain = self.group_gain.view(1, -1, 1, 1)
+        return (normalized * gain).view_as(x)
+
+
 class EdgeConvLinearMotion(SimpleLinearMotion):
     """Stage-1 additive branch: add a single DGCNN-style local-neighborhood block."""
 
@@ -362,10 +381,10 @@ class EdgeConvQuaternionStackedWeightedRMSAttentionReadoutMotion(EdgeConvQuatern
         return torch.cat((pooled_max, pooled_attn), dim=1)
 
 
-class EdgeConvQuaternionStackedAdaptiveWeightedRMSAttentionReadoutMotion(
+class EdgeConvQuaternionStackedGroupNormWeightedRMSAttentionReadoutMotion(
     EdgeConvQuaternionStackedWeightedRMSAttentionReadoutMotion
 ):
-    """Winner path with sample-conditioned quaternion merge weights."""
+    """Winner path with quaternion-group normalization after each quaternion block."""
 
     def __init__(
         self,
@@ -375,7 +394,7 @@ class EdgeConvQuaternionStackedAdaptiveWeightedRMSAttentionReadoutMotion(
         dropout=0.1,
         edgeconv_k=20,
         merge_eps=1e-6,
-        merge_hidden=16,
+        norm_eps=1e-5,
     ):
         super().__init__(
             num_classes=num_classes,
@@ -385,24 +404,9 @@ class EdgeConvQuaternionStackedAdaptiveWeightedRMSAttentionReadoutMotion(
             edgeconv_k=edgeconv_k,
             merge_eps=merge_eps,
         )
-        self.merge_weight_hidden = nn.Linear(4, merge_hidden)
-        self.merge_weight_activation = nn.GELU()
-        self.merge_weight_out = nn.Linear(merge_hidden, 4)
-        nn.init.zeros_(self.merge_weight_out.weight)
-        nn.init.zeros_(self.merge_weight_out.bias)
-
-    def merge_quaternions(self, encoded):
-        grouped = _reshape_quaternion_groups(encoded)
-        component_energy = torch.mean(grouped * grouped, dim=(1, 3))
-        adaptive_logits = self.merge_weight_out(
-            self.merge_weight_activation(self.merge_weight_hidden(component_energy))
-        )
-        component_logits = self.merge_component_logits.unsqueeze(0) + adaptive_logits
-        return quaternion_weighted_rms_merge(
-            encoded,
-            component_weights=component_logits,
-            eps=self.merge_eps,
-        )
+        _, hidden2 = hidden_dims
+        self.encoder_norm = QuaternionGroupNorm1d(hidden2, eps=norm_eps)
+        self.refine_norm = QuaternionGroupNorm1d(hidden2, eps=norm_eps)
 
 
 # Keep the legacy class name so older configs still resolve.
