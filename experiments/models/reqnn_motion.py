@@ -90,6 +90,14 @@ def _get_graph_feature(x, k, idx=None):
     return torch.cat((feature - center, center), dim=3).permute(0, 3, 1, 2).contiguous()
 
 
+def _flatten_framewise_idx(idx):
+    if idx.dim() != 4:
+        raise ValueError("Framewise neighborhood indices must have shape [B, T, P, K].")
+    batch_size, timestep, num_points, _ = idx.shape
+    frame_offsets = torch.arange(timestep, device=idx.device).view(1, timestep, 1, 1) * num_points
+    return (idx.long() + frame_offsets).reshape(batch_size, timestep * num_points, -1)
+
+
 class QuaternionPointLinear(nn.Module):
     """Pointwise quaternion linear transform over channel groups of four."""
 
@@ -229,11 +237,18 @@ def quaternion_weighted_rms_merge(x, component_weights, eps=1e-6):
 
 
 def _quaternion_similarity_rotate_grouped(grouped, rotation):
-    if rotation.dim() != 1 or rotation.numel() != 4:
-        raise ValueError("Quaternion similarity rotation expects a vector shaped [4].")
-
-    unit_rotation = F.normalize(rotation, dim=0)
-    rot_r, rot_i, rot_j, rot_k = unit_rotation.unbind()
+    if rotation.dim() == 1 and rotation.numel() == 4:
+        unit_rotation = F.normalize(rotation, dim=0)
+        rot_r, rot_i, rot_j, rot_k = unit_rotation.unbind()
+    elif rotation.dim() == 3 and rotation.size(-1) == 4:
+        unit_rotation = F.normalize(rotation, dim=-1)
+        rot_r, rot_i, rot_j, rot_k = unit_rotation.unbind(dim=-1)
+        rot_r = rot_r.unsqueeze(1)
+        rot_i = rot_i.unsqueeze(1)
+        rot_j = rot_j.unsqueeze(1)
+        rot_k = rot_k.unsqueeze(1)
+    else:
+        raise ValueError("Quaternion similarity rotation expects shape [4] or [B, N, 4].")
 
     x_r = grouped[:, :, 0]
     x_i = grouped[:, :, 1]
@@ -391,6 +406,45 @@ class EdgeConvQuaternionWeightedRMSMergeMotion(EdgeConvQuaternionRMSMergeMotion)
             component_weights=self.merge_component_logits,
             eps=self.merge_eps,
         )
+
+
+class EdgeConvQECCacheLocalFrameWeightedRMSMergeMotion(EdgeConvQuaternionWeightedRMSMergeMotion):
+    """Weighted RMS winner adapted to cached xyz neighborhoods and local-frame quaternions."""
+
+    def extract_features(self, inputs):
+        if not isinstance(inputs, dict):
+            raise ValueError("QEC cache branch expects dict inputs with points, lrf_quat, and qec_idx.")
+
+        points = inputs['points']
+        lrf_quat = inputs['lrf_quat']
+        qec_idx = inputs['qec_idx']
+
+        batch_size = points.shape[0]
+        point_features = points.reshape(batch_size, -1, 4).transpose(1, 2).contiguous()
+        flat_qec_idx = _flatten_framewise_idx(qec_idx)
+        if flat_qec_idx.size(-1) > self.edgeconv_k:
+            flat_qec_idx = flat_qec_idx[:, :, :self.edgeconv_k]
+
+        graph_features = _get_graph_feature(point_features, k=self.edgeconv_k, idx=flat_qec_idx)
+        edge_features = self.edgeconv(graph_features).max(dim=-1).values
+
+        encoded = self.quaternion_encoder(edge_features.transpose(1, 2).contiguous())
+        encoded = self.encoder_norm(encoded.transpose(1, 2).contiguous())
+        encoded = self.encoder_activation(encoded)
+
+        flat_lrf_quat = F.normalize(lrf_quat.reshape(batch_size, -1, 4).contiguous(), dim=-1)
+        encoded = self.merge_proj(
+            quaternion_similarity_rotated_weighted_rms_merge(
+                encoded,
+                component_weights=self.merge_component_logits,
+                rotation=flat_lrf_quat,
+                eps=self.merge_eps,
+            )
+        )
+
+        pooled_max = encoded.max(dim=-1).values
+        pooled_mean = encoded.mean(dim=-1)
+        return torch.cat((pooled_max, pooled_mean), dim=1)
 
 
 class EdgeConvQuaternionStackedWeightedRMSMergeMotion(EdgeConvQuaternionWeightedRMSMergeMotion):

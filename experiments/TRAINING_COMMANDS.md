@@ -98,6 +98,16 @@ python main.py \
   --device 0
 ```
 
+## Train Branch 2 (Additive stage qec-cache-localframe-weighted-rmsmerge next trial)
+
+```bash
+python main.py \
+  --config linear_branch_qec_cache_weighted_rmsmerge.yaml \
+  --work-dir ./work_dir/linear_branch_edgeconv_qec_cache_weighted_rms_h256_e120 \
+  --num-epoch 120 \
+  --device 0
+```
+
 ## Notes
 
 - `epoch120_model.pt` is saved because the configs use `save_interval: 5`.

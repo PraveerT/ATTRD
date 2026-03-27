@@ -2,6 +2,7 @@ import re
 import pdb
 import sys
 import numpy as np
+import torch
 
 sys.path.append("..")
 
@@ -162,6 +163,49 @@ class NvidiaREQNNLoader(NvidiaLoader):
                 PointcloudRotatePerturbation(angle_sigma=0.06, angle_clip=0.18),
                 PointcloudTranslate(translate_range=0.05),
                 PointcloudJitter(std=0.01, clip=0.03),
+            ])
+        else:
+            transform = Compose([
+                PointcloudToTensor(),
+            ])
+        return transform
+
+
+class NvidiaQECCacheLoader(NvidiaLoader):
+    """Loader for cached xyz neighborhoods and local-frame quaternions."""
+
+    def __getitem__(self, index):
+        label = int(self.r.split(self.inputs_list[index])[-2])
+        rel_path = self.r.split(self.inputs_list[index])[1]
+        rel_no_ext = rel_path[2:-4] if rel_path.startswith('./') else rel_path[:-4]
+        cache_path = f"../dataset/{rel_no_ext}_qec_cache.pt"
+        cache = torch.load(cache_path, map_location='cpu')
+
+        xyz = cache['xyz'].float()
+        lrf_quat = cache['lrf_quat'].float()
+        qec_idx = cache['qec_idx'].long()
+
+        timestep, pts_size, _ = xyz.shape
+        time_center = max((self.framerate - 1) / 2.0, 1.0)
+        time_coord = torch.arange(timestep, dtype=torch.float32).view(timestep, 1, 1).expand(-1, pts_size, 1)
+        points = torch.cat((xyz, (time_coord - time_center) / time_center), dim=-1)
+
+        # Keep cached local-frame quaternions and framewise neighborhoods aligned with the points.
+        points = self.transform(points.reshape(-1, 4).numpy()).reshape(timestep, pts_size, 4)
+
+        return {
+            'points': points,
+            'lrf_quat': lrf_quat,
+            'qec_idx': qec_idx,
+        }, label, self.inputs_list[index]
+
+    @staticmethod
+    def transform_init(phase):
+        if phase == 'train':
+            transform = Compose([
+                PointcloudToTensor(),
+                PointcloudScale(lo=0.95, hi=1.05),
+                PointcloudTranslate(translate_range=0.03),
             ])
         else:
             transform = Compose([
