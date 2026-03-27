@@ -56,12 +56,8 @@ class GpuDataParallel(object):
             return data.long().to(self.output_device)
         elif isinstance(data, torch.LongTensor):
             return data.to(self.output_device)
-        elif isinstance(data, dict):
-            return {key: self.data_to_device(value) for key, value in data.items()}
         elif isinstance(data, list):
             return [self.data_to_device(d) for d in data]
-        elif isinstance(data, tuple):
-            return tuple(self.data_to_device(d) for d in data)
         else:
             raise ValueError(data.shape, "Unknown Dtype: {}".format(data.dtype))
 
