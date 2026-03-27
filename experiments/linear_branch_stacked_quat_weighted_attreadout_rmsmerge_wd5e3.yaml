@@ -1,12 +1,12 @@
 # Additive branch-2 next trial:
 # - keep the current attention-readout winner architecture
-# - only increase EdgeConv neighborhood size from 20 to 24
+# - lower weight decay only, from 0.01 to 0.005
 
 dataloader: nvidia_dataloader.NvidiaLoader
 
 phase: train
 num_epoch: 120
-work_dir: ./work_dir/linear_branch_edgeconv_quatstack_weighted_attreadout_rms_k24_h256_e120/
+work_dir: ./work_dir/linear_branch_edgeconv_quatstack_weighted_attreadout_rms_wd5e3_h256_e120/
 batch_size: 8
 test_batch_size: 1
 num_worker: 8
@@ -24,7 +24,7 @@ optimizer_args:
   optimizer: Adam
   base_lr: 0.0005
   step: [80, 100, 110]
-  weight_decay: 0.01
+  weight_decay: 0.005
   start_epoch: 0
   nesterov: False
 
@@ -42,5 +42,5 @@ model_args:
   num_classes: 25
   hidden_dims: [64, 256]
   dropout: 0.1
-  edgeconv_k: 24
+  edgeconv_k: 20
   merge_eps: 0.000001

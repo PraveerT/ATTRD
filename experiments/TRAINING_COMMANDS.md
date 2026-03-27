@@ -36,12 +36,12 @@ python main.py \
   --device 0
 ```
 
-## Train Branch 2 (Next trial: attention readout with `edgeconv_k=24`)
+## Train Branch 2 (Next trial: attention readout with lower `weight_decay`)
 
 ```bash
 python main.py \
-  --config linear_branch_stacked_quat_weighted_attreadout_rmsmerge_k24.yaml \
-  --work-dir ./work_dir/linear_branch_edgeconv_quatstack_weighted_attreadout_rms_k24_h256_e120 \
+  --config linear_branch_stacked_quat_weighted_attreadout_rmsmerge_wd5e3.yaml \
+  --work-dir ./work_dir/linear_branch_edgeconv_quatstack_weighted_attreadout_rms_wd5e3_h256_e120 \
   --num-epoch 120 \
   --device 0
 ```
