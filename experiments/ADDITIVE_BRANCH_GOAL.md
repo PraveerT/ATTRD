@@ -7,7 +7,7 @@ Keep a single standalone branch-2 reference alongside branch 1 (`Motion`).
 - model: `models.reqnn_motion.EdgeConvQuaternionStackedWeightedRMSAttentionReadoutMotion`
 - config: `linear_branch_stacked_quat_weighted_attreadout_rmsmerge.yaml`
 - work dir: `work_dir/linear_branch_edgeconv_quatstack_weighted_attreadout_rms_h256_e120/`
-- best observed test accuracy so far: `73.0290%` at epoch `102`
+- best observed test accuracy so far: `74.6888%` at epoch `115`
 
 ## Kept Design
 
