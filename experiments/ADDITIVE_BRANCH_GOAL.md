@@ -5,9 +5,9 @@ Keep a single standalone branch-2 reference alongside branch 1 (`Motion`).
 ## Reference Branch-2 Run
 
 - model: `models.reqnn_motion.EdgeConvQuaternionStackedWeightedRMSAttentionReadoutMotion`
-- config: `linear_branch_stacked_quat_weighted_attreadout_rmsmerge.yaml`
-- work dir: `work_dir/linear_branch_edgeconv_quatstack_weighted_attreadout_rms_h256_e120/`
-- best observed test accuracy so far: `74.6888%` at epoch `115`
+- config: `linear_branch_stacked_quat_weighted_attreadout_rmsmerge_drop005.yaml`
+- work dir: `work_dir/linear_branch_edgeconv_quatstack_weighted_attreadout_rms_drop005_h256_e120/`
+- best observed test accuracy so far: `74.8963%` at epochs `107`, `111`, `112`, and `115`
 
 ## Kept Design
 
@@ -22,8 +22,8 @@ Keep a single standalone branch-2 reference alongside branch 1 (`Motion`).
 ```bash
 cd /notebooks/PMamba/experiments
 python main.py \
-  --config linear_branch_stacked_quat_weighted_attreadout_rmsmerge.yaml \
-  --work-dir ./work_dir/linear_branch_edgeconv_quatstack_weighted_attreadout_rms_h256_e120 \
+  --config linear_branch_stacked_quat_weighted_attreadout_rmsmerge_drop005.yaml \
+  --work-dir ./work_dir/linear_branch_edgeconv_quatstack_weighted_attreadout_rms_drop005_h256_e120 \
   --num-epoch 120 \
   --device 0
 ```
