@@ -1,18 +1,18 @@
-# Two-branch fusion model:
+# Two-branch fusion fine-tuning model:
 # - temporal_branch: Motion
-# - spatial_branch: REQNNMotion
+# - spatial_branch: EdgeConvQuaternionWeightedRMSMergeMotion
 #
-# Fine-tuning continuation example:
+# Fine-tuning from the current standalone winners with continuation-style epoch numbering:
 # python main.py --config motion_reqnn_fusion.yaml \
-#   --work-dir ./work_dir/motion_reqnn_fusion_e120_continue \
-#   --temporal-weights ./work_dir/baseline/epoch300_model.pt \
-#   --spatial-weights ./work_dir/reqnn_motion/epoch300_model.pt
+#   --work-dir ./work_dir/motion_weighted_rms_fusion_e240_ft \
+#   --temporal-weights ./work_dir/motion_e120/epoch110_model.pt \
+#   --spatial-weights ./work_dir/linear_branch_edgeconv_quatmerge_weighted_rms_h256_e120/epoch110_model.pt
 
 dataloader: nvidia_dataloader.NvidiaLoader
 
 phase: train
 num_epoch: 240
-work_dir: ./work_dir/motion_reqnn_fusion_e120_continue/
+work_dir: ./work_dir/motion_weighted_rms_fusion_e240_ft/
 batch_size: 4
 test_batch_size: 1
 num_worker: 4
@@ -49,9 +49,9 @@ model_args:
   num_classes: 25
   knn: [32, 24, 48, 24]
   topk: 8
-  reqnn_k: 20
-  reqnn_emb_dims: 256
-  spatial_temporal_hidden: 256
-  spatial_dropout: 0.3
+  spatial_hidden_dims: [64, 256]
+  spatial_edgeconv_k: 20
+  spatial_merge_eps: 0.000001
+  spatial_dropout: 0.1
   fusion_hidden: 512
   fusion_dropout: 0.3

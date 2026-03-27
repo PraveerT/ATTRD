@@ -49,6 +49,9 @@ actually improve accuracy on this dataset.
 - Unitary quaternion initialization for the point mixer
 - Quaternion activation added before quaternion merge
 - Quaternion batch norm replacing the winner's ordinary post-mixer batch norm
+- Dual-quaternion point mixer before the weighted RMS collapse
+- Single-step quaternion update gate after EdgeConv before the weighted RMS collapse
+- Orkis-style quaternion similarity rotation before the weighted RMS collapse
 
 ## Current Working Hypothesis
 
@@ -65,6 +68,75 @@ machinery. The useful part so far is:
 2. Continue changing only one thing at a time from this `h256` winner.
 3. Prefer small, local changes over large architecture swaps.
 4. Only return to fusion after branch 2 is consistently strong on its own.
+
+## Latest Non-Winning Continuation
+
+The single-step quaternion update-gate variant completed through epoch `120`:
+
+- keep EdgeConv
+- keep the weighted RMS collapse
+- keep the post-merge projection
+- keep learned quaternion-component weighting
+- replace the pointwise quaternion mixer with a single update-gated quaternion residual encoder
+
+This is adapted from the GatedQGNN update gate, but without recurrence or the
+reset gate. The local EdgeConv features act as the already-aggregated message,
+and the gate only decides how much of a second quaternion projection to mix back
+into the residual path before collapse. It did not beat the weighted-RMS winner.
+
+- best observed test accuracy: `68.8797%` at epoch `104`
+- final epoch-120 test accuracy: `67.4274%`
+- learned component weights at saved epoch `105`: approximately
+  `r=0.2592, i=0.2571, j=0.2500, k=0.2337`
+- config/work dir: `linear_branch_weighted_gate_rmsmerge.yaml` ->
+  `work_dir/linear_branch_edgeconv_quatmerge_weighted_gate_rms_h256_e120/`
+
+## Previous Non-Winning Continuation
+
+The dual-quaternion point-mixer variant completed through epoch `120`:
+
+- keep EdgeConv
+- keep the weighted RMS collapse
+- keep the post-merge projection
+- keep learned quaternion-component weighting
+- replace the pointwise quaternion mixer with a dual-quaternion mixer
+
+This is adapted from the DQGNN dual-quaternion multiplication path. The merge path
+and readout stay fixed to the winner so this isolates whether a richer
+dual-quaternion encoder helps before collapse. It did not beat the weighted-RMS
+winner.
+
+- best observed test accuracy: `66.8050%` at epoch `90`
+- final epoch-120 test accuracy: `63.6929%`
+- learned component weights at epoch `90`: approximately
+  `r=0.2687, i=0.2643, j=0.2370, k=0.2299`
+- config/work dir: `linear_branch_dualquat_weighted_rmsmerge.yaml` ->
+  `work_dir/linear_branch_edgeconv_dualquat_weighted_rms_h256_e120/`
+
+## Earlier Non-Winning Continuation
+
+The Orkis-style similarity-rotation variant completed through epoch `120`:
+
+- keep EdgeConv
+- keep the quaternion point mixer
+- keep the post-merge projection
+- keep learned quaternion-component weighting
+- add a proper quaternion similarity rotation `q x q^*` before the weighted RMS collapse
+
+This is adapted from the Orkis quaternion rotation operators. Unlike the earlier
+local-frame idea, it does not rotate the raw input path; it rotates only the
+merge-space quaternion features right before collapse. It also differs from the
+earlier simple left-multiplication variant by performing the full similarity
+rotation on the imaginary subspace. It did not beat the weighted-RMS winner.
+
+- best observed test accuracy: `68.6722%` at epoch `110`
+- final epoch-120 test accuracy: `67.0124%`
+- learned similarity rotation at epoch `110`: approximately
+  `[0.8523, -0.1700, 0.2223, 0.4418]`
+- learned component weights at epoch `110`: approximately
+  `r=0.2519, i=0.2590, j=0.2309, k=0.2583`
+- config/work dir: `linear_branch_weighted_similarity_rot_rmsmerge.yaml` ->
+  `work_dir/linear_branch_edgeconv_quatmerge_weighted_similarity_rot_rms_h256_e120/`
 
 ## Latest Completed Trial
 
