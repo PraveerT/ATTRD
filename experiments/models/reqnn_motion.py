@@ -315,8 +315,8 @@ class EdgeConvQuaternionStackedWeightedRMSMergeMotion(EdgeConvQuaternionWeighted
         return torch.cat((pooled_max, pooled_mean), dim=1)
 
 
-class EdgeConvQuaternionStackedGatedWeightedRMSMergeMotion(EdgeConvQuaternionStackedWeightedRMSMergeMotion):
-    """Stacked winner with a learnable residual gate on the refinement branch."""
+class EdgeConvQuaternionStackedWeightedRMSAttentionReadoutMotion(EdgeConvQuaternionStackedWeightedRMSMergeMotion):
+    """Stacked winner with an attention-pooled readout instead of plain mean pooling."""
 
     def __init__(self, num_classes, pts_size, hidden_dims=(64, 128), dropout=0.1, edgeconv_k=20, merge_eps=1e-6):
         super().__init__(
@@ -327,8 +327,10 @@ class EdgeConvQuaternionStackedGatedWeightedRMSMergeMotion(EdgeConvQuaternionSta
             edgeconv_k=edgeconv_k,
             merge_eps=merge_eps,
         )
-        # 2 * sigmoid(0) == 1, so the run starts exactly at the current stacked winner.
-        self.refine_residual_logit = nn.Parameter(torch.zeros(1))
+        _, hidden2 = hidden_dims
+        self.readout_attention = nn.Conv1d(hidden2, 1, kernel_size=1, bias=True)
+        nn.init.zeros_(self.readout_attention.weight)
+        nn.init.zeros_(self.readout_attention.bias)
 
     def extract_features(self, inputs):
         points = self._sample_points(inputs)
@@ -345,15 +347,14 @@ class EdgeConvQuaternionStackedGatedWeightedRMSMergeMotion(EdgeConvQuaternionSta
         refined = self.quaternion_refine(encoded.transpose(1, 2).contiguous())
         refined = self.refine_norm(refined.transpose(1, 2).contiguous())
         refined = self.refine_activation(refined)
-
-        refine_scale = 2.0 * torch.sigmoid(self.refine_residual_logit).view(1, 1, 1)
-        encoded = encoded + refine_scale * refined
+        encoded = encoded + refined
 
         encoded = self.merge_proj(self.merge_quaternions(encoded))
 
         pooled_max = encoded.max(dim=-1).values
-        pooled_mean = encoded.mean(dim=-1)
-        return torch.cat((pooled_max, pooled_mean), dim=1)
+        attention = torch.softmax(self.readout_attention(encoded), dim=-1)
+        pooled_attn = torch.sum(encoded * attention, dim=-1)
+        return torch.cat((pooled_max, pooled_attn), dim=1)
 
 
 # Keep the legacy class name so older configs still resolve.

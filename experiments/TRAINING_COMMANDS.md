@@ -26,12 +26,12 @@ python main.py \
   --device 0
 ```
 
-## Train Branch 2 (Next trial: gated stacked refinement)
+## Train Branch 2 (Next trial: stacked attention readout)
 
 ```bash
 python main.py \
-  --config linear_branch_stacked_quat_gated_weighted_rmsmerge.yaml \
-  --work-dir ./work_dir/linear_branch_edgeconv_quatstack_gated_weighted_rms_h256_e120 \
+  --config linear_branch_stacked_quat_weighted_attreadout_rmsmerge.yaml \
+  --work-dir ./work_dir/linear_branch_edgeconv_quatstack_weighted_attreadout_rms_h256_e120 \
   --num-epoch 120 \
   --device 0
 ```
