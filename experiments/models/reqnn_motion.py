@@ -357,51 +357,5 @@ class EdgeConvQuaternionStackedWeightedRMSAttentionReadoutMotion(EdgeConvQuatern
         return torch.cat((pooled_max, pooled_attn), dim=1)
 
 
-class EdgeConvQuaternionStackedWeightedRMSAttentionMeanBlendMotion(
-    EdgeConvQuaternionStackedWeightedRMSAttentionReadoutMotion
-):
-    """Attention-readout winner with a learnable residual blend back to mean pooling."""
-
-    def __init__(self, num_classes, pts_size, hidden_dims=(64, 128), dropout=0.1, edgeconv_k=20, merge_eps=1e-6):
-        super().__init__(
-            num_classes=num_classes,
-            pts_size=pts_size,
-            hidden_dims=hidden_dims,
-            dropout=dropout,
-            edgeconv_k=edgeconv_k,
-            merge_eps=merge_eps,
-        )
-        # Starts exactly at the current attention-readout winner.
-        self.readout_mean_blend = nn.Parameter(torch.zeros(1))
-
-    def extract_features(self, inputs):
-        points = self._sample_points(inputs)
-        batch_size = points.shape[0]
-        point_features = points.reshape(batch_size, -1, 4).transpose(1, 2).contiguous()
-
-        graph_features = _get_graph_feature(point_features, k=self.edgeconv_k)
-        edge_features = self.edgeconv(graph_features).max(dim=-1).values
-
-        encoded = self.quaternion_encoder(edge_features.transpose(1, 2).contiguous())
-        encoded = self.encoder_norm(encoded.transpose(1, 2).contiguous())
-        encoded = self.encoder_activation(encoded)
-
-        refined = self.quaternion_refine(encoded.transpose(1, 2).contiguous())
-        refined = self.refine_norm(refined.transpose(1, 2).contiguous())
-        refined = self.refine_activation(refined)
-        encoded = encoded + refined
-
-        encoded = self.merge_proj(self.merge_quaternions(encoded))
-
-        pooled_max = encoded.max(dim=-1).values
-        pooled_mean = encoded.mean(dim=-1)
-        attention = torch.softmax(self.readout_attention(encoded), dim=-1)
-        pooled_attn = torch.sum(encoded * attention, dim=-1)
-
-        blend = torch.tanh(self.readout_mean_blend).view(1, 1)
-        pooled_readout = pooled_attn + blend * (pooled_mean - pooled_attn)
-        return torch.cat((pooled_max, pooled_readout), dim=1)
-
-
 # Keep the legacy class name so older configs still resolve.
 REQNNMotion = SimpleLinearMotion
