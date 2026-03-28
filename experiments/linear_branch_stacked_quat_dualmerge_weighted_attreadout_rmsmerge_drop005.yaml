@@ -1,12 +1,12 @@
-# Additive branch-2 next trial:
-# - keep the current low-dropout attention-readout winner
-# - add a quaternion-group gate on the refinement residual before the residual add
+# Additive branch-2 current best:
+# - keep the low-dropout attention-readout winner backbone
+# - preserve both weighted-RMS magnitude and real-part summaries per quaternion before projection
 
 dataloader: nvidia_dataloader.NvidiaLoader
 
 phase: train
 num_epoch: 120
-work_dir: ./work_dir/linear_branch_edgeconv_quatstack_resgate_weighted_attreadout_rms_drop005_h256_e120/
+work_dir: ./work_dir/linear_branch_edgeconv_quatstack_dualmerge_weighted_attreadout_rms_drop005_h256_e120/
 batch_size: 8
 test_batch_size: 1
 num_worker: 8
@@ -36,7 +36,7 @@ test_loader_args:
   phase: 'test'
   framerate: *framesize
 
-model: models.reqnn_motion.EdgeConvQuaternionStackedResidualGateWeightedRMSAttentionReadoutMotion
+model: models.reqnn_motion.EdgeConvQuaternionStackedDualMergeWeightedRMSAttentionReadoutMotion
 model_args:
   pts_size: *frame_pts_size
   num_classes: 25
@@ -44,4 +44,3 @@ model_args:
   dropout: 0.05
   edgeconv_k: 20
   merge_eps: 0.000001
-  gate_eps: 0.000001

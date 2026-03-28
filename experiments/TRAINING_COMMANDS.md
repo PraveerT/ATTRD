@@ -16,7 +16,7 @@ python main.py \
   --device 0
 ```
 
-## Train Branch 2 (Standalone winner, 71.7842)
+## Train Branch 2 (Standalone baseline, 71.7842)
 
 ```bash
 python main.py \
@@ -26,7 +26,7 @@ python main.py \
   --device 0
 ```
 
-## Train Branch 2 (Current best so far, low-dropout attention readout)
+## Train Branch 2 (Previous best, low-dropout attention readout, 74.8963)
 
 ```bash
 python main.py \
@@ -36,12 +36,12 @@ python main.py \
   --device 0
 ```
 
-## Train Branch 2 (Next trial: quaternion-gated refinement residual)
+## Train Branch 2 (Current best, dual quaternion merge, 77.1784)
 
 ```bash
 python main.py \
-  --config linear_branch_stacked_quat_resgate_weighted_attreadout_rmsmerge_drop005.yaml \
-  --work-dir ./work_dir/linear_branch_edgeconv_quatstack_resgate_weighted_attreadout_rms_drop005_h256_e120 \
+  --config linear_branch_stacked_quat_dualmerge_weighted_attreadout_rmsmerge_drop005.yaml \
+  --work-dir ./work_dir/linear_branch_edgeconv_quatstack_dualmerge_weighted_attreadout_rms_drop005_h256_e120 \
   --num-epoch 120 \
   --device 0
 ```

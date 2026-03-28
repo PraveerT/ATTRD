@@ -362,21 +362,12 @@ class EdgeConvQuaternionStackedWeightedRMSAttentionReadoutMotion(EdgeConvQuatern
         return torch.cat((pooled_max, pooled_attn), dim=1)
 
 
-class EdgeConvQuaternionStackedResidualGateWeightedRMSAttentionReadoutMotion(
+class EdgeConvQuaternionStackedDualMergeWeightedRMSAttentionReadoutMotion(
     EdgeConvQuaternionStackedWeightedRMSAttentionReadoutMotion
 ):
-    """Winner path with a quaternion-group gate on the refinement residual."""
+    """Winner path with a dual quaternion collapse: weighted RMS plus real-part summary."""
 
-    def __init__(
-        self,
-        num_classes,
-        pts_size,
-        hidden_dims=(64, 128),
-        dropout=0.1,
-        edgeconv_k=20,
-        merge_eps=1e-6,
-        gate_eps=1e-6,
-    ):
+    def __init__(self, num_classes, pts_size, hidden_dims=(64, 128), dropout=0.1, edgeconv_k=20, merge_eps=1e-6):
         super().__init__(
             num_classes=num_classes,
             pts_size=pts_size,
@@ -386,42 +377,22 @@ class EdgeConvQuaternionStackedResidualGateWeightedRMSAttentionReadoutMotion(
             merge_eps=merge_eps,
         )
         _, hidden2 = hidden_dims
-        self.refine_gate = nn.Conv1d(hidden2 // 4, hidden2 // 4, kernel_size=1, bias=True)
-        nn.init.zeros_(self.refine_gate.weight)
-        nn.init.zeros_(self.refine_gate.bias)
-        self.gate_eps = gate_eps
+        self.merge_proj = nn.Sequential(
+            nn.Conv1d(hidden2 // 2, hidden2, kernel_size=1, bias=False),
+            nn.BatchNorm1d(hidden2),
+            nn.GELU(),
+        )
 
-    def extract_features(self, inputs):
-        points = self._sample_points(inputs)
-        batch_size = points.shape[0]
-        point_features = points.reshape(batch_size, -1, 4).transpose(1, 2).contiguous()
-
-        graph_features = _get_graph_feature(point_features, k=self.edgeconv_k)
-        edge_features = self.edgeconv(graph_features).max(dim=-1).values
-
-        encoded = self.quaternion_encoder(edge_features.transpose(1, 2).contiguous())
-        encoded = self.encoder_norm(encoded.transpose(1, 2).contiguous())
-        encoded = self.encoder_activation(encoded)
-
-        refined = self.quaternion_refine(encoded.transpose(1, 2).contiguous())
-        refined = self.refine_norm(refined.transpose(1, 2).contiguous())
-        refined = self.refine_activation(refined)
-
-        encoded_groups = _reshape_quaternion_groups(encoded)
-        group_energy = torch.sqrt(torch.mean(encoded_groups * encoded_groups, dim=2) + self.gate_eps)
-        group_gate = 1.0 + torch.tanh(self.refine_gate(group_energy))
-
-        refined_groups = _reshape_quaternion_groups(refined)
-        refined = (refined_groups * group_gate.unsqueeze(2)).view_as(refined)
-        encoded = encoded + refined
-
-        encoded = self.merge_proj(self.merge_quaternions(encoded))
-
-        pooled_max = encoded.max(dim=-1).values
-        attention = torch.softmax(self.readout_attention(encoded), dim=-1)
-        pooled_attn = torch.sum(encoded * attention, dim=-1)
-        return torch.cat((pooled_max, pooled_attn), dim=1)
+    def merge_quaternions(self, encoded):
+        grouped = _reshape_quaternion_groups(encoded)
+        merged_rms = quaternion_weighted_rms_merge(
+            encoded,
+            component_weights=self.merge_component_logits,
+            eps=self.merge_eps,
+        )
+        real_part = grouped[:, :, 0, :]
+        return torch.cat((merged_rms, real_part), dim=1)
 
 
-# Keep the legacy class name so older configs still resolve.
+# Keep the legacy module alias so older imports still resolve.
 REQNNMotion = SimpleLinearMotion
