@@ -1,0 +1,60 @@
+# Approach 2: Contrastive correspondence loss
+# Fine-tune from epoch110 checkpoint with InfoNCE on matched points
+
+dataloader: nvidia_dataloader.NvidiaQuaternionQCCParityLoader
+
+phase: train
+num_epoch: 120
+work_dir: ./work_dir/approach2_contrastive_correspondence/
+batch_size: 8
+test_batch_size: 1
+num_worker: 8
+
+device: 0
+log_interval: 50
+eval_interval: 1
+save_interval: 5
+
+framesize: &framesize 32
+pts_size: &frame_pts_size 96
+dynamic_pts_size: True
+
+weights: ./work_dir/quaternion_branch/epoch110_model.pt
+strict_load: False
+
+optimizer_args:
+  optimizer: Adam
+  base_lr: 0.0005
+  step: [80, 100, 110]
+  weight_decay: 0.01
+  start_epoch: 0
+  nesterov: False
+
+train_loader_args:
+  phase: 'train'
+  framerate: *framesize
+  return_correspondence: True
+  correspondence_radius: 2
+  correspondence_depth_weight: 0.25
+  correspondence_sample_weight: 0.1
+  correspondence_confidence_scale: 16.0
+  correspondence_max_dist: 64.0
+  bidirectional_correspondence: True
+
+test_loader_args:
+  phase: 'test'
+  framerate: *framesize
+  return_correspondence: False
+
+model: models.reqnn_motion.ContrastiveCorrespondenceMotion
+model_args:
+  pts_size: *frame_pts_size
+  num_classes: 25
+  hidden_dims: [64, 256]
+  dropout: 0.05
+  edgeconv_k: 20
+  merge_eps: 0.000001
+  aux_weight: 0.01
+  temperature: 0.07
+  num_negatives: 64
+  max_pairs: 256
