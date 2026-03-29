@@ -56,6 +56,15 @@ python main.py \
   --device 0
 ```
 
+## Train QCC On Quaternion Branch (from fresh control checkpoint)
+
+```bash
+python main.py \
+  --config quaternion_branch_qcc_from110.yaml \
+  --work-dir ./work_dir/quaternion_branch_qcc_from110 \
+  --device 0
+```
+
 ## Notes
 
 - `epoch120_model.pt` is saved because the configs use `save_interval: 5`.
