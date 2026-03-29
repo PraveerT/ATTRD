@@ -48,18 +48,18 @@ class GpuDataParallel(object):
         return model
 
     def data_to_device(self, data):
-        if isinstance(data, torch.FloatTensor):
-            return data.to(self.output_device)
-        elif isinstance(data, torch.DoubleTensor):
-            return data.float().to(self.output_device)
-        elif isinstance(data, torch.ByteTensor):
-            return data.long().to(self.output_device)
-        elif isinstance(data, torch.LongTensor):
-            return data.to(self.output_device)
+        if isinstance(data, dict):
+            return {key: self.data_to_device(value) for key, value in data.items()}
+        elif isinstance(data, tuple):
+            return tuple(self.data_to_device(d) for d in data)
         elif isinstance(data, list):
             return [self.data_to_device(d) for d in data]
+        elif torch.is_tensor(data):
+            if data.dtype == torch.float64:
+                data = data.float()
+            return data.to(self.output_device)
         else:
-            raise ValueError(data.shape, "Unknown Dtype: {}".format(data.dtype))
+            return data
 
     def criterion_to_device(self, loss):
         return loss.to(self.output_device)

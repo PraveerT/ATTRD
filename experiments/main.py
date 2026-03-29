@@ -266,6 +266,7 @@ class Processor():
         
         loader = self.data_loader['train']
         loss_value = []
+        aux_loss_values = []
         temporal_loss_values = []
         spatial_loss_values = []
         correct = 0
@@ -284,7 +285,18 @@ class Processor():
             self.recoder.record_timer("device")
             output = self.model(image)
             self.recoder.record_timer("forward")
-            loss = torch.mean(self.loss(output, label))
+            classification_loss = torch.mean(self.loss(output, label))
+            loss = classification_loss
+
+            aux_loss = None
+            aux_metrics = {}
+            if hasattr(model_ref, 'get_auxiliary_loss'):
+                aux_loss = model_ref.get_auxiliary_loss()
+                if aux_loss is not None:
+                    loss = loss + aux_loss
+                    aux_loss_values.append(aux_loss.detach().item())
+                    if hasattr(model_ref, 'get_auxiliary_metrics'):
+                        aux_metrics = model_ref.get_auxiliary_metrics() or {}
             
             # Compute separate branch losses for monitoring
             if hasattr(model_ref, 'temporal_logits') and hasattr(model_ref, 'spatial_logits'):
@@ -308,6 +320,24 @@ class Processor():
                               f"Spatial: {spatial_loss.item():.4f} (lr={spatial_lr:.6f}), "
                               f"Combined: {loss.item():.4f}, "
                               f"Alpha: {getattr(model_ref, 'alpha_value', 'N/A')}")
+            elif aux_loss is not None and batch_idx % 50 == 0:
+                qcc_raw = aux_metrics.get('qcc_raw')
+                qcc_forward = aux_metrics.get('qcc_forward')
+                qcc_backward = aux_metrics.get('qcc_backward')
+                qcc_valid_ratio = aux_metrics.get('qcc_valid_ratio')
+                self.recoder.print_log(
+                    '\tEpoch: {}, Batch({}/{}) aux | cls: {:.6f} total: {:.6f} qcc: {:.6f} fwd: {:.6f} bwd: {:.6f} valid: {:.4f}'.format(
+                        epoch,
+                        batch_idx,
+                        len(loader),
+                        classification_loss.item(),
+                        loss.item(),
+                        qcc_raw.item() if qcc_raw is not None else 0.0,
+                        qcc_forward.item() if qcc_forward is not None else 0.0,
+                        qcc_backward.item() if qcc_backward is not None else 0.0,
+                        qcc_valid_ratio.item() if qcc_valid_ratio is not None else 0.0,
+                    )
+                )
             
             self.optimizer.zero_grad()
             loss.backward()
@@ -338,6 +368,8 @@ class Processor():
         self.optimizer.scheduler.step()
         train_loss = np.mean(loss_value)
         train_acc = 100. * correct / total
+        if aux_loss_values:
+            self.recoder.print_log('\tMean auxiliary loss: {:.10f}.'.format(np.mean(aux_loss_values)))
         self.recoder.print_log('\tMean training loss: {:.10f}.'.format(train_loss))
         return train_acc, train_loss
 

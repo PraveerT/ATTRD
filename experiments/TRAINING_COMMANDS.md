@@ -46,7 +46,18 @@ python main.py \
   --device 0
 ```
 
+## Train QCC In Isolation (from branch winner, parity path)
+
+```bash
+python main.py \
+  --config quaternion_corr_cycle_parity_from110.yaml \
+  --work-dir ./work_dir/quaternion_qcc_isolated_parity_from110 \
+  --num-epoch 140 \
+  --device 0
+```
+
 ## Notes
 
 - `epoch120_model.pt` is saved because the configs use `save_interval: 5`.
 - Evaluation now runs every 10 epochs before epoch 100, and every epoch from epoch 100 onward.
+- Keep QCC experiments isolated from `quaternion_branch` until they beat the standalone winner.

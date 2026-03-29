@@ -1,0 +1,60 @@
+# Isolated QCC experiment:
+# fine-tune the quaternion winner with correspondence-driven QCC while preserving
+# the original winner loader behavior and dynamic point-size curriculum.
+
+dataloader: nvidia_dataloader.NvidiaQuaternionQCCParityLoader
+
+phase: train
+num_epoch: 140
+work_dir: ./work_dir/quaternion_qcc_isolated_parity_from110/
+batch_size: 8
+test_batch_size: 1
+num_worker: 8
+
+device: 0
+log_interval: 50
+eval_interval: 1
+save_interval: 5
+
+weights: ./work_dir/quaternion_branch/epoch110_model.pt
+strict_load: False
+
+framesize: &framesize 32
+pts_size: &frame_pts_size 96
+dynamic_pts_size: True
+
+optimizer_args:
+  optimizer: Adam
+  base_lr: 0.0005
+  step: [80, 100, 110]
+  weight_decay: 0.01
+  start_epoch: 110
+  nesterov: False
+
+train_loader_args:
+  phase: 'train'
+  framerate: *framesize
+  return_correspondence: True
+  correspondence_radius: 2
+  correspondence_depth_weight: 0.25
+  correspondence_sample_weight: 0.1
+  correspondence_confidence_scale: 16.0
+  correspondence_max_dist: 64.0
+  bidirectional_correspondence: True
+
+test_loader_args:
+  phase: 'test'
+  framerate: *framesize
+  return_correspondence: False
+
+model: models.reqnn_motion.EdgeConvQuaternionStackedDualMergeQCCWeightedRMSAttentionReadoutMotion
+model_args:
+  pts_size: *frame_pts_size
+  num_classes: 25
+  hidden_dims: [64, 256]
+  dropout: 0.05
+  edgeconv_k: 20
+  merge_eps: 0.000001
+  qcc_mode: correspondence_cycle
+  qcc_weight: 0.001
+  qcc_eps: 0.000001
