@@ -1,11 +1,11 @@
-# Bearing-quaternion QCC feature + grounded cycle consistency loss
-# Continues from epoch 110 checkpoint with reconstruction + cycle aux loss
+# Quaternion branch: Bearing-quaternion QCC feature + grounded cycle consistency loss
+# Peak accuracy: 80.29%
 
 dataloader: nvidia_dataloader.NvidiaQuaternionQCCParityLoader
 
 phase: train
 num_epoch: 140
-work_dir: ./work_dir/quaternion_branch_qcc_loss/
+work_dir: ./work_dir/quaternion_branch/
 batch_size: 8
 test_batch_size: 1
 num_worker: 8

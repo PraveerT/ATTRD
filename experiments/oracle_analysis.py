@@ -27,9 +27,10 @@ from models.reqnn_motion import BearingQCCFeatureMotion
 quat_model = BearingQCCFeatureMotion(
     num_classes=25, pts_size=256, hidden_dims=[64, 256],
     dropout=0.05, edgeconv_k=20, merge_eps=1e-6,
-    so3_weight=0.01, rotation_sigma=0.3, bearing_knn_k=10,
+    so3_weight=0.0, rotation_sigma=0.3, bearing_knn_k=10,
+    qcc_weight=0.1,
 ).cuda()
-ckpt_q = torch.load('work_dir/quaternion_branch/epoch110_model.pt', map_location='cpu')
+ckpt_q = torch.load('work_dir/quaternion_branch/epoch112_model.pt', map_location='cpu')
 state_q = ckpt_q.get('model_state_dict', ckpt_q.get('model', ckpt_q))
 quat_model.load_state_dict(state_q, strict=False)
 quat_model.eval()
