@@ -1,0 +1,64 @@
+# Learned fusion: PMamba + Quaternion branches (frozen) with learned gate
+dataloader: nvidia_dataloader.NvidiaLoader
+
+phase: train
+num_epoch: 180
+work_dir: ./work_dir/fusion_branch/
+batch_size: 8
+test_batch_size: 1
+num_worker: 8
+
+device: 0
+log_interval: 50
+eval_interval: 1
+save_interval: 5
+
+framesize: &framesize 32
+pts_size: 256
+dynamic_pts_size: False
+
+# Branch weights loaded via prefix remapping
+temporal_weights: ./work_dir/pmamba_branch/epoch110_model.pt
+temporal_source_prefix: ''
+temporal_target_prefix: temporal_branch
+
+spatial_weights: ./work_dir/quaternion_branch/epoch110_model.pt
+spatial_source_prefix: ''
+spatial_target_prefix: spatial_branch
+
+freeze: null
+
+optimizer_args:
+  optimizer: Adam
+  base_lr: 0.0005
+  step: [150, 165, 175]
+  weight_decay: 0.01
+  start_epoch: 120
+  nesterov: False
+
+train_loader_args:
+  phase: 'train'
+  framerate: *framesize
+
+test_loader_args:
+  phase: 'test'
+  framerate: *framesize
+
+model: models.fusion.MotionDualBranchFusion
+model_args:
+  pts_size: 256
+  num_classes: 25
+  temporal_model_args:
+    knn: [32, 24, 48, 24]
+    topk: 8
+  spatial_model_args:
+    hidden_dims: [64, 256]
+    dropout: 0.05
+    edgeconv_k: 20
+    merge_eps: 0.000001
+    so3_weight: 0.01
+    rotation_sigma: 0.3
+    bearing_knn_k: 10
+  fusion_dim: 512
+  dropout: 0.15
+  branch_prior: [0.75, 0.25]

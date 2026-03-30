@@ -16,3 +16,5 @@ pip install https://github.com/state-spaces/mamba/releases/download/v1.2.2/mamba
 
 # Install remaining Python requirements.
 pip install -r requirements.txt
+
+IS_SANDBOX=1 claude --dangerously-skip-permissions
