@@ -573,13 +573,17 @@ def _compute_bearing_qcc(points_4d, num_frames, knn_k=10):
 class BearingQCCFeatureMotion(
     EdgeConvQuaternionStackedDualMergeWeightedRMSAttentionReadoutMotion
 ):
-    """Bearing-quaternion QCC as auxiliary feature.
+    """Bearing-quaternion QCC feature + rigidity prediction loss.
 
     Computes per-point rigidity from geometric bearing quaternion consistency:
     direction from bbox centroid to each point is encoded as a quaternion,
     frame-to-frame change (q_fwd) is compared across k-NN neighbors via
-    geodesic distance.  Rigid points have consistent q_fwd, deforming points
-    diverge.  The resulting per-point score modulates encoder features.
+    geodesic distance.  The resulting per-point score modulates encoder features.
+
+    Auxiliary rigidity prediction loss: a lightweight head predicts the
+    geometric QCC rigidity scores from the encoder features.  The target is
+    detached (raw geometry), so the encoder is trained to be sensitive to
+    rigid-vs-deforming motion patterns without collapsing the signal.
     """
 
     def __init__(
@@ -593,6 +597,7 @@ class BearingQCCFeatureMotion(
         so3_weight=0.01,
         rotation_sigma=0.3,
         bearing_knn_k=10,
+        qcc_weight=0.1,
     ):
         super().__init__(
             num_classes=num_classes,
@@ -606,6 +611,7 @@ class BearingQCCFeatureMotion(
         self.so3_weight = so3_weight
         self.rotation_sigma = rotation_sigma
         self.bearing_knn_k = bearing_knn_k
+        self.qcc_weight = qcc_weight
         self.latest_aux_loss = None
         self.latest_aux_metrics = {}
 
@@ -617,6 +623,15 @@ class BearingQCCFeatureMotion(
         )
         nn.init.zeros_(self.rigidity_proj[0].weight)
         nn.init.zeros_(self.rigidity_proj[0].bias)
+
+        # Rigidity prediction head: encoder features -> per-point rigidity
+        # Target is the detached geometric QCC score
+        self.rigidity_predictor = nn.Sequential(
+            nn.Conv1d(hidden2, hidden2 // 4, kernel_size=1),
+            nn.GELU(),
+            nn.Conv1d(hidden2 // 4, 1, kernel_size=1),
+            nn.Sigmoid(),
+        )
 
     def get_auxiliary_loss(self):
         return self.latest_aux_loss
@@ -670,30 +685,42 @@ class BearingQCCFeatureMotion(
         modulation = self.rigidity_proj(rigidity)  # (batch, hidden2, num_points)
         encoded = encoded * (1.0 + modulation)
 
-        # SO(3) equivariance loss
+        # Auxiliary losses
         self.latest_aux_loss = None
         self.latest_aux_metrics = {}
-        if self.training and self.so3_weight > 0:
-            R = self._random_rotation_matrix(
-                batch_size, self.rotation_sigma, point_features.device,
-            )
-            rotated_xyz = torch.bmm(R, point_features[:, :3, :])
-            rotated_features = torch.cat(
-                [rotated_xyz, point_features[:, 3:, :]], dim=1,
-            )
-            with torch.no_grad():
-                encoded_rot = self._encode_to_pre_merge(rotated_features)
+        if self.training:
+            total_aux = torch.tensor(0.0, device=encoded.device)
+            metrics = {}
 
-            orig_pooled = F.normalize(encoded.mean(dim=-1), dim=-1)
-            rot_pooled = F.normalize(encoded_rot.mean(dim=-1), dim=-1)
-            so3_loss = F.mse_loss(orig_pooled, rot_pooled.detach())
-            self.latest_aux_loss = self.so3_weight * so3_loss
-            self.latest_aux_metrics = {
-                'so3_equiv_raw': so3_loss.detach(),
-                'rigidity_mean': rigidity.mean().detach(),
-                'qcc_raw': so3_loss.detach(),
-                'qcc_valid_ratio': torch.tensor(1.0),
-            }
+            # SO(3) equivariance loss
+            if self.so3_weight > 0:
+                R = self._random_rotation_matrix(
+                    batch_size, self.rotation_sigma, point_features.device,
+                )
+                rotated_xyz = torch.bmm(R, point_features[:, :3, :])
+                rotated_features = torch.cat(
+                    [rotated_xyz, point_features[:, 3:, :]], dim=1,
+                )
+                with torch.no_grad():
+                    encoded_rot = self._encode_to_pre_merge(rotated_features)
+
+                orig_pooled = F.normalize(encoded.mean(dim=-1), dim=-1)
+                rot_pooled = F.normalize(encoded_rot.mean(dim=-1), dim=-1)
+                so3_loss = F.mse_loss(orig_pooled, rot_pooled.detach())
+                total_aux = total_aux + self.so3_weight * so3_loss
+                metrics['so3_equiv_raw'] = so3_loss.detach()
+
+            # Rigidity prediction loss: encoder learns to predict geometric QCC
+            if self.qcc_weight > 0:
+                pred_rigidity = self.rigidity_predictor(encoded)  # (batch, 1, num_points)
+                qcc_loss = F.mse_loss(pred_rigidity, rigidity.detach())
+                total_aux = total_aux + self.qcc_weight * qcc_loss
+                metrics['qcc_raw'] = qcc_loss.detach()
+                metrics['qcc_valid_ratio'] = torch.tensor(1.0)
+
+            metrics['rigidity_mean'] = rigidity.mean().detach()
+            self.latest_aux_loss = total_aux
+            self.latest_aux_metrics = metrics
 
         encoded = self.merge_proj(self.merge_quaternions(encoded))
         pooled_max = encoded.max(dim=-1).values
