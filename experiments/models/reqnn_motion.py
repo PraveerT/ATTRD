@@ -570,20 +570,137 @@ def _compute_bearing_qcc(points_4d, num_frames, knn_k=10):
     return rigidity_flat
 
 
+def _hamilton_product(a, b):
+    """Hamilton product of two quaternion tensors (..., 4) in [w,x,y,z] format."""
+    aw, ax, ay, az = a[..., 0], a[..., 1], a[..., 2], a[..., 3]
+    bw, bx, by, bz = b[..., 0], b[..., 1], b[..., 2], b[..., 3]
+    return torch.stack([
+        aw*bw - ax*bx - ay*by - az*bz,
+        aw*bx + ax*bw + ay*bz - az*by,
+        aw*by - ax*bz + ay*bw + az*bx,
+        aw*bz + ax*by - ay*bx + az*bw,
+    ], dim=-1)
+
+
+def _quaternion_rotate_vector(q, v):
+    """Rotate 3D vectors v by unit quaternions q.
+
+    Args:
+        q: (..., 4) unit quaternions [w,x,y,z]
+        v: (..., 3) vectors
+
+    Returns:
+        rotated: (..., 3) rotated vectors
+    """
+    # v as pure quaternion [0, vx, vy, vz]
+    v_quat = torch.cat([torch.zeros_like(v[..., :1]), v], dim=-1)
+    q_conj = q * torch.tensor([1, -1, -1, -1], device=q.device, dtype=q.dtype)
+    rotated = _hamilton_product(_hamilton_product(q, v_quat), q_conj)
+    return rotated[..., 1:]  # drop w component
+
+
+class _GroundedCycleConsistency(nn.Module):
+    """Grounded quaternion cycle consistency module.
+
+    Splits encoded features into 3 temporal segments, estimates quaternion
+    rotations between pairs.  Each quaternion is grounded by a reconstruction
+    loss: rotating the source segment's pooled features should match the
+    target segment.  The cycle constraint (q_12 * q_23 * q_31 = identity)
+    adds mutual consistency on top, which is the novel signal.
+    """
+
+    def __init__(self, feat_dim):
+        super().__init__()
+        # Quaternion estimator: from concatenated segment summaries to [w,x,y,z]
+        self.quat_head = nn.Sequential(
+            nn.Linear(feat_dim * 2, feat_dim),
+            nn.GELU(),
+            nn.Linear(feat_dim, 4),
+        )
+
+    def _estimate_quaternion(self, src_pooled, tgt_pooled):
+        """Estimate unit quaternion from pooled segment features."""
+        combined = torch.cat([src_pooled, tgt_pooled], dim=-1)
+        q = self.quat_head(combined)  # (batch, 4)
+        return F.normalize(q, dim=-1)  # project to unit sphere
+
+    def forward(self, encoded, num_frames, pts_per_frame, points_xyz):
+        """Compute grounded cycle consistency loss.
+
+        Args:
+            encoded: (batch, feat_dim, num_points) encoder features
+            num_frames: int
+            pts_per_frame: int
+            points_xyz: (batch, num_frames, pts_per_frame, 3) raw XYZ coords
+
+        Returns:
+            loss: scalar (reconstruction + cycle)
+            metrics: dict
+        """
+        batch = encoded.shape[0]
+        feat_dim = encoded.shape[1]
+
+        seg_size = num_frames // 3
+
+        # Per-point XYZ per segment: (batch, seg_size * pts, 3)
+        xyz1 = points_xyz[:, :seg_size].reshape(batch, -1, 3)
+        xyz2 = points_xyz[:, seg_size:2*seg_size].reshape(batch, -1, 3)
+        xyz3 = points_xyz[:, 2*seg_size:3*seg_size].reshape(batch, -1, 3)
+
+        # Pool encoded features per segment for quaternion estimation
+        feat = encoded.permute(0, 2, 1).reshape(
+            batch, num_frames, pts_per_frame, feat_dim,
+        )
+        seg1 = feat[:, :seg_size].reshape(batch, -1, feat_dim).mean(dim=1)
+        seg2 = feat[:, seg_size:2*seg_size].reshape(batch, -1, feat_dim).mean(dim=1)
+        seg3 = feat[:, 2*seg_size:3*seg_size].reshape(batch, -1, feat_dim).mean(dim=1)
+
+        # Estimate quaternion rotations between segment pairs
+        q_12 = self._estimate_quaternion(seg1, seg2.detach())
+        q_23 = self._estimate_quaternion(seg2, seg3.detach())
+        q_31 = self._estimate_quaternion(seg3, seg1.detach())
+
+        # Reconstruction loss on per-point XYZ (centered per segment)
+        # The quaternion must rotate source point cloud to match target
+        recon_loss = torch.tensor(0.0, device=encoded.device)
+        for src_xyz, tgt_xyz, q in [
+            (xyz1, xyz2, q_12), (xyz2, xyz3, q_23), (xyz3, xyz1, q_31),
+        ]:
+            src_c = src_xyz - src_xyz.mean(dim=1, keepdim=True)
+            tgt_c = tgt_xyz - tgt_xyz.mean(dim=1, keepdim=True)
+            # q is (batch, 4), broadcast over points
+            rotated = _quaternion_rotate_vector(
+                q.unsqueeze(1).expand(-1, src_c.shape[1], -1), src_c,
+            )
+            recon_loss = recon_loss + F.mse_loss(rotated, tgt_c.detach())
+        recon_loss = recon_loss / 3.0
+
+        # Cycle loss: q_12 * q_23 * q_31 should compose to identity
+        q_cycle = _hamilton_product(_hamilton_product(q_12, q_23), q_31)
+        q_id = torch.tensor([1.0, 0.0, 0.0, 0.0], device=encoded.device)
+        loss_pos = ((q_cycle - q_id) ** 2).sum(dim=-1)
+        loss_neg = ((q_cycle + q_id) ** 2).sum(dim=-1)
+        cycle_loss = torch.min(loss_pos, loss_neg).mean()
+
+        total = recon_loss + cycle_loss
+
+        metrics = {
+            'cycle_raw': cycle_loss.detach(),
+            'recon_raw': recon_loss.detach(),
+            'q_cycle_w': q_cycle[:, 0].abs().mean().detach(),
+        }
+        return total, metrics
+
+
 class BearingQCCFeatureMotion(
     EdgeConvQuaternionStackedDualMergeWeightedRMSAttentionReadoutMotion
 ):
-    """Bearing-quaternion QCC feature + rigidity prediction loss.
+    """Bearing-quaternion QCC feature + grounded cycle consistency loss.
 
-    Computes per-point rigidity from geometric bearing quaternion consistency:
-    direction from bbox centroid to each point is encoded as a quaternion,
-    frame-to-frame change (q_fwd) is compared across k-NN neighbors via
-    geodesic distance.  The resulting per-point score modulates encoder features.
-
-    Auxiliary rigidity prediction loss: a lightweight head predicts the
-    geometric QCC rigidity scores from the encoder features.  The target is
-    detached (raw geometry), so the encoder is trained to be sensitive to
-    rigid-vs-deforming motion patterns without collapsing the signal.
+    Computes per-point rigidity from geometric bearing quaternion consistency
+    and uses it to modulate encoder features.  Additionally, a grounded cycle
+    consistency module estimates quaternion rotations between temporal segments
+    with pairwise reconstruction grounding and cycle composition constraint.
     """
 
     def __init__(
@@ -594,7 +711,7 @@ class BearingQCCFeatureMotion(
         dropout=0.1,
         edgeconv_k=20,
         merge_eps=1e-6,
-        so3_weight=0.01,
+        so3_weight=0.0,
         rotation_sigma=0.3,
         bearing_knn_k=10,
         qcc_weight=0.1,
@@ -624,14 +741,8 @@ class BearingQCCFeatureMotion(
         nn.init.zeros_(self.rigidity_proj[0].weight)
         nn.init.zeros_(self.rigidity_proj[0].bias)
 
-        # Rigidity prediction head: encoder features -> per-point rigidity
-        # Target is the detached geometric QCC score
-        self.rigidity_predictor = nn.Sequential(
-            nn.Conv1d(hidden2, hidden2 // 4, kernel_size=1),
-            nn.GELU(),
-            nn.Conv1d(hidden2 // 4, 1, kernel_size=1),
-            nn.Sigmoid(),
-        )
+        # Grounded cycle consistency module
+        self.cycle_module = _GroundedCycleConsistency(feat_dim=hidden2)
 
     def get_auxiliary_loss(self):
         return self.latest_aux_loss
@@ -710,11 +821,14 @@ class BearingQCCFeatureMotion(
                 total_aux = total_aux + self.so3_weight * so3_loss
                 metrics['so3_equiv_raw'] = so3_loss.detach()
 
-            # Rigidity prediction loss: encoder learns to predict geometric QCC
+            # Grounded cycle consistency loss
             if self.qcc_weight > 0:
-                pred_rigidity = self.rigidity_predictor(encoded)  # (batch, 1, num_points)
-                qcc_loss = F.mse_loss(pred_rigidity, rigidity.detach())
+                qcc_loss, qcc_metrics = self.cycle_module(
+                    encoded, num_frames, pts_per_frame,
+                    points[..., :3],  # raw XYZ for reconstruction grounding
+                )
                 total_aux = total_aux + self.qcc_weight * qcc_loss
+                metrics.update(qcc_metrics)
                 metrics['qcc_raw'] = qcc_loss.detach()
                 metrics['qcc_valid_ratio'] = torch.tensor(1.0)
 

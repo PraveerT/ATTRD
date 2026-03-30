@@ -1,5 +1,5 @@
-# Bearing-quaternion QCC feature + rigidity prediction loss
-# Continues from epoch 110 checkpoint with rigidity prediction aux loss
+# Bearing-quaternion QCC feature + grounded cycle consistency loss
+# Continues from epoch 110 checkpoint with reconstruction + cycle aux loss
 
 dataloader: nvidia_dataloader.NvidiaQuaternionQCCParityLoader
 
@@ -13,7 +13,7 @@ num_worker: 8
 device: 0
 log_interval: 50
 eval_interval: 1
-save_interval: 5
+save_interval: 1
 
 framesize: &framesize 32
 pts_size: &frame_pts_size 96
