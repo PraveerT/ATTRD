@@ -465,6 +465,9 @@ def _resolve_correspondence_pairs(sampled_orig_idx, corr_full_target_idx, corr_f
     valid_source = sampled_orig_idx >= 0
     safe_source = sampled_orig_idx.clamp(min=0)
 
+    # Clamp safe_source to valid range for the correspondence table
+    safe_source = safe_source.clamp(max=total_points - 1)
+
     # Look up each sampled point's correspondence target (in original space)
     target_orig = torch.gather(full_target_idx, 1, safe_source)
     target_orig = torch.where(valid_source, target_orig, torch.full_like(target_orig, -1))
@@ -482,7 +485,7 @@ def _resolve_correspondence_pairs(sampled_orig_idx, corr_full_target_idx, corr_f
             orig_to_sampled[b, sampled_orig_idx[b, m].long()] = positions[b, m]
 
     # Map target original index -> sampled position
-    safe_target_orig = target_orig.clamp(min=0)
+    safe_target_orig = target_orig.clamp(min=0, max=total_points - 1)
     target_pos = torch.full_like(target_orig, -1)
     for b in range(batch_size):
         m = target_orig[b] >= 0
@@ -945,6 +948,704 @@ class SO3AugEquivarianceMotion(
                 'so3_equiv_raw': loss.detach(),
             }
             self.latest_aux_loss = self.aux_weight * loss
+
+        encoded = self.merge_proj(self.merge_quaternions(encoded))
+        pooled_max = encoded.max(dim=-1).values
+        attention = torch.softmax(self.readout_attention(encoded), dim=-1)
+        pooled_attn = torch.sum(encoded * attention, dim=-1)
+        return torch.cat((pooled_max, pooled_attn), dim=1)
+
+
+class SO3AugFixedQCCMotion(SO3AugEquivarianceMotion):
+    """SO(3) augmentation + fixed QCC: quaternion geodesic consistency on correspondences.
+
+    Fixed QCC: for matched point pairs across frames, normalize per-point
+    quaternion features to unit quaternions and minimize geodesic distance
+    on S^3.  No rotation prediction, no extra parameters.  Combined with
+    the SO(3) augmentation equivariance loss from Approach 3.
+    """
+
+    def __init__(
+        self,
+        num_classes,
+        pts_size,
+        hidden_dims=(64, 128),
+        dropout=0.1,
+        edgeconv_k=20,
+        merge_eps=1e-6,
+        aux_weight=0.01,
+        rotation_sigma=0.3,
+        qcc_weight=0.01,
+        qcc_margin=0.3,
+        max_pairs=256,
+    ):
+        super().__init__(
+            num_classes=num_classes,
+            pts_size=pts_size,
+            hidden_dims=hidden_dims,
+            dropout=dropout,
+            edgeconv_k=edgeconv_k,
+            merge_eps=merge_eps,
+            aux_weight=aux_weight,
+            rotation_sigma=rotation_sigma,
+        )
+        self.qcc_weight = qcc_weight
+        self.qcc_margin = qcc_margin
+        self.max_pairs = max_pairs
+
+    def _compute_qcc_loss(self, encoded, sampled_aux):
+        """Fixed QCC: geodesic distance on S^3 between matched quaternion features."""
+        if sampled_aux is None:
+            return None
+
+        orig_flat_idx = sampled_aux.get('orig_flat_idx')
+        corr_target = sampled_aux.get('corr_full_target_idx')
+        corr_weight = sampled_aux.get('corr_full_weight')
+        if orig_flat_idx is None or corr_target is None or corr_weight is None:
+            return None
+
+        batch_size, channels, num_points = encoded.shape
+        orig_flat_idx = orig_flat_idx.reshape(batch_size, -1).long()
+        if orig_flat_idx.size(1) != num_points:
+            return None
+
+        result = _resolve_correspondence_pairs(
+            orig_flat_idx, corr_target, corr_weight,
+        )
+        if result is None:
+            return None
+        src_pos, tgt_pos, pair_weight, valid = result
+
+        groups = channels // 4
+        total_loss = encoded.new_tensor(0.0)
+        total_weight = 0.0
+        total_pairs = 0
+
+        for b in range(batch_size):
+            b_valid = valid[b]
+            if not b_valid.any():
+                continue
+            b_src = src_pos[b, b_valid]
+            b_tgt = tgt_pos[b, b_valid].clamp(min=0)
+            b_w = pair_weight[b, b_valid]
+
+            if b_src.size(0) > self.max_pairs:
+                perm = torch.randperm(b_src.size(0), device=encoded.device)[:self.max_pairs]
+                b_src, b_tgt, b_w = b_src[perm], b_tgt[perm], b_w[perm]
+
+            num_pairs = b_src.size(0)
+            feat = encoded[b]  # (channels, num_points)
+
+            # Gather features for matched pairs
+            src_feat = feat[:, b_src].t()  # (pairs, channels)
+            tgt_feat = feat[:, b_tgt].t()
+
+            # Reshape to quaternion groups: (pairs, groups, 4)
+            src_qg = src_feat.reshape(num_pairs, groups, 4)
+            tgt_qg = tgt_feat.reshape(num_pairs, groups, 4)
+
+            # Normalize to unit quaternions on S^3
+            src_unit = F.normalize(src_qg, dim=-1, eps=1e-6)
+            tgt_unit = F.normalize(tgt_qg.detach(), dim=-1, eps=1e-6)
+
+            # Geodesic distance: 1 - |dot(q1, q2)| (handles q/-q ambiguity)
+            # Margin: only penalize when distance exceeds threshold
+            dot = (src_unit * tgt_unit).sum(dim=-1)  # (pairs, groups)
+            geodesic_raw = 1.0 - dot.abs()
+            geodesic = F.relu(geodesic_raw - self.qcc_margin).mean(dim=-1)  # (pairs,)
+
+            pair_loss = (geodesic * b_w).sum()
+            total_loss = total_loss + pair_loss
+            total_weight += b_w.sum().item()
+            total_pairs += num_pairs
+
+        if total_weight < 1e-6:
+            return None, {}
+
+        loss = total_loss / max(total_weight, 1e-6)
+        metrics = {
+            'qcc_geodesic': loss.detach(),
+            'qcc_pairs': float(total_pairs),
+        }
+        return self.qcc_weight * loss, metrics
+
+    def extract_features(self, inputs, aux_input=None):
+        points, sampled_aux = self._sample_points_with_aux(inputs, aux_input=aux_input)
+        batch_size = points.shape[0]
+        point_features = points.reshape(batch_size, -1, 4).transpose(1, 2).contiguous()
+
+        encoded = self._encode_to_pre_merge(point_features)
+
+        self.latest_aux_loss = None
+        self.latest_aux_metrics = {}
+
+        if self.training:
+            total_aux = encoded.new_tensor(0.0)
+            metrics = {}
+
+            # SO(3) augmentation equivariance loss
+            if self.aux_weight > 0:
+                R = self._random_rotation_matrix(
+                    batch_size, self.rotation_sigma, point_features.device,
+                )
+                rotated_xyz = torch.bmm(R, point_features[:, :3, :])
+                rotated_features = torch.cat(
+                    [rotated_xyz, point_features[:, 3:, :]], dim=1,
+                )
+                with torch.no_grad():
+                    encoded_rot = self._encode_to_pre_merge(rotated_features)
+
+                orig_pooled = F.normalize(encoded.mean(dim=-1), dim=-1)
+                rot_pooled = F.normalize(encoded_rot.mean(dim=-1), dim=-1)
+                so3_loss = F.mse_loss(orig_pooled, rot_pooled.detach())
+                total_aux = total_aux + self.aux_weight * so3_loss
+                metrics['so3_equiv_raw'] = so3_loss.detach()
+
+            # Fixed QCC: quaternion geodesic consistency on correspondences
+            if self.qcc_weight > 0:
+                qcc_result = self._compute_qcc_loss(encoded, sampled_aux)
+                if qcc_result is not None:
+                    qcc_loss, qcc_metrics = qcc_result
+                    total_aux = total_aux + qcc_loss
+                    metrics.update(qcc_metrics)
+
+            if total_aux.item() > 0:
+                self.latest_aux_loss = total_aux
+            self.latest_aux_metrics = metrics
+
+        encoded = self.merge_proj(self.merge_quaternions(encoded))
+        pooled_max = encoded.max(dim=-1).values
+        attention = torch.softmax(self.readout_attention(encoded), dim=-1)
+        pooled_attn = torch.sum(encoded * attention, dim=-1)
+        return torch.cat((pooled_max, pooled_attn), dim=1)
+
+
+class TemporalCorrespondenceMotion(
+    EdgeConvQuaternionStackedDualMergeWeightedRMSAttentionReadoutMotion
+):
+    """QCC as architecture: temporal skip connections via correspondences.
+
+    For matched point pairs across frames, mix the correspondent's quaternion
+    features into each point via a gated residual.  The gate and mixing
+    transform are initialized to zero so the model starts identical to the
+    pretrained baseline.  Combined with SO(3) augmentation equivariance.
+    """
+
+    def __init__(
+        self,
+        num_classes,
+        pts_size,
+        hidden_dims=(64, 128),
+        dropout=0.1,
+        edgeconv_k=20,
+        merge_eps=1e-6,
+        so3_weight=0.01,
+        rotation_sigma=0.3,
+    ):
+        super().__init__(
+            num_classes=num_classes,
+            pts_size=pts_size,
+            hidden_dims=hidden_dims,
+            dropout=dropout,
+            edgeconv_k=edgeconv_k,
+            merge_eps=merge_eps,
+        )
+        _, hidden2 = hidden_dims
+        self.so3_weight = so3_weight
+        self.rotation_sigma = rotation_sigma
+        self.latest_aux_loss = None
+        self.latest_aux_metrics = {}
+
+        # Temporal correspondence gate + transform (zero-init)
+        self.corr_gate = nn.Parameter(torch.tensor(0.0))
+        self.corr_transform = QuaternionPointLinear(hidden2, hidden2)
+        # Zero-init so the model starts identical to baseline
+        nn.init.zeros_(self.corr_transform.weight_r)
+        nn.init.zeros_(self.corr_transform.weight_i)
+        nn.init.zeros_(self.corr_transform.weight_j)
+        nn.init.zeros_(self.corr_transform.weight_k)
+        nn.init.zeros_(self.corr_transform.bias)
+
+    def _sample_points_with_aux(self, inputs, aux_input=None):
+        """Correspondence-aware sampling: guarantee matched pairs survive."""
+        points = inputs[..., :4]
+        batch_size, num_frames, point_count, channels = points.shape
+        sample_size = min(self.pts_size, point_count)
+
+        if sample_size == point_count or aux_input is None or not self.training:
+            return super()._sample_points_with_aux(inputs, aux_input=aux_input)
+
+        corr_full_target = aux_input.get('corr_full_target_idx')
+        corr_full_weight = aux_input.get('corr_full_weight')
+        orig_flat_idx = aux_input.get('orig_flat_idx')
+        if corr_full_target is None or corr_full_weight is None or orig_flat_idx is None:
+            return super()._sample_points_with_aux(inputs, aux_input=aux_input)
+
+        device = points.device
+        corr_target = corr_full_target.long()       # (batch, total_orig)
+        corr_weight = corr_full_weight.float()       # (batch, total_orig)
+        flat_idx = orig_flat_idx.long()              # (batch, frames, pts)
+
+        # Gather correspondence info for frames 0..T-2
+        # src flat indices for the first T-1 frames
+        src_flat = flat_idx[:, :-1, :].reshape(batch_size, -1)  # (batch, (T-1)*pts)
+        src_valid = src_flat >= 0
+        safe_src = src_flat.clamp(min=0)
+
+        # Look up targets and weights
+        tgt_flat = torch.gather(corr_target, 1, safe_src)
+        tgt_w = torch.gather(corr_weight, 1, safe_src)
+        tgt_flat = torch.where(src_valid, tgt_flat, torch.full_like(tgt_flat, -1))
+        tgt_w = torch.where(src_valid, tgt_w, torch.zeros_like(tgt_w))
+
+        # Convert target flat index to within-frame index
+        tgt_within = tgt_flat % point_count
+        has_corr = (tgt_flat >= 0) & (tgt_w > 0)  # (batch, (T-1)*pts)
+
+        # Source within-frame indices (same indices repeated for each frame)
+        src_within = torch.arange(point_count, device=device).unsqueeze(0).expand(
+            batch_size, -1,
+        )  # (batch, pts) — same within-frame idx for all frames
+
+        # For each batch: mark which within-frame indices participate in correspondences
+        # A point index is "corr-active" if it appears as src or tgt in any frame pair
+        # Scatter src indices
+        corr_score = torch.zeros(batch_size, point_count, device=device)
+        src_within_expanded = src_within.unsqueeze(1).expand(
+            -1, num_frames - 1, -1,
+        ).reshape(batch_size, -1)  # (batch, (T-1)*pts)
+        corr_score.scatter_add_(1, src_within_expanded, has_corr.float())
+        # Scatter tgt indices
+        safe_tgt_within = tgt_within.clamp(min=0)
+        corr_score.scatter_add_(1, safe_tgt_within, has_corr.float())
+
+        # Sample: prioritise high corr_score points
+        # Add small random noise to break ties and randomize among equal-score points
+        noise = torch.rand(batch_size, point_count, device=device) * 0.5
+        priority = corr_score + noise  # corr points get score >= 1, others < 0.5
+
+        # Top-k by priority
+        _, indices = priority.topk(sample_size, dim=1)  # (batch, sample_size)
+        indices = indices.sort(dim=1).values  # sorted for determinism
+
+        # Gather points and provenance
+        # points: (batch, frames, pts, 4) -> gather along pts dim
+        idx_expand = indices.unsqueeze(1).unsqueeze(-1).expand(
+            -1, num_frames, -1, channels,
+        )
+        sampled_points = torch.gather(points, 2, idx_expand)
+
+        idx_flat_expand = indices.unsqueeze(1).expand(-1, num_frames, -1)
+        sampled_orig = torch.gather(flat_idx, 2, idx_flat_expand)
+
+        sampled_aux = dict(aux_input)
+        sampled_aux['orig_flat_idx'] = sampled_orig
+        return sampled_points, sampled_aux
+
+    def get_auxiliary_loss(self):
+        return self.latest_aux_loss
+
+    def get_auxiliary_metrics(self):
+        return self.latest_aux_metrics
+
+    def _apply_temporal_mixing(self, encoded, sampled_aux):
+        """Mix correspondent features into each point via gated residual.
+
+        encoded: (batch, channels, num_points) in conv format
+        Returns: encoded with temporal information mixed in
+        """
+        if sampled_aux is None:
+            return encoded
+
+        orig_flat_idx = sampled_aux.get('orig_flat_idx')
+        corr_target = sampled_aux.get('corr_full_target_idx')
+        corr_weight = sampled_aux.get('corr_full_weight')
+        if orig_flat_idx is None or corr_target is None or corr_weight is None:
+            return encoded
+
+        batch_size, channels, num_points = encoded.shape
+        orig_flat_idx = orig_flat_idx.reshape(batch_size, -1).long()
+        if orig_flat_idx.size(1) != num_points:
+            return encoded
+
+        result = _resolve_correspondence_pairs(
+            orig_flat_idx, corr_target, corr_weight,
+        )
+        if result is None:
+            return encoded
+        src_pos, tgt_pos, pair_weight, valid = result
+
+        gate = torch.sigmoid(self.corr_gate)
+
+        # Process correspondent features through the transform
+        # Work in point format: (batch, num_points, channels)
+        point_feat = encoded.transpose(1, 2).contiguous()
+        corr_feat = self.corr_transform(point_feat)  # (batch, num_points, channels)
+        corr_feat = corr_feat.transpose(1, 2).contiguous()  # back to conv format
+
+        # For each valid pair, mix target's transformed feature into source
+        mixed = encoded.clone()
+        for b in range(batch_size):
+            b_valid = valid[b]
+            if not b_valid.any():
+                continue
+            b_src = src_pos[b, b_valid]
+            b_tgt = tgt_pos[b, b_valid].clamp(min=0)
+            b_w = pair_weight[b, b_valid]
+
+            # Weighted gated residual: src += gate * weight * transform(tgt)
+            contribution = gate * b_w.unsqueeze(0) * corr_feat[b, :, b_tgt]
+            mixed[b, :, b_src] = mixed[b, :, b_src] + contribution
+
+            # Bidirectional: also mix src into tgt
+            contribution_rev = gate * b_w.unsqueeze(0) * corr_feat[b, :, b_src]
+            mixed[b, :, b_tgt] = mixed[b, :, b_tgt] + contribution_rev
+
+        return mixed
+
+    @staticmethod
+    def _random_rotation_matrix(batch_size, sigma, device):
+        axis = torch.randn(batch_size, 3, device=device)
+        axis = F.normalize(axis, dim=-1)
+        angle = torch.randn(batch_size, 1, device=device) * sigma
+        K = torch.zeros(batch_size, 3, 3, device=device)
+        K[:, 0, 1] = -axis[:, 2]
+        K[:, 0, 2] = axis[:, 1]
+        K[:, 1, 0] = axis[:, 2]
+        K[:, 1, 2] = -axis[:, 0]
+        K[:, 2, 0] = -axis[:, 1]
+        K[:, 2, 1] = axis[:, 0]
+        I = torch.eye(3, device=device).unsqueeze(0)
+        sin_a = torch.sin(angle).unsqueeze(-1)
+        cos_a = torch.cos(angle).unsqueeze(-1)
+        return I + sin_a * K + (1 - cos_a) * torch.bmm(K, K)
+
+    def _encode_to_pre_merge(self, point_features):
+        graph_features = _get_graph_feature(point_features, k=self.edgeconv_k)
+        edge_features = self.edgeconv(graph_features).max(dim=-1).values
+        encoded = self.quaternion_encoder(edge_features.transpose(1, 2).contiguous())
+        encoded = self.encoder_norm(encoded.transpose(1, 2).contiguous())
+        encoded = self.encoder_activation(encoded)
+        refined = self.quaternion_refine(encoded.transpose(1, 2).contiguous())
+        refined = self.refine_norm(refined.transpose(1, 2).contiguous())
+        refined = self.refine_activation(refined)
+        return encoded + refined
+
+    def extract_features(self, inputs, aux_input=None):
+        points, sampled_aux = self._sample_points_with_aux(inputs, aux_input=aux_input)
+        batch_size = points.shape[0]
+        point_features = points.reshape(batch_size, -1, 4).transpose(1, 2).contiguous()
+
+        encoded = self._encode_to_pre_merge(point_features)
+
+        # Apply temporal correspondence mixing (the QCC-as-architecture step)
+        encoded = self._apply_temporal_mixing(encoded, sampled_aux)
+
+        # SO(3) equivariance loss
+        self.latest_aux_loss = None
+        self.latest_aux_metrics = {}
+        if self.training and self.so3_weight > 0:
+            R = self._random_rotation_matrix(
+                batch_size, self.rotation_sigma, point_features.device,
+            )
+            rotated_xyz = torch.bmm(R, point_features[:, :3, :])
+            rotated_features = torch.cat(
+                [rotated_xyz, point_features[:, 3:, :]], dim=1,
+            )
+            with torch.no_grad():
+                encoded_rot = self._encode_to_pre_merge(rotated_features)
+
+            orig_pooled = F.normalize(encoded.mean(dim=-1), dim=-1)
+            rot_pooled = F.normalize(encoded_rot.mean(dim=-1), dim=-1)
+            so3_loss = F.mse_loss(orig_pooled, rot_pooled.detach())
+            self.latest_aux_loss = self.so3_weight * so3_loss
+            self.latest_aux_metrics = {
+                'so3_equiv_raw': so3_loss.detach(),
+                'corr_gate': torch.sigmoid(self.corr_gate).detach(),
+            }
+
+        encoded = self.merge_proj(self.merge_quaternions(encoded))
+        pooled_max = encoded.max(dim=-1).values
+        attention = torch.softmax(self.readout_attention(encoded), dim=-1)
+        pooled_attn = torch.sum(encoded * attention, dim=-1)
+        return torch.cat((pooled_max, pooled_attn), dim=1)
+
+
+def _compute_rigidity_scores(points_3d, knn_idx, corr_pairs):
+    """Compute per-point rigidity from displacement consistency in k-NN neighborhoods.
+
+    For each point with a valid correspondence, check how coherently its k-NN
+    neighbors moved to the next frame.  Rigid regions have low displacement
+    variance; articulation points have high variance.
+
+    Args:
+        points_3d: (batch, 3, num_points) - xyz coordinates
+        knn_idx: (batch, num_points, k) - spatial k-NN indices
+        corr_pairs: tuple from _resolve_correspondence_pairs or None
+
+    Returns:
+        rigidity: (batch, 1, num_points) - 0=non-rigid, 1=rigid
+    """
+    batch_size, _, num_points = points_3d.shape
+    rigidity = torch.zeros(batch_size, 1, num_points, device=points_3d.device)
+
+    if corr_pairs is None:
+        return rigidity
+
+    src_pos, tgt_pos, pair_weight, valid = corr_pairs
+    k = knn_idx.size(-1)
+
+    # Build per-point displacement: target_xyz - source_xyz for matched points
+    # First build a displacement map: for each point, its displacement (or zero)
+    displacement = torch.zeros_like(points_3d)  # (batch, 3, num_points)
+    has_disp = torch.zeros(batch_size, num_points, device=points_3d.device)
+
+    for b in range(batch_size):
+        b_valid = valid[b]
+        if not b_valid.any():
+            continue
+        b_src = src_pos[b, b_valid]
+        b_tgt = tgt_pos[b, b_valid].clamp(min=0)
+
+        src_xyz = points_3d[b, :, b_src]  # (3, n_pairs)
+        tgt_xyz = points_3d[b, :, b_tgt]  # (3, n_pairs)
+        disp = tgt_xyz - src_xyz           # (3, n_pairs)
+
+        displacement[b, :, b_src] = disp
+        has_disp[b, b_src] = 1.0
+
+    # For each point, gather displacements of its k-NN neighbors
+    # knn_idx: (batch, num_points, k)
+    flat_knn = knn_idx.reshape(batch_size, -1)  # (batch, num_points*k)
+
+    # Gather neighbor displacements: (batch, 3, num_points*k)
+    nbr_disp = torch.gather(
+        displacement, 2, flat_knn.unsqueeze(1).expand(-1, 3, -1),
+    ).reshape(batch_size, 3, num_points, k)
+
+    # Gather neighbor validity
+    nbr_valid = torch.gather(
+        has_disp, 1, flat_knn,
+    ).reshape(batch_size, num_points, k)  # (batch, num_points, k)
+
+    # Count valid neighbors per point
+    valid_count = nbr_valid.sum(dim=-1)  # (batch, num_points)
+    enough = valid_count >= 3  # need at least 3 neighbors with correspondences
+
+    # Mean displacement per neighborhood
+    nbr_valid_3d = nbr_valid.unsqueeze(1)  # (batch, 1, num_points, k)
+    safe_count = valid_count.clamp(min=1).unsqueeze(1)  # (batch, 1, num_points)
+    mean_disp = (nbr_disp * nbr_valid_3d).sum(dim=-1) / safe_count  # (batch, 3, num_points)
+
+    # Variance of displacements
+    diff = nbr_disp - mean_disp.unsqueeze(-1)  # (batch, 3, num_points, k)
+    sq_diff = (diff * diff * nbr_valid_3d).sum(dim=-1) / safe_count  # (batch, 3, num_points)
+    variance = sq_diff.sum(dim=1)  # (batch, num_points) - total displacement variance
+
+    # Convert to rigidity score in [0, 1]
+    # rigidity = exp(-variance / scale)
+    scale = variance[enough].median().clamp(min=1e-6) if enough.any() else 1.0
+    rig = torch.exp(-variance / scale)
+    rig = torch.where(enough, rig, torch.zeros_like(rig))
+
+    rigidity = rig.unsqueeze(1)  # (batch, 1, num_points)
+    return rigidity
+
+
+class RigidityFeatureMotion(
+    EdgeConvQuaternionStackedDualMergeWeightedRMSAttentionReadoutMotion
+):
+    """QCC as rigidity feature: correspondence displacement consistency
+    becomes a per-point feature that modulates encoder output.
+
+    Rigid regions (low displacement variance) get a different treatment
+    than articulation points (high variance).  The model learns what
+    rigidity patterns mean for each gesture class.
+    """
+
+    def __init__(
+        self,
+        num_classes,
+        pts_size,
+        hidden_dims=(64, 128),
+        dropout=0.1,
+        edgeconv_k=20,
+        merge_eps=1e-6,
+        so3_weight=0.01,
+        rotation_sigma=0.3,
+        rigidity_k=10,
+    ):
+        super().__init__(
+            num_classes=num_classes,
+            pts_size=pts_size,
+            hidden_dims=hidden_dims,
+            dropout=dropout,
+            edgeconv_k=edgeconv_k,
+            merge_eps=merge_eps,
+        )
+        _, hidden2 = hidden_dims
+        self.so3_weight = so3_weight
+        self.rotation_sigma = rotation_sigma
+        self.rigidity_k = rigidity_k
+        self.latest_aux_loss = None
+        self.latest_aux_metrics = {}
+
+        # Rigidity modulation: scale features by (1 + alpha * rigidity)
+        # alpha starts at 0 so the model starts identical to baseline
+        self.rigidity_alpha = nn.Parameter(torch.tensor(0.0))
+
+        # Small projection to let the model transform rigidity into
+        # a per-channel modulation (1 -> hidden2)
+        self.rigidity_proj = nn.Sequential(
+            nn.Conv1d(1, hidden2, kernel_size=1, bias=True),
+            nn.Tanh(),
+        )
+        nn.init.zeros_(self.rigidity_proj[0].weight)
+        nn.init.zeros_(self.rigidity_proj[0].bias)
+
+    def _sample_points_with_aux(self, inputs, aux_input=None):
+        """Correspondence-aware sampling: prioritise points with valid matches."""
+        points = inputs[..., :4]
+        batch_size, num_frames, point_count, channels = points.shape
+        sample_size = min(self.pts_size, point_count)
+
+        if sample_size == point_count or aux_input is None or not self.training:
+            return super()._sample_points_with_aux(inputs, aux_input=aux_input)
+
+        corr_full_target = aux_input.get('corr_full_target_idx')
+        corr_full_weight = aux_input.get('corr_full_weight')
+        orig_flat_idx = aux_input.get('orig_flat_idx')
+        if corr_full_target is None or corr_full_weight is None or orig_flat_idx is None:
+            return super()._sample_points_with_aux(inputs, aux_input=aux_input)
+
+        device = points.device
+        corr_target = corr_full_target.long()
+        corr_weight = corr_full_weight.float()
+        flat_idx = orig_flat_idx.long()
+
+        src_flat = flat_idx[:, :-1, :].reshape(batch_size, -1)
+        src_valid = src_flat >= 0
+        safe_src = src_flat.clamp(min=0)
+        tgt_flat = torch.gather(corr_target, 1, safe_src)
+        tgt_w = torch.gather(corr_weight, 1, safe_src)
+        tgt_flat = torch.where(src_valid, tgt_flat, torch.full_like(tgt_flat, -1))
+        tgt_w = torch.where(src_valid, tgt_w, torch.zeros_like(tgt_w))
+        tgt_within = tgt_flat % point_count
+        has_corr = (tgt_flat >= 0) & (tgt_w > 0)
+
+        src_within = torch.arange(point_count, device=device).unsqueeze(0).expand(batch_size, -1)
+        corr_score = torch.zeros(batch_size, point_count, device=device)
+        src_within_exp = src_within.unsqueeze(1).expand(-1, num_frames - 1, -1).reshape(batch_size, -1)
+        corr_score.scatter_add_(1, src_within_exp, has_corr.float())
+        corr_score.scatter_add_(1, tgt_within.clamp(min=0), has_corr.float())
+
+        noise = torch.rand(batch_size, point_count, device=device) * 0.5
+        priority = corr_score + noise
+        _, indices = priority.topk(sample_size, dim=1)
+        indices = indices.sort(dim=1).values
+
+        idx_expand = indices.unsqueeze(1).unsqueeze(-1).expand(-1, num_frames, -1, channels)
+        sampled_points = torch.gather(points, 2, idx_expand)
+        idx_flat_expand = indices.unsqueeze(1).expand(-1, num_frames, -1)
+        sampled_orig = torch.gather(flat_idx, 2, idx_flat_expand)
+
+        sampled_aux = dict(aux_input)
+        sampled_aux['orig_flat_idx'] = sampled_orig
+        return sampled_points, sampled_aux
+
+    def get_auxiliary_loss(self):
+        return self.latest_aux_loss
+
+    def get_auxiliary_metrics(self):
+        return self.latest_aux_metrics
+
+    @staticmethod
+    def _random_rotation_matrix(batch_size, sigma, device):
+        axis = torch.randn(batch_size, 3, device=device)
+        axis = F.normalize(axis, dim=-1)
+        angle = torch.randn(batch_size, 1, device=device) * sigma
+        K = torch.zeros(batch_size, 3, 3, device=device)
+        K[:, 0, 1] = -axis[:, 2]
+        K[:, 0, 2] = axis[:, 1]
+        K[:, 1, 0] = axis[:, 2]
+        K[:, 1, 2] = -axis[:, 0]
+        K[:, 2, 0] = -axis[:, 1]
+        K[:, 2, 1] = axis[:, 0]
+        I = torch.eye(3, device=device).unsqueeze(0)
+        sin_a = torch.sin(angle).unsqueeze(-1)
+        cos_a = torch.cos(angle).unsqueeze(-1)
+        return I + sin_a * K + (1 - cos_a) * torch.bmm(K, K)
+
+    def _encode_to_pre_merge(self, point_features):
+        graph_features = _get_graph_feature(point_features, k=self.edgeconv_k)
+        edge_features = self.edgeconv(graph_features).max(dim=-1).values
+        encoded = self.quaternion_encoder(edge_features.transpose(1, 2).contiguous())
+        encoded = self.encoder_norm(encoded.transpose(1, 2).contiguous())
+        encoded = self.encoder_activation(encoded)
+        refined = self.quaternion_refine(encoded.transpose(1, 2).contiguous())
+        refined = self.refine_norm(refined.transpose(1, 2).contiguous())
+        refined = self.refine_activation(refined)
+        return encoded + refined
+
+    def extract_features(self, inputs, aux_input=None):
+        points, sampled_aux = self._sample_points_with_aux(inputs, aux_input=aux_input)
+        batch_size = points.shape[0]
+        point_features = points.reshape(batch_size, -1, 4).transpose(1, 2).contiguous()
+        points_3d = point_features[:, :3, :]
+
+        # Compute k-NN for both EdgeConv and rigidity
+        knn_idx = _knn_indices(point_features, max(self.edgeconv_k, self.rigidity_k))
+
+        encoded = self._encode_to_pre_merge(point_features)
+
+        # Compute rigidity from correspondence displacement consistency
+        corr_pairs = None
+        if sampled_aux is not None:
+            orig_flat_idx = sampled_aux.get('orig_flat_idx')
+            corr_target = sampled_aux.get('corr_full_target_idx')
+            corr_weight = sampled_aux.get('corr_full_weight')
+            if orig_flat_idx is not None and corr_target is not None and corr_weight is not None:
+                flat_idx = orig_flat_idx.reshape(batch_size, -1).long()
+                if flat_idx.size(1) == encoded.size(2):
+                    corr_pairs = _resolve_correspondence_pairs(
+                        flat_idx, corr_target, corr_weight,
+                    )
+
+        rigidity_knn = knn_idx[:, :, :self.rigidity_k]
+        rigidity = _compute_rigidity_scores(points_3d, rigidity_knn, corr_pairs)
+        # rigidity: (batch, 1, num_points) in [0, 1]
+
+        # Modulate features: encoded * (1 + proj(rigidity))
+        modulation = self.rigidity_proj(rigidity)  # (batch, hidden2, num_points)
+        encoded = encoded * (1.0 + modulation)
+
+        # SO(3) equivariance loss
+        self.latest_aux_loss = None
+        self.latest_aux_metrics = {}
+        if self.training and self.so3_weight > 0:
+            R = self._random_rotation_matrix(
+                batch_size, self.rotation_sigma, point_features.device,
+            )
+            rotated_xyz = torch.bmm(R, point_features[:, :3, :])
+            rotated_features = torch.cat(
+                [rotated_xyz, point_features[:, 3:, :]], dim=1,
+            )
+            with torch.no_grad():
+                encoded_rot = self._encode_to_pre_merge(rotated_features)
+
+            orig_pooled = F.normalize(encoded.mean(dim=-1), dim=-1)
+            rot_pooled = F.normalize(encoded_rot.mean(dim=-1), dim=-1)
+            so3_loss = F.mse_loss(orig_pooled, rot_pooled.detach())
+            self.latest_aux_loss = self.so3_weight * so3_loss
+            n_valid = (corr_pairs is not None and corr_pairs[3].sum().item()) if corr_pairs is not None else 0
+            n_total = rigidity.numel() // rigidity.size(1)  # num_points * batch
+            self.latest_aux_metrics = {
+                'so3_equiv_raw': so3_loss.detach(),
+                'rigidity_mean': rigidity.mean().detach(),
+                'rigidity_alpha': self.rigidity_alpha.detach(),
+                'qcc_raw': so3_loss.detach(),  # reuse for log format
+                'qcc_valid_ratio': torch.tensor(n_valid / max(n_total, 1)),
+            }
 
         encoded = self.merge_proj(self.merge_quaternions(encoded))
         pooled_max = encoded.max(dim=-1).values

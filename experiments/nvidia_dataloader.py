@@ -622,7 +622,12 @@ class NvidiaQuaternionQCCParityLoader(NvidiaQuaternionQCCLoader):
                 before_point = result[start_idx - 1:start_idx]
                 after_point = result[end_idx:end_idx + 1]
                 result[start_idx:end_idx] = before_point * (1 - alpha) + after_point * alpha
-                result_provenance[start_idx:end_idx] = invalid_id.expand(hole_size)
+                # Propagate correspondence: nearest boundary provenance
+                mid = hole_size // 2
+                before_prov = result_provenance[start_idx - 1]
+                after_prov = result_provenance[end_idx]
+                result_provenance[start_idx:start_idx + mid] = before_prov
+                result_provenance[start_idx + mid:end_idx] = after_prov
             elif start_idx == 0:
                 result[start_idx:end_idx] = result[end_idx:end_idx + hole_size]
                 result_provenance[start_idx:end_idx] = result_provenance[end_idx:end_idx + hole_size]
