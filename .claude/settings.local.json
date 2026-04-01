@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git reset:*)",
+      "Bash(ls *.yaml)",
+      "Bash(python main.py --config approach1_local_equivariance.yaml)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(python main.py --config approach3_so3_fixed_qcc.yaml)",
+      "Bash(python:*)",
+      "Bash(while ps:*)",
+      "Bash(do sleep:*)",
+      "Bash(done)",
+      "Bash(sort -t'%' -k1 -rn)"
+    ]
+  }
+}

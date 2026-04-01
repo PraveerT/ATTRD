@@ -17,4 +17,7 @@ pip install https://github.com/state-spaces/mamba/releases/download/v1.2.2/mamba
 # Install remaining Python requirements.
 pip install -r requirements.txt
 
-IS_SANDBOX=1 claude --dangerously-skip-permissions
+# IS_SANDBOX=1 claude --dangerously-skip-permissions
+# Export Jupyter token for jlab CLI auto-connect
+echo "$JUPYTER_TOKEN" > /notebooks/.jlab-token
+echo "jlab: token saved to /notebooks/.jlab-token"

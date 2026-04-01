@@ -8,11 +8,15 @@ class Optimizer(object):
     def __init__(self, model, optim_dict):
         self.optim_dict = optim_dict
         self.spatial_prefix = self.optim_dict.get('spatial_prefix', 'spatial_branch').strip('.')
-        
+        self.temporal_prefix = self.optim_dict.get('temporal_prefix', 'temporal_branch').strip('.')
+
         # Separate parameter groups for different learning rates
         spatial_params = []
         temporal_params = []
-        
+        fusion_params = []
+
+        fusion_lr_mult = self.optim_dict.get('fusion_lr_mult', 1.0)
+
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
@@ -22,18 +26,23 @@ class Optimizer(object):
                 or normalized_name.startswith(self.spatial_prefix + '.')
             ):
                 spatial_params.append(param)
-            else:
+            elif self.temporal_prefix and (
+                normalized_name == self.temporal_prefix
+                or normalized_name.startswith(self.temporal_prefix + '.')
+            ):
                 temporal_params.append(param)
-        
-        # Set spatial LR to match temporal LR
-        spatial_lr = self.optim_dict['base_lr'] * 1.0  # Same as temporal
-        temporal_lr = self.optim_dict['base_lr']
-        
+            else:
+                fusion_params.append(param)
+
+        base_lr = self.optim_dict['base_lr']
+
         param_groups = []
         if temporal_params:
-            param_groups.append({'params': temporal_params, 'lr': temporal_lr, 'name': 'temporal'})
+            param_groups.append({'params': temporal_params, 'lr': base_lr, 'name': 'temporal'})
         if spatial_params:
-            param_groups.append({'params': spatial_params, 'lr': spatial_lr, 'name': 'spatial'})
+            param_groups.append({'params': spatial_params, 'lr': base_lr, 'name': 'spatial'})
+        if fusion_params:
+            param_groups.append({'params': fusion_params, 'lr': base_lr * fusion_lr_mult, 'name': 'fusion'})
         if not param_groups:
             raise ValueError("No trainable parameters were found for optimizer setup.")
         
@@ -54,7 +63,17 @@ class Optimizer(object):
         self.scheduler = self.define_lr_scheduler(self.optimizer, self.optim_dict['step'])
 
     def define_lr_scheduler(self, optimizer, milestones):
-        if self.optim_dict["optimizer"] in ['SGD', 'Adam']:
+        scheduler_type = self.optim_dict.get('scheduler', 'multistep')
+        if scheduler_type == 'cosine':
+            num_epochs = self.optim_dict.get('num_epochs', milestones[-1] if milestones else 200)
+            start_epoch = self.optim_dict.get('start_epoch', 0)
+            lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=num_epochs - start_epoch,
+                eta_min=self.optim_dict['base_lr'] * 0.01,
+            )
+            return lr_scheduler
+        elif self.optim_dict["optimizer"] in ['SGD', 'Adam']:
             lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=milestones, gamma=0.1)
             return lr_scheduler
         else:

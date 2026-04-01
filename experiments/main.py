@@ -297,29 +297,32 @@ class Processor():
                     aux_loss_values.append(aux_loss.detach().item())
                     if hasattr(model_ref, 'get_auxiliary_metrics'):
                         aux_metrics = model_ref.get_auxiliary_metrics() or {}
-            
-            # Compute separate branch losses for monitoring
+
+            # Compute separate branch losses (with gradient for aux training)
             if hasattr(model_ref, 'temporal_logits') and hasattr(model_ref, 'spatial_logits'):
-                with torch.no_grad():
-                    temporal_loss = torch.mean(self.loss(model_ref.temporal_logits, label))
-                    spatial_loss = torch.mean(self.loss(model_ref.spatial_logits, label))
-                    
-                    # Track separate losses for epoch mean calculation
-                    temporal_loss_values.append(temporal_loss.item())
-                    spatial_loss_values.append(spatial_loss.item())
-                    
-                    # Print branch losses every 50 batches
-                    if batch_idx % 50 == 0:
-                        lr_by_name = {
-                            group.get('name', f'group_{idx}'): group['lr']
-                            for idx, group in enumerate(self.optimizer.optimizer.param_groups)
-                        }
-                        temporal_lr = lr_by_name.get('temporal', current_learning_rate[0])
-                        spatial_lr = lr_by_name.get('spatial', temporal_lr)
-                        print(f"\n[Branch Losses] Temporal: {temporal_loss.item():.4f} (lr={temporal_lr:.6f}), "
-                              f"Spatial: {spatial_loss.item():.4f} (lr={spatial_lr:.6f}), "
-                              f"Combined: {loss.item():.4f}, "
-                              f"Alpha: {getattr(model_ref, 'alpha_value', 'N/A')}")
+                temporal_loss = torch.mean(self.loss(model_ref.temporal_logits, label))
+                spatial_loss = torch.mean(self.loss(model_ref.spatial_logits, label))
+
+                # Add auxiliary branch losses to train aux classifiers
+                aux_w = getattr(model_ref, 'aux_weight', 0.0)
+                if aux_w > 0:
+                    loss = loss + aux_w * (temporal_loss + spatial_loss)
+
+                # Track separate losses for epoch mean calculation
+                temporal_loss_values.append(temporal_loss.detach().item())
+                spatial_loss_values.append(spatial_loss.detach().item())
+
+                # Print branch losses every 50 batches
+                if batch_idx % 50 == 0:
+                    lr_by_name = {
+                        group.get('name', f'group_{idx}'): group['lr']
+                        for idx, group in enumerate(self.optimizer.optimizer.param_groups)
+                    }
+                    temporal_lr = lr_by_name.get('temporal', current_learning_rate[0])
+                    spatial_lr = lr_by_name.get('spatial', temporal_lr)
+                    print(f"\n[Branch Losses] Temporal: {temporal_loss.item():.4f} (lr={temporal_lr:.6f}), "
+                          f"Spatial: {spatial_loss.item():.4f} (lr={spatial_lr:.6f}), "
+                          f"Combined: {loss.item():.4f}")
             elif aux_loss is not None and batch_idx % 50 == 0:
                 qcc_raw = aux_metrics.get('qcc_raw')
                 qcc_forward = aux_metrics.get('qcc_forward')

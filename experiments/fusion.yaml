@@ -1,8 +1,9 @@
 # Learned fusion: PMamba + Quaternion (grounded cycle consistency) branches
+# Concat fusion with auxiliary branch losses + cosine annealing
 dataloader: nvidia_dataloader.NvidiaLoader
 
 phase: train
-num_epoch: 180
+num_epoch: 250
 work_dir: ./work_dir/fusion_branch/
 batch_size: 8
 test_batch_size: 1
@@ -31,9 +32,13 @@ strict_load: False
 
 optimizer_args:
   optimizer: Adam
-  base_lr: 0.0005
-  step: [150, 165, 175]
-  weight_decay: 0.01
+  base_lr: 0.000012
+  fusion_lr_mult: 25.0
+  temporal_prefix: temporal_branch
+  scheduler: cosine
+  num_epochs: 250
+  step: [200, 230, 245]
+  weight_decay: 0.02
   start_epoch: 120
   nesterov: False
 
@@ -61,6 +66,6 @@ model_args:
     rotation_sigma: 0.3
     bearing_knn_k: 10
     qcc_weight: 0.1
-  fusion_dim: 512
-  dropout: 0.15
-  branch_prior: [0.75, 0.25]
+  fusion_dim: 256
+  dropout: 0.25
+  aux_weight: 0.3
