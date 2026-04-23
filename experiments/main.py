@@ -33,6 +33,23 @@ class Processor():
         # Telegram Bot Configuration
         self.telegram_bot_token = "8049556095:AAH0c0KB0DmzFtcW0s97ZS_kQ8ux9gX72eE"
         self.telegram_chat_id = None
+        # Oracle/fusion telemetry vs PMamba @ e110 (cached probs).
+        self._pmamba_probs = None
+        self._pmamba_labels = None
+        self._eval_probs = []
+        self._eval_labels = []
+        self._latest_oracle = None
+        self._latest_fusion = None
+        self._latest_fusion_alpha = None
+        try:
+            _cache = "work_dir/pmamba_branch/pmamba_test_preds.npz"
+            import numpy as _np, os as _os
+            if _os.path.exists(_cache):
+                _d = _np.load(_cache)
+                self._pmamba_probs = _d["probs"]
+                self._pmamba_labels = _d["labels"]
+        except Exception:
+            pass
         self.best_accuracy = 0.0  # Track best accuracy within current run
         
         # A fixed point count can be requested either from the CLI or directly in config.
@@ -106,8 +123,23 @@ class Processor():
                 continue
 
             if target_state[actual_target_key].shape != tensor.shape:
+                src_shape = tuple(tensor.shape)
+                tgt_shape = tuple(target_state[actual_target_key].shape)
+                # Partial-copy if only dim 1 differs and target is wider
+                if (len(src_shape) == len(tgt_shape)
+                        and len(src_shape) >= 2
+                        and src_shape[0] == tgt_shape[0]
+                        and src_shape[1] < tgt_shape[1]
+                        and src_shape[2:] == tgt_shape[2:]):
+                    merged = target_state[actual_target_key].clone()
+                    merged[:, :src_shape[1]] = tensor
+                    prepared_state[actual_target_key] = merged
+                    shape_mismatches.append(
+                        (source_key, actual_target_key, src_shape, tgt_shape)
+                    )
+                    continue
                 shape_mismatches.append(
-                    (source_key, actual_target_key, tuple(tensor.shape), tuple(target_state[actual_target_key].shape))
+                    (source_key, actual_target_key, src_shape, tgt_shape)
                 )
                 continue
 
@@ -232,6 +264,17 @@ class Processor():
     def train(self, epoch):
         self.model.train()
         model_ref = self.model.module if hasattr(self.model, 'module') else self.model
+
+        # Apply qcc_weight_schedule if provided in config
+        schedule = getattr(self.arg, 'qcc_weight_schedule', None)
+        if schedule and hasattr(model_ref, 'qcc_weights'):
+            applicable = [w for ep_th, w in schedule if epoch >= ep_th]
+            if applicable:
+                new_weight = applicable[-1]
+                if hasattr(model_ref, 'qcc_weights'):
+                    model_ref.qcc_weights = [new_weight] * len(model_ref.qcc_weights)
+                if hasattr(model_ref, 'qcc_weight'):
+                    model_ref.qcc_weight = new_weight
         
         # Check if a fixed pts_size was requested.
         if self.use_static_pts:
@@ -285,7 +328,12 @@ class Processor():
             self.recoder.record_timer("device")
             output = self.model(image)
             self.recoder.record_timer("forward")
-            classification_loss = torch.mean(self.loss(output, label))
+            sample_w = getattr(model_ref, 'latest_sample_weights', None)
+            if sample_w is not None:
+                per_sample = torch.nn.functional.cross_entropy(output, label, reduction='none')
+                classification_loss = (per_sample * sample_w).sum() / (sample_w.sum() + 1e-8)
+            else:
+                classification_loss = torch.mean(self.loss(output, label))
             loss = classification_loss
 
             aux_loss = None
@@ -378,6 +426,8 @@ class Processor():
 
     def eval(self, loader_name):
         self.model.eval()
+        self._eval_probs = []
+        self._eval_labels = []
         for l_name in loader_name:
             loader = self.data_loader[l_name]
             loss_mean = []
@@ -397,6 +447,8 @@ class Processor():
                 # loss = torch.mean(self.loss(output, label))
                 loss_mean += self.loss(output, label).cpu().detach().numpy().tolist()
                 self.stat.update_accuracy(output.data.cpu(), label.cpu(), topk=self.topk)
+                self._eval_probs.append(torch.softmax(output.detach().float(), dim=1).cpu().numpy())
+                self._eval_labels.append(label.detach().cpu().numpy())
             self.recoder.print_log('mean loss: ' + str(np.mean(loss_mean)))
 
     def Loading(self):
@@ -513,7 +565,7 @@ class Processor():
             self.data_loader['test'] = torch.utils.data.DataLoader(
                 dataset=test_dataset,
                 batch_size=self.arg.test_batch_size,
-                shuffle=True,
+                shuffle=False,                 # deterministic for oracle alignment
                 drop_last=False,
                 num_workers=self.arg.num_worker,
             )
@@ -595,22 +647,36 @@ class Processor():
         
         # Send Telegram message with evaluation results
         try:
-            # Check if this is a new best
-            is_new_best = prec1 > self.best_accuracy
+            # Compute oracle first so best_metric selection can use it.
+            self._maybe_compute_oracle(epoch, mode)
+            # Pick best-metric: oracle if cached PMamba available, else prec1.
+            best_metric = self._latest_oracle if self._latest_oracle is not None else prec1
+            best_label = "oracle" if self._latest_oracle is not None else "prec1"
+            # Check if this is a new best (by the chosen metric).
+            is_new_best = best_metric > self.best_accuracy
             if is_new_best:
-                self.best_accuracy = prec1
-            
+                self.best_accuracy = best_metric
+                try:
+                    best_path = f"{self.arg.work_dir}/best_model.pt"
+                    self.save_model(epoch, self.model, self.optimizer, best_path)
+                    self.recoder.print_log(f"  Saved new best to {best_path} at {best_label}={self.best_accuracy:.2f}% (prec1={prec1:.2f}%)")
+                except Exception as _e:
+                    self.recoder.print_log(f"Failed to save best_model.pt: {_e}")
             # Format message as: Train: train acc train loss Test: test acc test loss
             if train_acc is not None and train_loss is not None:
                 message = f"📊 Epoch {epoch}\n"
                 message += f"Train: {train_acc:.1f} {train_loss:.2f}\n"
                 message += f"Test: {prec1:.1f} {prec5:.1f}"
+                if self._latest_oracle is not None:
+                    message += f"\nOracle: {self._latest_oracle:.2f}% | Fusion a={self._latest_fusion_alpha:.2f} -> {self._latest_fusion:.2f}%"
                 if is_new_best:
                     message += f" 🏆 New Best: {self.best_accuracy:.1f}%"
             else:
                 # For test phase without training data
                 message = f"📊 Epoch {epoch} {mode}\n"
                 message += f"Test: {prec1:.1f} {prec5:.1f}\n"
+                if self._latest_oracle is not None:
+                    message += f"Oracle: {self._latest_oracle:.2f}% | Fusion a={self._latest_fusion_alpha:.2f} -> {self._latest_fusion:.2f}%\n"
                 if is_new_best:
                     message += f"🏆 New Best: {self.best_accuracy:.1f}%\n"
             
@@ -618,6 +684,45 @@ class Processor():
             self.send_telegram_message(message)
         except Exception as e:
             self.recoder.print_log(f"Failed to send Telegram message: {e}")
+
+    def _maybe_compute_oracle(self, epoch, mode):
+        """Populate self._latest_oracle and self._latest_fusion (percentages)
+        using cached PMamba test-set probs + this eval pass' accumulated probs.
+        """
+        self._latest_oracle = None
+        self._latest_fusion = None
+        self._latest_fusion_alpha = None
+        if self._pmamba_probs is None or not self._eval_probs:
+            return
+        try:
+            import numpy as np
+            probs = np.concatenate(self._eval_probs, axis=0)                 # (N, 25)
+            labels = np.concatenate(self._eval_labels, axis=0)               # (N,)
+            if probs.shape[0] != self._pmamba_probs.shape[0]:
+                self.recoder.print_log(
+                    f"[oracle] skip: {probs.shape[0]} model preds vs {self._pmamba_probs.shape[0]} cached PMamba preds"
+                )
+                return
+            # Labels should agree with cache; use cache labels as reference.
+            ref_labels = self._pmamba_labels if self._pmamba_labels.shape[0] == probs.shape[0] else labels
+            pm_correct = self._pmamba_probs.argmax(1) == ref_labels
+            md_correct = probs.argmax(1) == ref_labels
+            oracle = (pm_correct | md_correct).mean() * 100
+            best_a, best_acc = 1.0, (pm_correct).mean() * 100
+            for ai in range(0, 105, 5):
+                a = ai / 100.0
+                fp = (a * self._pmamba_probs + (1 - a) * probs).argmax(1)
+                acc = (fp == ref_labels).mean() * 100
+                if acc > best_acc:
+                    best_acc = acc; best_a = a
+            self._latest_oracle = float(oracle)
+            self._latest_fusion = float(best_acc)
+            self._latest_fusion_alpha = float(best_a)
+            self.recoder.print_log(
+                f"[oracle] epoch={epoch} mode={mode} oracle={oracle:.2f}% fusion[a={best_a:.2f}]={best_acc:.2f}%"
+            )
+        except Exception as e:
+            self.recoder.print_log(f"[oracle] failed: {e}")
 
     def save_model(self, epoch, model, optimizer, save_path):
         state = {

@@ -21,3 +21,10 @@ __pycache__/
 .idea/
 *.swp
 *.swo
+
+# Checkpoints + data caches
+*.pt
+*.pth
+*.npy
+*.npz
+*.bak

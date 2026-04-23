@@ -200,4 +200,8 @@ def get_parser():
         type=float,
         default=0.7,
         help='weight for soft label loss (0.0-1.0)')
+    parser.add_argument(
+        '--qcc-weight-schedule',
+        default=None,
+        help='list of [epoch_threshold, weight] pairs for scheduling qcc_weight')
     return parser

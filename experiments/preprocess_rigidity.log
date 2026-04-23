@@ -1,0 +1,23 @@
+Loaded global dataset statistics for consistent normalization
+1050
+[train] 1050 samples
+  100/1050  new=100  cached=0
+  200/1050  new=200  cached=0
+  300/1050  new=300  cached=0
+  400/1050  new=400  cached=0
+  500/1050  new=500  cached=0
+  600/1050  new=600  cached=0
+  700/1050  new=700  cached=0
+  800/1050  new=800  cached=0
+  900/1050  new=900  cached=0
+  1000/1050  new=1000  cached=0
+[train] done 1050 new, 0 cached
+Loaded global dataset statistics for consistent normalization
+482
+[test] 482 samples
+  100/482  new=100  cached=0
+  200/482  new=200  cached=0
+  300/482  new=300  cached=0
+  400/482  new=400  cached=0
+[test] done 482 new, 0 cached
+all done

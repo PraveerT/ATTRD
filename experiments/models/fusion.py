@@ -7,11 +7,12 @@ from models.reqnn_motion import BearingQCCFeatureMotion
 
 
 class MotionDualBranchFusion(nn.Module):
-    """Learned fusion of PMamba temporal branch and quaternion spatial branch.
+    """Logit-gated fusion of frozen PMamba and quaternion branches.
 
-    Each branch is frozen and provides features.  The fusion head concatenates
-    projected branch features and classifies from the joint representation.
-    Auxiliary per-branch classification losses keep each branch's signal sharp.
+    Branches are weight-frozen but kept in train mode for random point
+    sampling. During eval, K internal TTA passes average probabilities
+    (arithmetic mean) for robust predictions. During training, single
+    pass provides data augmentation for the gate.
     """
 
     def __init__(
@@ -20,97 +21,102 @@ class MotionDualBranchFusion(nn.Module):
         pts_size,
         temporal_model_args=None,
         spatial_model_args=None,
-        fusion_dim=256,
-        dropout=0.25,
-        aux_weight=0.3,
-        branch_prior=(0.75, 0.25),  # kept for config compat, unused
+        aux_weight=0.0,
+        tta_k=10,
+        **kwargs,
     ):
         super().__init__()
         self.num_classes = num_classes
         self.pts_size = pts_size
         self.aux_weight = aux_weight
+        self.tta_k = tta_k
 
-        # --- Temporal branch (PMamba) ---
-        t_args = temporal_model_args or {}
+        # Temporal branch (PMamba)
         self.temporal_branch = Motion(
-            num_classes=num_classes, pts_size=pts_size, **t_args,
+            num_classes=num_classes,
+            pts_size=pts_size,
+            **(temporal_model_args or {}),
         )
-        self.temporal_feat_dim = self.temporal_branch.feature_dim  # 1024
+        self.temporal_feat_dim = self.temporal_branch.feature_dim
 
-        # --- Spatial branch (Quaternion + Bearing QCC) ---
-        s_args = spatial_model_args or {}
+        # Spatial branch (Quaternion)
         self.spatial_branch = BearingQCCFeatureMotion(
-            num_classes=num_classes, pts_size=pts_size, **s_args,
+            num_classes=num_classes,
+            pts_size=pts_size,
+            **(spatial_model_args or {}),
         )
-        self.spatial_feat_dim = self.spatial_branch.feature_dim  # 512
+        self.spatial_feat_dim = self.spatial_branch.feature_dim
 
-        # --- Fusion layers ---
-        # Project both branches to same dimension
-        self.temporal_proj = nn.Sequential(
-            nn.Linear(self.temporal_feat_dim, fusion_dim),
-            nn.LayerNorm(fusion_dim),
-            nn.GELU(),
-        )
-        self.spatial_proj = nn.Sequential(
-            nn.Linear(self.spatial_feat_dim, fusion_dim),
-            nn.LayerNorm(fusion_dim),
-            nn.GELU(),
-        )
+        # Freeze branch weights
+        for param in self.temporal_branch.parameters():
+            param.requires_grad = False
+        for param in self.spatial_branch.parameters():
+            param.requires_grad = False
 
-        # Classifier on concatenated features (2 * fusion_dim -> num_classes)
-        self.classifier = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(fusion_dim * 2, fusion_dim),
-            nn.GELU(),
-            nn.Dropout(dropout * 0.5),
-            nn.Linear(fusion_dim, num_classes),
-        )
+        # Logit-based gate
+        self.gate = nn.Linear(num_classes * 2, num_classes)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.constant_(self.gate.bias, 1.4)
 
-        # Lightweight auxiliary branch classifiers (frozen branch features -> logits)
-        self.temporal_aux_cls = nn.Linear(self.temporal_feat_dim, num_classes)
-        self.spatial_aux_cls = nn.Linear(self.spatial_feat_dim, num_classes)
-
-        # Store branch logits for monitoring
         self.temporal_logits = None
         self.spatial_logits = None
 
-    def _unpack_inputs(self, inputs):
-        """Handle both dict and tensor inputs."""
-        if isinstance(inputs, dict):
-            return inputs['points'], inputs
-        return inputs, None
+    def _stabilize_branches(self):
+        for m in list(self.temporal_branch.modules()) + list(self.spatial_branch.modules()):
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.Dropout)):
+                m.eval()
 
-    def extract_features(self, inputs):
-        points, aux_input = self._unpack_inputs(inputs)
+    def train(self, mode=True):
+        super().train(mode)
+        # Branches always in train mode for random point sampling
+        self.temporal_branch.train()
+        self.spatial_branch.train()
+        self._stabilize_branches()
+        return self
 
-        # Temporal branch expects raw tensor
-        t_feat = self.temporal_branch.extract_features(points)
-
-        # Spatial branch expects dict or tensor with aux
-        s_feat = self.spatial_branch.extract_features(points, aux_input=aux_input)
-
-        # Auxiliary branch logits (for aux loss during training)
-        self.temporal_logits = self.temporal_aux_cls(t_feat)
-        self.spatial_logits = self.spatial_aux_cls(s_feat)
-
-        # Project to fusion dimension
-        t_proj = self.temporal_proj(t_feat)
-        s_proj = self.spatial_proj(s_feat)
-
-        # Concatenate both projections
-        fused = torch.cat([t_proj, s_proj], dim=1)  # (batch, fusion_dim * 2)
-
-        return fused
-
-    def get_auxiliary_loss(self):
-        """Return auxiliary branch classification losses."""
-        if not self.training or self.temporal_logits is None:
-            return None
-        # We don't have labels here — main.py computes aux loss from
-        # self.temporal_logits / self.spatial_logits via the branch loss monitor.
-        # Return None and let main.py handle it.
-        return None
+    def _single_pass(self, points, aux_input):
+        """One forward pass with current random point sampling."""
+        with torch.no_grad():
+            t_feat = self.temporal_branch.extract_features(points)
+            s_feat = self.spatial_branch.extract_features(points, aux_input=aux_input)
+            t_logits = self.temporal_branch.classify_features(t_feat)
+            s_logits = self.spatial_branch.classifier(s_feat)
+        return t_logits, s_logits
 
     def forward(self, inputs):
-        fused = self.extract_features(inputs)
-        return self.classifier(fused)
+        if isinstance(inputs, dict):
+            points = inputs['points']
+            aux_input = inputs
+        else:
+            points = inputs
+            aux_input = None
+
+        K = self.tta_k if not self.training else 1
+
+        if K == 1:
+            t_logits, s_logits = self._single_pass(points, aux_input)
+            self.temporal_logits = t_logits
+            self.spatial_logits = s_logits
+        else:
+            # Average logits and probabilities over K random point samples
+            all_t = []
+            all_s = []
+            for _ in range(K):
+                t_logits, s_logits = self._single_pass(points, aux_input)
+                all_t.append(t_logits)
+                all_s.append(s_logits)
+            # Average logits for gate input (smoother signal)
+            t_logits = torch.stack(all_t).mean(0)
+            s_logits = torch.stack(all_s).mean(0)
+            self.temporal_logits = t_logits
+            self.spatial_logits = s_logits
+
+        # Gate from (averaged) logits
+        gate_input = torch.cat([t_logits, s_logits], dim=1)
+        gate_weights = torch.sigmoid(self.gate(gate_input))
+
+        t_probs = F.softmax(t_logits, dim=1)
+        s_probs = F.softmax(s_logits, dim=1)
+
+        fused = gate_weights * t_probs + (1 - gate_weights) * s_probs
+        return torch.log(fused + 1e-8)

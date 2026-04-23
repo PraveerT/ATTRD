@@ -426,8 +426,12 @@ class NvidiaQuaternionQCCParityLoader(NvidiaQuaternionQCCLoader):
         correspondence_cache=True,
         correspondence_cache_tag="corr_qcc_parity_v2",
         bidirectional_correspondence=True,
+        assignment_mode="mutual",
     ):
         self.bidirectional_correspondence = bidirectional_correspondence
+        if assignment_mode not in ("mutual", "hungarian"):
+            raise ValueError(f"assignment_mode must be 'mutual' or 'hungarian', got {assignment_mode}")
+        self.assignment_mode = assignment_mode
         super().__init__(
             framerate=framerate,
             valid_subject=valid_subject,
@@ -667,7 +671,10 @@ class NvidiaQuaternionQCCParityLoader(NvidiaQuaternionQCCLoader):
                 'corr_full_weight': cached['corr_full_weight'].astype(np.float32),
             }
 
-        correspondence = self._build_full_correspondence(raw_depth, raw_points)
+        if self.assignment_mode == "hungarian":
+            correspondence = self._build_full_correspondence_hungarian(raw_depth, raw_points)
+        else:
+            correspondence = self._build_full_correspondence(raw_depth, raw_points)
         if self.correspondence_cache:
             tmp_path = "{}.{}.tmp.npz".format(cache_path[:-4], os.getpid())
             np.savez_compressed(
@@ -684,6 +691,12 @@ class NvidiaQuaternionQCCParityLoader(NvidiaQuaternionQCCLoader):
 
     def _full_correspondence_cache_path(self, raw_depth_path):
         direction_tag = "bi" if self.bidirectional_correspondence else "uni"
+        if self.assignment_mode == "hungarian":
+            return "{}_{}_hu_r{}.npz".format(
+                raw_depth_path[:-4],
+                self.correspondence_cache_tag,
+                self.correspondence_radius,
+            )
         return "{}_{}_{}_r{}.npz".format(
             raw_depth_path[:-4],
             self.correspondence_cache_tag,
@@ -740,6 +753,72 @@ class NvidiaQuaternionQCCParityLoader(NvidiaQuaternionQCCLoader):
         return {
             'corr_full_target_idx': corr_full_target_idx,
             'corr_full_weight': corr_full_weight,
+        }
+
+    def _match_dense_points_vec(self, depth_frame, source_points):
+        height, width = depth_frame.shape
+        n = source_points.shape[0]
+        r = self.correspondence_radius
+        sr = np.clip(np.round(source_points[:, 0]).astype(np.int32), 0, height - 1)
+        sc = np.clip(np.round(source_points[:, 1]).astype(np.int32), 0, width - 1)
+        sd = source_points[:, 2].astype(np.float32)
+        drs, dcs = np.meshgrid(np.arange(-r, r + 1), np.arange(-r, r + 1), indexing="ij")
+        drs = drs.ravel().astype(np.int32)
+        dcs = dcs.ravel().astype(np.int32)
+        rr = sr[:, None] + drs[None, :]
+        cc = sc[:, None] + dcs[None, :]
+        in_bounds = (rr >= 0) & (rr < height) & (cc >= 0) & (cc < width)
+        rr_c = np.clip(rr, 0, height - 1)
+        cc_c = np.clip(cc, 0, width - 1)
+        cand_depth = depth_frame[rr_c, cc_c].astype(np.float32)
+        valid_pix = in_bounds & (cand_depth > 0)
+        spatial = (drs * drs + dcs * dcs).astype(np.float32)
+        score = spatial[None, :] + self.correspondence_depth_weight * np.abs(cand_depth - sd[:, None])
+        score = np.where(valid_pix, score, np.inf)
+        best = np.argmin(score, axis=1)
+        best_score = score[np.arange(n), best]
+        ok = np.isfinite(best_score)
+        matched = np.stack(
+            [rr[np.arange(n), best], cc[np.arange(n), best], cand_depth[np.arange(n), best]],
+            axis=1,
+        ).astype(np.float32)
+        return matched, ok
+
+    def _build_full_correspondence_hungarian(self, raw_depth, raw_points):
+        from scipy.optimize import linear_sum_assignment
+        frame_count, point_count, _ = raw_points.shape
+        total_points = frame_count * point_count
+        corr_full_target_idx = np.full(total_points, -1, dtype=np.int64)
+        corr_full_weight = np.zeros(total_points, dtype=np.float32)
+        big_cost = np.float32(1e8)
+
+        for frame_idx in range(frame_count - 1):
+            source_points = raw_points[frame_idx, :, :3]
+            target_points = raw_points[frame_idx + 1, :, :3]
+            matched, ok = self._match_dense_points_vec(raw_depth[frame_idx + 1], source_points)
+            diff = target_points[None, :, :3] - matched[:, None, :3]
+            cost = (
+                diff[..., 0] ** 2
+                + diff[..., 1] ** 2
+                + self.correspondence_sample_weight * diff[..., 2] ** 2
+            ).astype(np.float32)
+            cost_masked = np.where(ok[:, None], cost, big_cost)
+            row, col = linear_sum_assignment(cost_masked)
+            assigned_cost = cost_masked[row, col]
+            keep = (assigned_cost <= self.correspondence_max_dist) & ok[row]
+            kept_row = row[keep]
+            kept_col = col[keep]
+            kept_cost = assigned_cost[keep].astype(np.float32)
+            conf = 1.0 / (1.0 + kept_cost / max(self.correspondence_confidence_scale, 1e-6))
+            conf = conf.astype(np.float32)
+            source_flat = frame_idx * point_count + kept_row
+            target_flat = (frame_idx + 1) * point_count + kept_col
+            corr_full_target_idx[source_flat] = target_flat
+            corr_full_weight[source_flat] = conf
+
+        return {
+            "corr_full_target_idx": corr_full_target_idx,
+            "corr_full_weight": corr_full_weight,
         }
 
     def _frame_best_matches(self, source_points, target_points, target_depth_frame):

@@ -1,0 +1,61 @@
+PMamba loaded. missing=0 unexpected=0
+v26a loaded. missing=0 unexpected=0
+Loaded global dataset statistics for consistent normalization
+482
+Loaded global dataset statistics for consistent normalization
+482
+Test samples: 482
+  0/482  pmamba=100.0%  quat=100.0%
+  50/482  pmamba=68.6%  quat=68.6%
+  100/482  pmamba=74.3%  quat=66.3%
+  150/482  pmamba=74.8%  quat=68.2%
+  200/482  pmamba=68.7%  quat=67.7%
+  250/482  pmamba=73.3%  quat=71.3%
+  300/482  pmamba=73.8%  quat=72.8%
+  350/482  pmamba=73.8%  quat=74.4%
+  400/482  pmamba=76.3%  quat=75.6%
+  450/482  pmamba=78.7%  quat=75.8%
+
+========================================================
+PMamba accuracy:      79.25% (382/482)
+v26a accuracy:        76.56% (369/482)
+Oracle (either):      87.34% (421/482)
+========================================================
+Both correct:         330  ( 68.5%)
+Only PMamba:           52  ( 10.8%)
+Only v26a:             39  (  8.1%)
+Both wrong:            61  ( 12.7%)
+========================================================
+Complementarity (exactly-one): 91
+Headroom over best single:     +8.09pp
+
+========================================================
+Late Fusion: alpha * PMamba_softmax + (1-alpha) * v26a_softmax
+========================================================
+  alpha=0.00  acc= 76.56%  (369/482)
+  alpha=0.05  acc= 76.76%  (370/482)
+  alpha=0.10  acc= 77.39%  (373/482)
+  alpha=0.15  acc= 77.18%  (372/482)
+  alpha=0.20  acc= 77.59%  (374/482)
+  alpha=0.25  acc= 77.80%  (375/482)
+  alpha=0.30  acc= 77.80%  (375/482)
+  alpha=0.35  acc= 79.25%  (382/482)
+  alpha=0.40  acc= 79.88%  (385/482)
+  alpha=0.45  acc= 80.50%  (388/482)
+  alpha=0.50  acc= 79.67%  (384/482)
+  alpha=0.55  acc= 80.08%  (386/482)
+  alpha=0.60  acc= 81.12%  (391/482)
+  alpha=0.65  acc= 81.74%  (394/482)
+  alpha=0.70  acc= 81.74%  (394/482)
+  alpha=0.75  acc= 81.12%  (391/482)
+  alpha=0.80  acc= 80.71%  (389/482)
+  alpha=0.85  acc= 80.08%  (386/482)
+  alpha=0.90  acc= 80.29%  (387/482)
+  alpha=0.95  acc= 79.88%  (385/482)
+  alpha=1.00  acc= 79.25%  (382/482)
+
+Best late fusion: alpha=0.65 -> 81.74%
+Lift over PMamba: +2.49pp
+Lift over v26a:   +5.19pp
+Oracle ceiling:   87.34%
+Fusion vs oracle: 48.1% of available headroom captured
