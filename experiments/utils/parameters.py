@@ -81,6 +81,12 @@ def get_parser():
         default=True,
         help='dynamically schedule pts_size during training instead of keeping it fixed')
     parser.add_argument(
+        '--pts-random-range',
+        type=int,
+        nargs='*',
+        default=None,
+        help='if set [lo, hi], sample pts uniformly each epoch in this range (overrides default dynamic past ep 100)')
+    parser.add_argument(
         '--freeze',
         type=str,
         default=None,

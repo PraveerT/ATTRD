@@ -300,8 +300,12 @@ class Processor():
                 # Use quadratic progression for faster increase
                 pts_size = int(128 + (256 - 128) * (progress ** 2))
             else:
-                # Keep at maximum after epoch 100
-                pts_size = 256
+                rr = getattr(self.arg, 'pts_random_range', None)
+                if rr:
+                    import random as _rnd
+                    pts_size = _rnd.randint(int(rr[0]), int(rr[1]))
+                else:
+                    pts_size = 256
             
             # Update model's pts_size
             model_ref.pts_size = pts_size
