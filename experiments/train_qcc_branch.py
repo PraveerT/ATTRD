@@ -1,14 +1,11 @@
-"""TinyKNN with Cfbq input (10ch) + QCC aux losses.
+"""Train QCC branch: tiny dualstream + pair_cyc (qf*qb-I) on Cfbq mutual.
 
-Variants run sequentially:
-  V1  predict per-pair q_fwd from per-frame features; loss = 1 - |q_pred · q_gt|
-  V3  predict per-pair (q_fwd, tr_fwd); loss = sandwich consistency
-       || quat_rotate(q_pred, xyz[t]) + tr_pred - xyz[t+1] ||^2  (matched pts only)
+Saves model state_dict and test logits to work_dir/qcc_branch/ for fusion
+analyses and reproducibility.
 
-Both variants keep the classification head/loss identical to the 82.57 winner.
-Aux loss weight a hyper-param (sweep small).
+Final test acc target: ~82-84 (matches Cfbq baseline within seed noise).
 """
-import sys
+import sys, os
 sys.path.insert(0, '/notebooks/PMamba/experiments')
 import torch, torch.nn as nn, torch.nn.functional as F, numpy as np, math, requests
 import nvidia_dataloader
@@ -57,17 +54,7 @@ def hamilton(a, b):
     ], dim=-1)
 
 
-def quat_rotate_pts_batched(q, points):
-    """q: (B,4) unit, points: (B,N,3) -> (B,N,3)."""
-    B, N, _ = points.shape
-    q_b = q.unsqueeze(1).expand(B, N, 4)
-    pq = torch.cat([torch.zeros(B, N, 1, device=points.device, dtype=points.dtype), points], dim=-1)
-    q_conj = torch.cat([q_b[..., 0:1], -q_b[..., 1:]], dim=-1)
-    return hamilton(hamilton(q_b, pq), q_conj)[..., 1:]
-
-
-def quat_rotate_pts_single(q, points):
-    """q: (4,) unit, points: (N,3) -> (N,3)."""
+def quat_rotate_pts(q, points):
     N = points.shape[0]
     q_b = q.unsqueeze(0).expand(N, -1)
     pq = torch.cat([torch.zeros(N, 1, device=points.device, dtype=points.dtype), points], dim=-1)
@@ -89,7 +76,7 @@ def kabsch_quat(src, tgt, mask):
     D = torch.diag_embed(torch.stack([torch.ones_like(det), torch.ones_like(det), det], dim=-1))
     R = V @ D @ U.transpose(-1, -2)
     q = rot_to_quat(R[0])
-    t = tm.squeeze(0).squeeze(0) - quat_rotate_pts_single(q, sm.squeeze(0).squeeze(0).unsqueeze(0))[0]
+    t = tm.squeeze(0).squeeze(0) - quat_rotate_pts(q, sm.squeeze(0).squeeze(0).unsqueeze(0))[0]
     return q, t
 
 
@@ -119,19 +106,17 @@ def corr_sample_indices(orig_flat_idx, corr_target, corr_weight, pts_size, F_, P
 
 
 PTS = 256
+IDENT = torch.tensor([1.0, 0.0, 0.0, 0.0])
 
 
 def collect(phase):
-    """Cfbq features + per-pair Kabsch q,tr targets + matched mask."""
     loader = nvidia_dataloader.NvidiaQuaternionQCCParityLoader(
-        framerate=32, phase=phase, return_correspondence=True, assignment_mode='hungarian')
+        framerate=32, phase=phase, return_correspondence=True)  # mutual default
     N = len(loader)
     XYZ = np.zeros((N, 32, PTS, 3), dtype=np.float32)
     RF = np.zeros((N, 32, PTS, 3), dtype=np.float32)
     RB = np.zeros((N, 32, PTS, 3), dtype=np.float32)
-    QF = np.zeros((N, 31, 4), dtype=np.float32)
-    TR = np.zeros((N, 31, 3), dtype=np.float32)
-    MATCH = np.zeros((N, 31, PTS), dtype=np.float32)  # mask used for kabsch
+    PAIRCYC = np.zeros((N, 32, 4), dtype=np.float32)
     labels = np.zeros(N, dtype=np.int64)
     for i in range(N):
         s = loader[i]; pts_d = s[0]; label = s[1]
@@ -146,29 +131,30 @@ def collect(phase):
         XYZ[i] = xyz_s.cpu().numpy()
         for t in range(F_ - 1):
             qf, trf = kabsch_quat(xyz_s[t], xyz_s[t+1], matched[t])
-            RF[i, t+1] = (xyz_s[t+1] - (quat_rotate_pts_single(qf, xyz_s[t]) + trf)).cpu().numpy()
             qb, trb = kabsch_quat(xyz_s[t+1], xyz_s[t], matched[t])
-            RB[i, t]   = (xyz_s[t]   - (quat_rotate_pts_single(qb, xyz_s[t+1]) + trb)).cpu().numpy()
-            QF[i, t] = qf.cpu().numpy()
-            TR[i, t] = trf.cpu().numpy()
-            MATCH[i, t] = matched[t].float().cpu().numpy()
+            RF[i, t+1] = (xyz_s[t+1] - (quat_rotate_pts(qf, xyz_s[t]) + trf)).cpu().numpy()
+            RB[i, t]   = (xyz_s[t]   - (quat_rotate_pts(qb, xyz_s[t+1]) + trb)).cpu().numpy()
+            qcyc = hamilton(qf.unsqueeze(0), qb.unsqueeze(0))[0]
+            qcyc = F.normalize(qcyc, dim=-1)
+            if (qcyc * IDENT.to(qcyc.device)).sum() < 0:
+                qcyc = -qcyc
+            PAIRCYC[i, t] = (qcyc - IDENT.to(qcyc.device)).cpu().numpy()
         labels[i] = label
         if (i+1) % 300 == 0:
-            print(f'  collect {phase} {i+1}/{N}')
-    return (torch.from_numpy(XYZ), torch.from_numpy(RF), torch.from_numpy(RB),
-            torch.from_numpy(QF), torch.from_numpy(TR), torch.from_numpy(MATCH),
+            print(f'  {phase} {i+1}/{N}')
+    return (torch.from_numpy(XYZ), torch.from_numpy(RF),
+            torch.from_numpy(RB), torch.from_numpy(PAIRCYC),
             torch.from_numpy(labels))
 
 
-print('=== Phase A: Cfbq features + Kabsch targets ===')
-xyz_tr, rf_tr, rb_tr, qf_tr, tr_tr, m_tr, y_tr = collect('train')
-xyz_te, rf_te, rb_te, qf_te, tr_te, m_te, y_te = collect('test')
+print('=== Phase A: Cfbq + pair_cyc features (mutual) ===')
+xyz_tr, rf_tr, rb_tr, pc_tr, y_tr = collect('train')
+xyz_te, rf_te, rb_te, pc_te, y_te = collect('test')
 T = 32
 t_tr_ch = torch.linspace(0, 1, T).view(1, T, 1, 1).expand(xyz_tr.shape[0], T, PTS, 1)
 t_te_ch = torch.linspace(0, 1, T).view(1, T, 1, 1).expand(xyz_te.shape[0], T, PTS, 1)
-C_tr = torch.cat([xyz_tr, rf_tr, rb_tr, t_tr_ch], dim=-1)  # 10ch
+C_tr = torch.cat([xyz_tr, rf_tr, rb_tr, t_tr_ch], dim=-1)  # 10ch per-point
 C_te = torch.cat([xyz_te, rf_te, rb_te, t_te_ch], dim=-1)
-print(f"C_tr shape {C_tr.shape}")
 
 
 def knn_xyz(xyz, k):
@@ -202,17 +188,18 @@ class EdgeConv(nn.Module):
         return h.max(-1).values.transpose(1, 2)
 
 
-class TinyKNNAux(nn.Module):
-    """Tiny KNN with optional aux head exposing per-frame features post-pooling."""
-
-    def __init__(self, in_ch=10, num_classes=25, k=16, aux_out=0):
+class TinyDualStream(nn.Module):
+    """Per-point Cfbq 10ch + per-frame pair_cyc 4ch via separate stream."""
+    def __init__(self, in_ch=10, num_classes=25, k=16, fr_in=4, fr_out=64):
         super().__init__()
-        self.aux_out = aux_out
         self.edge = EdgeConv(in_ch=in_ch, out_ch=128, k=k)
         self.pt_mlp = nn.Sequential(
             nn.Linear(128 + in_ch, 128), nn.LayerNorm(128), nn.GELU(),
             nn.Linear(128, 256), nn.LayerNorm(256), nn.GELU())
-        self.proj = nn.Conv1d(512, 256, 1)
+        self.fr_mlp = nn.Sequential(
+            nn.Linear(fr_in, 32), nn.GELU(),
+            nn.Linear(32, fr_out))
+        self.proj = nn.Conv1d(512 + fr_out, 256, 1)
         self.c1 = nn.Conv1d(256,256,3,padding=1); self.b1 = nn.BatchNorm1d(256)
         self.c2 = nn.Conv1d(256,256,3,padding=1); self.b2 = nn.BatchNorm1d(256)
         self.c3 = nn.Conv1d(256,256,3,padding=1); self.b3 = nn.BatchNorm1d(256)
@@ -220,165 +207,86 @@ class TinyKNNAux(nn.Module):
         self.drop = nn.Dropout(0.2)
         self.head = nn.Sequential(nn.Linear(256, 128), nn.GELU(), nn.Dropout(0.3),
                                   nn.Linear(128, num_classes))
-        if aux_out > 0:
-            # Per-frame-pair head: concat f[t] (256) and f[t+1] (256) -> aux_out
-            self.aux_head = nn.Sequential(
-                nn.Linear(512, 128), nn.GELU(),
-                nn.Linear(128, aux_out))
 
-    def forward(self, x):
-        B, T_, P_, C_ = x.shape
-        x_bt = x.reshape(B*T_, P_, C_)
+    def forward(self, x_pt, x_fr):
+        B, T_, P_, C_ = x_pt.shape
+        x_bt = x_pt.reshape(B*T_, P_, C_)
         local = self.edge(x_bt)
         h = torch.cat([local, x_bt], dim=-1)
         h = self.pt_mlp(h).reshape(B, T_, P_, -1)
-        # Per-frame feature (B, T, 512) before any time conv
-        per_frame = torch.cat([h.max(2).values, h.mean(2)], dim=-1)
-        h_seq = per_frame.transpose(1, 2)  # (B, 512, T)
+        per_frame_pt = torch.cat([h.max(2).values, h.mean(2)], dim=-1)
+        per_frame_fr = self.fr_mlp(x_fr)
+        per_frame = torch.cat([per_frame_pt, per_frame_fr], dim=-1)
+        h_seq = per_frame.transpose(1, 2)
         h_seq = self.proj(h_seq)
         h_seq = F.gelu(self.b1(self.c1(h_seq)))
         h_seq = h_seq + F.gelu(self.b2(self.c2(h_seq)))
         h_seq = h_seq + F.gelu(self.b3(self.c3(h_seq)))
         h_seq = h_seq + F.gelu(self.b4(self.c4(h_seq)))
-        # Aux head over pairs of per_frame features
-        aux = None
-        if self.aux_out > 0:
-            f_t = per_frame[:, :-1]    # (B, T-1, 512)
-            f_n = per_frame[:, 1:]     # (B, T-1, 512)
-            aux_in = torch.cat([f_t, f_n], dim=-1)  # (B, T-1, 1024) — but head is (512 -> 128)
-            # Actually aux_head expects 512 input. Use sum/concat fusion -> reduce.
-            aux_in_red = f_t + f_n     # simple sum fusion to 512
-            aux = self.aux_head(aux_in_red)  # (B, T-1, aux_out)
-        h_out = self.drop(h_seq).max(-1).values
-        logits = self.head(h_out)
-        return logits, aux
+        h_seq = self.drop(h_seq).max(-1).values
+        return self.head(h_seq)
 
 
-def quat_dist_loss(q_pred, q_gt):
-    """1 - |<q_pred, q_gt>|. q_pred (B,T-1,4), q_gt (B,T-1,4). Both unit."""
-    q_pred = F.normalize(q_pred, dim=-1)
-    dot = (q_pred * q_gt).sum(-1).abs()
-    return (1 - dot).mean()
+SAVE_DIR = '/notebooks/PMamba/experiments/work_dir/qcc_branch'
+os.makedirs(SAVE_DIR, exist_ok=True)
 
 
-def sandwich_loss(q_pred, tr_pred, xyz_t, xyz_n, mask):
-    """|| q_pred · xyz[t] + tr_pred - xyz[t+1] ||^2 over matched points.
-    q_pred (B,T-1,4), tr_pred (B,T-1,3), xyz_t/xyz_n (B,T-1,P,3), mask (B,T-1,P).
-    """
-    Bs, Tm, P, _ = xyz_t.shape
-    qn = F.normalize(q_pred, dim=-1)
-    qf = qn.reshape(Bs * Tm, 4)
-    pts_t = xyz_t.reshape(Bs * Tm, P, 3)
-    rotated = quat_rotate_pts_batched(qf, pts_t).reshape(Bs, Tm, P, 3)
-    pred = rotated + tr_pred.unsqueeze(2)
-    diff = (pred - xyz_n) ** 2
-    diff = diff.sum(-1)  # (B,T-1,P)
-    mw = mask.clamp(min=0)
-    denom = mw.sum().clamp(min=1.0)
-    return (diff * mw).sum() / denom
-
-
-def train_eval(seed, X_tr, y_tr, X_te, y_te,
-               qf_tr, tr_tr, m_tr,
-               aux_kind, aux_weight,
-               epochs=120, bs=16, lr=2e-3, k=16, in_ch=10):
-    """aux_kind: 'none' | 'quatdist' | 'sandwich'."""
+def train_eval(seed, X_tr_pt, X_tr_fr, y_tr, X_te_pt, X_te_fr, y_te,
+               epochs=120, bs=16, lr=2e-3, k=16):
     torch.manual_seed(seed); np.random.seed(seed); torch.cuda.manual_seed_all(seed)
-    aux_out = 4 if aux_kind == 'quatdist' else (7 if aux_kind == 'sandwich' else 0)
-    model = TinyKNNAux(in_ch=in_ch, k=k, aux_out=aux_out).cuda()
-    print(f"[{aux_kind}] aux_w={aux_weight} params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
+    model = TinyDualStream(in_ch=10, k=k).cuda()
+    print(f"params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     warmup = 5
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda ep: (ep+1)/warmup if ep<warmup
         else 0.5*(1+math.cos(math.pi*(ep-warmup)/max(1,epochs-warmup))))
-    X_tr_c = X_tr.cuda(); y_tr_c = y_tr.cuda()
-    X_te_c = X_te.cuda(); y_te_c = y_te.cuda()
-    qf_tr_c = qf_tr.cuda(); tr_tr_c = tr_tr.cuda(); m_tr_c = m_tr.cuda()
-    best = 0.0; best_ep = -1; best_logits = None
+    Xtr_pt = X_tr_pt.cuda(); Xtr_fr = X_tr_fr.cuda(); y_tr_c = y_tr.cuda()
+    Xte_pt = X_te_pt.cuda(); Xte_fr = X_te_fr.cuda(); y_te_c = y_te.cuda()
+    best = 0.0; best_ep = -1; best_logits = None; best_state = None
     for ep in range(epochs):
         model.train()
         g = torch.Generator(device='cpu'); g.manual_seed(seed*1000+ep)
-        perm = torch.randperm(len(X_tr), generator=g)
-        cls_loss_acc, aux_loss_acc, n_batches = 0.0, 0.0, 0
-        for i in range(0, len(X_tr), bs):
+        perm = torch.randperm(len(X_tr_pt), generator=g)
+        for i in range(0, len(X_tr_pt), bs):
             idx = perm[i:i+bs]
-            xb = X_tr_c[idx]; yb = y_tr_c[idx]
-            qf_b = qf_tr_c[idx]; tr_b = tr_tr_c[idx]; m_b = m_tr_c[idx]
-            B_, T_, P_, _ = xb.shape
-            xb = xb * (torch.rand(B_, 1, P_, 1, device=xb.device) > 0.10).float()
+            xb_pt = Xtr_pt[idx]; xb_fr = Xtr_fr[idx]; yb = y_tr_c[idx]
+            B_, T_, P_, _ = xb_pt.shape
+            xb_pt = xb_pt * (torch.rand(B_, 1, P_, 1, device=xb_pt.device) > 0.10).float()
             opt.zero_grad()
-            logits, aux = model(xb)
-            loss_cls = F.cross_entropy(logits, yb, label_smoothing=0.1)
-            loss_aux = torch.zeros((), device=logits.device)
-            if aux_kind == 'quatdist':
-                loss_aux = quat_dist_loss(aux, qf_b)
-            elif aux_kind == 'sandwich':
-                q_pred = aux[..., :4]
-                tr_pred = aux[..., 4:7]
-                xyz_t = xb[:, :-1, :, :3]
-                xyz_n = xb[:, 1:,  :, :3]
-                loss_aux = sandwich_loss(q_pred, tr_pred, xyz_t, xyz_n, m_b)
-            loss = loss_cls + aux_weight * loss_aux
+            loss = F.cross_entropy(model(xb_pt, xb_fr), yb, label_smoothing=0.1)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
-            cls_loss_acc += loss_cls.item(); aux_loss_acc += float(loss_aux); n_batches += 1
         sched.step()
         model.eval()
         with torch.no_grad():
             lg = []
-            for i in range(0, len(X_te), 32):
-                logits_te, _ = model(X_te_c[i:i+32])
-                lg.append(logits_te.cpu())
+            for i in range(0, len(X_te_pt), 32):
+                lg.append(model(Xte_pt[i:i+32], Xte_fr[i:i+32]).cpu())
             lg = torch.cat(lg, 0)
             acc = (lg.argmax(-1).cuda() == y_te_c).float().mean().item()
-        if acc > best: best = acc; best_ep = ep; best_logits = lg.clone()
-        if ep % 10 == 0 or ep == epochs - 1:
-            print(f"  ep{ep:3d} te={acc*100:5.2f} best={best*100:5.2f}(ep{best_ep})  "
-                  f"cls={cls_loss_acc/n_batches:.3f} aux={aux_loss_acc/n_batches:.3f}")
-    return best, best_logits
+        if acc > best:
+            best = acc; best_ep = ep; best_logits = lg.clone()
+            best_state = {k_: v.detach().cpu().clone() for k_, v in model.state_dict().items()}
+        if ep % 5 == 0 or ep == epochs - 1:
+            print(f"  ep{ep:3d} te={acc*100:5.2f} best={best*100:5.2f}(ep{best_ep})")
+    return best, best_ep, best_logits, best_state
 
 
-print('\n=== V0: baseline (no aux, 10ch Cfbq) — sanity check vs 82.57 ===')
-tg("Tiny Cfbq+QCC aux: V0 baseline starting.")
-acc0, _ = train_eval(1, C_tr, y_tr, C_te, y_te, qf_tr, tr_tr, m_tr,
-                     aux_kind='none', aux_weight=0.0)
-tg(f"V0 baseline: {acc0*100:.2f}%")
+print('\n=== Phase B: Train QCC branch (V2 dualstream + pair_cyc) ===')
+tg("QCC branch training starting (V2 dualstream + pair_cyc).")
+acc, best_ep, logits, state = train_eval(1, C_tr, pc_tr, y_tr, C_te, pc_te, y_te,
+                                          epochs=120, k=16)
 
-print('\n=== V1: quat-distance aux (predict q_fwd, loss=1-|q·q_gt|) ===')
-results_v1 = {}
-for w in [0.1, 0.5, 1.0]:
-    acc, _ = train_eval(1, C_tr, y_tr, C_te, y_te, qf_tr, tr_tr, m_tr,
-                        aux_kind='quatdist', aux_weight=w)
-    results_v1[w] = acc
-    print(f"  V1 w={w}: {acc*100:.2f}%")
-tg(f"V1 quatdist results: {results_v1}")
+# Save model state_dict
+torch.save({'model_state_dict': state, 'best_acc': acc, 'best_ep': best_ep, 'seed': 1},
+           f'{SAVE_DIR}/best_model.pt')
+print(f"saved {SAVE_DIR}/best_model.pt at acc={acc*100:.2f}% (ep{best_ep})")
 
-print('\n=== V3: sandwich consistency aux (predict q+tr, loss=||q·p+tr-p\'||^2) ===')
-results_v3 = {}
-for w in [0.1, 0.5, 1.0]:
-    acc, _ = train_eval(1, C_tr, y_tr, C_te, y_te, qf_tr, tr_tr, m_tr,
-                        aux_kind='sandwich', aux_weight=w)
-    results_v3[w] = acc
-    print(f"  V3 w={w}: {acc*100:.2f}%")
-tg(f"V3 sandwich results: {results_v3}")
+# Save test logits
+np.savez(f'{SAVE_DIR}/test_logits.npz',
+         logits=logits.numpy(), labels=y_te.numpy(),
+         acc=acc, best_ep=best_ep, seed=1)
+print(f"saved {SAVE_DIR}/test_logits.npz")
 
-
-msg = f"""
-=== Tiny + Cfbq (10ch) + QCC aux loss ===
-V0 baseline (no aux):     {acc0*100:.2f}%
-TinyKNN Cfbq prior best:  82.57%
-
-V1 quat-distance:
-""" + "\n".join([f"  w={w}: {r*100:.2f}%" for w, r in results_v1.items()]) + """
-
-V3 sandwich consistency:
-""" + "\n".join([f"  w={w}: {r*100:.2f}%" for w, r in results_v3.items()])
-
-print(msg); tg(msg)
-
-np.savez('/tmp/tiny_cfbq_qcc_aux.npz',
-         baseline=acc0,
-         v1_results={str(w): r for w, r in results_v1.items()},
-         v3_results={str(w): r for w, r in results_v3.items()})
-print("saved /tmp/tiny_cfbq_qcc_aux.npz")
+tg(f"QCC branch final: {acc*100:.2f}% at ep{best_ep}, saved to work_dir/qcc_branch/")
