@@ -58,6 +58,7 @@ class MLPBlock(nn.Module):
 class MotionBlock(nn.Module):
     def __init__(self, out_channel, dimension, embedding_dim):
         super(MotionBlock, self).__init__()
+        self.embedding_dim = embedding_dim
         self.layer_list = []
         if dimension == 1:
             self.layer_list.append(
@@ -119,8 +120,8 @@ class MotionBlock(nn.Module):
             self.channel_attention = None
 
     def forward(self, output):
-        position_embedding = self.layer_list[0](output[:, :4])
-        feature_embedding = output[:, 4:]
+        position_embedding = self.layer_list[0](output[:, :self.embedding_dim])
+        feature_embedding = output[:, self.embedding_dim:]
         for layer in self.layer_list[1:]:
             feature_embedding = layer(feature_embedding)
         
@@ -177,7 +178,7 @@ class GroupOperation(object):
             
         return offsets
 
-    def st_group_points(self, array, interval, distance_dim, knn, dim):
+    def st_group_points(self, array, interval, distance_dim, knn, dim, coord_dim=4):
         """
         Spatio-temporal grouping with optimized batch processing.
         """
@@ -212,14 +213,14 @@ class GroupOperation(object):
         array_expanded = array.unsqueeze(-1).expand_as(neighbor)
         
         # Enhanced feature computation with relative positions and features
-        position_diff = array_expanded[:, :4] - neighbor[:, :4]
-        
+        position_diff = array_expanded[:, :coord_dim] - neighbor[:, :coord_dim]
+
         # Option to include distance as additional feature
-        if channels > 4:
+        if channels > coord_dim:
             ret_features = torch.cat([
-                position_diff,           # Relative positions
-                array_expanded[:, 4:],   # Source features
-                neighbor[:, 4:]          # Neighbor features
+                position_diff,                  # Relative positions
+                array_expanded[:, coord_dim:],  # Source features
+                neighbor[:, coord_dim:]         # Neighbor features
             ], dim=1)
         else:
             ret_features = position_diff

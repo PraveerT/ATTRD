@@ -215,16 +215,17 @@ class MambaTemporalEncoder(nn.Module):
 
 class Motion(nn.Module):
     def __init__(self, num_classes, pts_size, topk=16, downsample=(2, 2, 2),
-                 knn=(16, 48, 48, 24)):
+                 knn=(16, 48, 48, 24), coord_channels=4):
         super(Motion, self).__init__()
-        self.stage1 = MLPBlock([4, 32, 64], 2)
+        self.coord_channels = coord_channels
+        self.stage1 = MLPBlock([coord_channels, 32, 64], 2)
         self.pool1 = nn.AdaptiveMaxPool2d((None, 1))
-        self.stage2 = MotionBlock([128, 128, ], 2, 4)
+        self.stage2 = MotionBlock([128, 128, ], 2, coord_channels)
         self.pool2 = nn.AdaptiveMaxPool2d((None, 1))
-        self.stage3 = MotionBlock([256, 256, ], 2, 4)
+        self.stage3 = MotionBlock([256, 256, ], 2, coord_channels)
         self.pool3 = nn.AdaptiveMaxPool2d((None, 1))
         # Stage 4 removed to reduce overfitting and improve efficiency
-        self.stage5 = MLPBlock([260, 1024], 2)  # Updated from 512 to 260 (fea3 channels)
+        self.stage5 = MLPBlock([256 + coord_channels, 1024], 2)  # Updated from 512 to 260 (fea3 channels)
         self.pool5 = nn.AdaptiveMaxPool2d((1, 1))
         self.stage6 = MLPBlock([1024, num_classes], 2, with_bn=False)
         self.global_bn = nn.BatchNorm2d(1024)
@@ -238,7 +239,7 @@ class Motion(nn.Module):
         self.mamba = MambaTemporalEncoder(in_channels=256, hidden_dim=128, output_dim=256, num_layers=2)
         
         # Add Multi-scale Feature Processor layer after stage2
-        self.multi_scale = MultiScaleFeatureProcessor(in_channels=132, num_scales=4, feature_dim=32)
+        self.multi_scale = MultiScaleFeatureProcessor(in_channels=(coord_channels + 64) * 2 - coord_channels, num_scales=4, feature_dim=32)
         self.feature_dim = 1024
 
     def _sample_points(self, inputs):
@@ -254,7 +255,7 @@ class Motion(nn.Module):
             # Deterministic sampling during testing for consistent results
             indices = torch.linspace(0, point_count - 1, sample_size, device=device).long()
         points = points[:, :, :, indices]
-        return points[:, :4]
+        return points[:, :self.coord_channels]
 
     def _encode_sampled_points(self, coords):
         batchsize, in_dims, timestep, pts_num = coords.shape
@@ -267,18 +268,18 @@ class Motion(nn.Module):
         fea1 = torch.cat((coords, fea1), dim=1)
 
         # stage 2: inter-frame, early
-        in_dims = fea1.shape[1] * 2 - 4
+        in_dims = fea1.shape[1] * 2 - self.coord_channels
         pts_num //= self.downsample[0]
-        ret_group_array2 = self.group.st_group_points(fea1, 3, [0, 1, 2], self.knn[1], 3)
+        ret_group_array2 = self.group.st_group_points(fea1, 3, [0, 1, 2], self.knn[1], 3, coord_dim=self.coord_channels)
         ret_array2, coords = self.select_ind(ret_group_array2, coords, batchsize, in_dims, timestep, pts_num)
         fea2 = self.pool2(self.stage2(ret_array2)).reshape(batchsize, -1, timestep, pts_num)
         fea2 = torch.cat((coords, fea2), dim=1)
         fea2 = self.multi_scale(fea2)
 
         # stage 3: inter-frame, middle, applying mamba in this stage
-        in_dims = fea2.shape[1] * 2 - 4
+        in_dims = fea2.shape[1] * 2 - self.coord_channels
         pts_num //= self.downsample[1]
-        ret_group_array3 = self.group.st_group_points(fea2, 3, [0, 1, 2], self.knn[2], 3)
+        ret_group_array3 = self.group.st_group_points(fea2, 3, [0, 1, 2], self.knn[2], 3, coord_dim=self.coord_channels)
         ret_array3, coords = self.select_ind(ret_group_array3, coords, batchsize, in_dims, timestep, pts_num)
         fea3 = self.pool3(self.stage3(ret_array3)).reshape(batchsize, -1, timestep, pts_num)
         fea3_mamba = self.mamba(fea3)
