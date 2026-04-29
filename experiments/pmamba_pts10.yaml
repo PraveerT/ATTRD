@@ -1,0 +1,55 @@
+# Single-stream 10-channel input: raw uvd-t (4) + nearest-lattice octo (6).
+# Each row in the input is a raw point with corresponded-lattice features
+# attached via per-frame nearest neighbour (xyz). coord_channels=10 lets the
+# patched Motion treat all 10 as coords; KNN distance still uses [0:3] = uvd
+# via distance_dim=[0,1,2]. position_diff & embedding use the full 10.
+
+dataloader: nvidia_pts10_loader.NvidiaPts10Loader
+
+phase: train
+num_epoch: 100
+work_dir: ./work_dir/pmamba_pts10/
+batch_size: 8
+test_batch_size: 1
+num_worker: 8
+
+device: 0
+log_interval: 50
+eval_interval: 1
+save_interval: 5
+
+framesize: 32
+pts_size: 256
+dynamic_pts_size: false
+strict_load: false
+
+weights: null
+
+optimizer_args:
+  optimizer: Adam
+  base_lr: 0.0006
+  step:
+  - 70
+  weight_decay: 0.03
+  start_epoch: 0
+  nesterov: false
+
+train_loader_args:
+  phase: train
+  framerate: 32
+
+test_loader_args:
+  phase: test
+  framerate: 32
+
+model: models.motion.Motion
+model_args:
+  pts_size: 256
+  num_classes: 25
+  knn:
+  - 32
+  - 24
+  - 48
+  - 24
+  topk: 8
+  coord_channels: 10
