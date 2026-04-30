@@ -1,0 +1,57 @@
+# Variant A: pts10 (raw + nearest-lattice) plus per-frame combined forward
+# quaternion (q_fwd_raw · q_fwd_lat) broadcast as 4 extra channels per point.
+# stage1_in_channels = 14; rest of model stays at coord_channels=4.
+# Warmstart from baseline epoch110 padded to 14 channels (last 10 zero-init)
+# with backbone frozen so only stage1 input embedding adapts.
+
+dataloader: nvidia_pts10_qcyc_loader.NvidiaPts10QcycLoader
+
+phase: train
+num_epoch: 30
+work_dir: ./work_dir/pmamba_pts10_qcyc_a/
+batch_size: 8
+test_batch_size: 1
+num_worker: 8
+
+device: 0
+log_interval: 50
+eval_interval: 1
+save_interval: 5
+
+framesize: 32
+pts_size: 256
+dynamic_pts_size: false
+strict_load: false
+
+weights: ./work_dir/pmamba_branch/epoch110_padded_stage1_14ch.pt
+freeze: backbone
+
+optimizer_args:
+  optimizer: Adam
+  base_lr: 0.0001
+  step:
+  - 20
+  weight_decay: 0.03
+  start_epoch: 0
+  nesterov: false
+
+train_loader_args:
+  phase: train
+  framerate: 32
+
+test_loader_args:
+  phase: test
+  framerate: 32
+
+model: models.motion.Motion
+model_args:
+  pts_size: 256
+  num_classes: 25
+  knn:
+  - 32
+  - 24
+  - 48
+  - 24
+  topk: 8
+  coord_channels: 4
+  stage1_in_channels: 14
