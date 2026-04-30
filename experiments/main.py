@@ -281,7 +281,10 @@ class Processor():
             unfrozen = 0
             for name, param in model.named_parameters():
                 normalized = self._normalize_key(name)
-                if normalized.startswith('stage1.') or normalized == 'stage1':
+                # Keep stage1.* (input embedding) and aux_head.* (any new
+                # auxiliary heads added by subclasses) trainable.
+                if (normalized.startswith('stage1.') or normalized == 'stage1'
+                        or normalized.startswith('aux_head.') or normalized == 'aux_head'):
                     param.requires_grad = True
                     unfrozen += 1
                 else:
