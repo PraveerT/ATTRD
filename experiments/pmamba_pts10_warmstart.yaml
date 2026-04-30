@@ -1,0 +1,61 @@
+# Warm-start: load baseline pmamba_branch epoch110 (stage1 stripped via
+# epoch110_nostage1.pt) and fine-tune with octo input. stage1 has new 10-ch
+# input dim so it can't load from baseline; everything else (stage2-5,
+# multi_scale, mamba, global_bn, classifier) loads from baseline so the
+# backbone starts at ~89.83 baseline performance. Stage1 is randomly
+# initialized and learns the lattice/octo embedding fast.
+#
+# Mirrors baseline pmamba_warmrestart_ep80.yaml schedule but adapted to
+# our setup.
+
+dataloader: nvidia_pts10_loader.NvidiaPts10Loader
+
+phase: train
+num_epoch: 30
+work_dir: ./work_dir/pmamba_pts10_warmstart_freeze/
+batch_size: 8
+test_batch_size: 1
+num_worker: 8
+
+device: 0
+log_interval: 50
+eval_interval: 1
+save_interval: 5
+
+framesize: 32
+pts_size: 256
+dynamic_pts_size: false
+strict_load: false
+
+weights: ./work_dir/pmamba_branch/epoch110_padded_stage1_10ch.pt
+freeze: backbone
+
+optimizer_args:
+  optimizer: Adam
+  base_lr: 0.0001
+  step:
+  - 20
+  weight_decay: 0.03
+  start_epoch: 0
+  nesterov: false
+
+train_loader_args:
+  phase: train
+  framerate: 32
+
+test_loader_args:
+  phase: test
+  framerate: 32
+
+model: models.motion.Motion
+model_args:
+  pts_size: 256
+  num_classes: 25
+  knn:
+  - 32
+  - 24
+  - 48
+  - 24
+  topk: 8
+  coord_channels: 4
+  stage1_in_channels: 10

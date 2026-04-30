@@ -16,6 +16,31 @@ sys.path.append("../..")
 from utils import get_parser, import_class, GpuDataParallel, Optimizer, Recorder, Stat, RandomState
 
 
+
+# === ShuffleMix+ patch ===
+def shufflemix_pc(image, label, smprob):
+    """ShuffleMix+ for point cloud (B, T, P, C).
+
+    For ``smprob`` fraction of frames per clip, replace those frames with the
+    corresponding frames from a flipped-batch sample. Returns the mixed input
+    and the two label sets plus a mixing weight ``lam`` for label-side mixing.
+    """
+    if smprob <= 0.0 or image.dim() < 3:
+        return image, label, label, 1.0
+    import random as _random
+    B = image.size(0)
+    T = image.size(1)
+    label_b = label.flip(0)
+    if (label_b == label).all():
+        return image, label, label, 1.0
+    n_replace = max(1, int(round(smprob * T)))
+    idx = _random.sample(range(T), n_replace)
+    image_b = image.flip(0).clone()
+    image[:, idx] = image_b[:, idx]
+    lam = 1.0 - n_replace / T
+    return image, label, label_b, lam
+# === end ShuffleMix+ patch ===
+
 class Processor():
     def __init__(self, arg):
         self.arg = arg
@@ -248,6 +273,23 @@ class Processor():
                 self.recoder.print_log(
                     'Froze {} parameter tensors under {}.'.format(frozen, self.arg.spatial_target_prefix)
                 )
+        elif self.arg.freeze == 'backbone':
+            # Freeze every param NOT under stage1.* — useful for warmstart with
+            # padded stage1 input where we want only the input embedding to
+            # adapt while the backbone stays at baseline.
+            frozen = 0
+            unfrozen = 0
+            for name, param in model.named_parameters():
+                normalized = self._normalize_key(name)
+                if normalized.startswith('stage1.') or normalized == 'stage1':
+                    param.requires_grad = True
+                    unfrozen += 1
+                else:
+                    param.requires_grad = False
+                    frozen += 1
+            self.recoder.print_log(
+                'Backbone freeze: {} frozen, {} trainable (stage1).'.format(frozen, unfrozen)
+            )
         elif self.arg.freeze == 'temporal':
             frozen = self._set_requires_grad_by_prefix(model, self.arg.temporal_target_prefix, False)
             if frozen == 0:
@@ -329,6 +371,8 @@ class Processor():
             self.recoder.record_timer("dataloader")
             image = self.device.data_to_device(data[0])
             label = self.device.data_to_device(data[1])
+            sm_smprob = float(getattr(self.arg, 'shufflemix_smprob', 0.0))
+            image, _label_a, _label_b, _sm_lam = shufflemix_pc(image, label, sm_smprob)
             self.recoder.record_timer("device")
             output = self.model(image)
             self.recoder.record_timer("forward")
@@ -337,7 +381,12 @@ class Processor():
                 per_sample = torch.nn.functional.cross_entropy(output, label, reduction='none')
                 classification_loss = (per_sample * sample_w).sum() / (sample_w.sum() + 1e-8)
             else:
-                classification_loss = torch.mean(self.loss(output, label))
+                if _sm_lam < 1.0:
+                    loss_a = torch.mean(self.loss(output, _label_a))
+                    loss_b = torch.mean(self.loss(output, _label_b))
+                    classification_loss = _sm_lam * loss_a + (1.0 - _sm_lam) * loss_b
+                else:
+                    classification_loss = torch.mean(self.loss(output, label))
             loss = classification_loss
 
             aux_loss = None

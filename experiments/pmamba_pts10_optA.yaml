@@ -23,7 +23,7 @@ pts_size: 96
 dynamic_pts_size: true
 strict_load: false
 
-weights: null
+weights: ./work_dir/pmamba_pts10_optA_v2/epoch105_model.pt
 
 optimizer_args:
   optimizer: Adam
@@ -33,7 +33,7 @@ optimizer_args:
   - 160
   - 180
   weight_decay: 0.03
-  start_epoch: 0
+  start_epoch: 105
   nesterov: false
 
 train_loader_args:

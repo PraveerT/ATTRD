@@ -50,19 +50,12 @@ class NvidiaPts10Loader(data.Dataset):
             self.octo_mean = np.zeros(6, dtype=np.float32)
             self.octo_std = np.ones(6, dtype=np.float32)
 
-        if phase == "train":
-            self.transform = Compose([
-                PointcloudToTensor(),
-                PointcloudScale(lo=0.85, hi=1.15),
-                PointcloudRotatePerturbation(angle_sigma=0.08, angle_clip=0.18),
-                PointcloudTranslate(translate_range=0.1),
-                TemporalSpeedChange(speed_range=(0.85, 1.15), prob=0.3),
-                TemporalTranslate(max_shift_ratio=0.2, prob=0.4),
-                TemporalCutout(max_cutout_ratio=0.2, num_holes=(1, 4), prob=0.3),
-                TemporalShuffle(window_size=7, num_shuffles=4, prob=0.4),
-            ])
-        else:
-            self.transform = Compose([PointcloudToTensor()])
+        # No-augment mode for warmstart: keep raw + lattice channels in sync.
+        # Augmentations are tricky because applying scale/rotate/translate to
+        # raw uvd-t but not to lattice channels (4:10) causes a domain mismatch
+        # train↔eval; the loaded baseline is fragile to that. Drop augments
+        # and rely on the rich corresponded features instead.
+        self.transform = Compose([PointcloudToTensor()])
 
     def get_inputs_list(self):
         prefix = "../dataset/Nvidia/Processed"
