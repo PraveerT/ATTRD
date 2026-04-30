@@ -1,0 +1,55 @@
+# Two-stream avg-of-logits: raw_branch (warmstart from baseline) +
+# octo_branch (random) + learnable alpha (init=sigmoid(5)~0.993 -> raw heavy).
+# At init prediction ≈ baseline 89.83. Training nudges alpha toward 0.5 as
+# octo_branch learns to predict.
+
+dataloader: nvidia_dual_loader.NvidiaDualLoader
+
+phase: train
+num_epoch: 160
+work_dir: ./work_dir/pmamba_dual_avg_frozen/
+batch_size: 8
+test_batch_size: 1
+num_worker: 8
+
+device: 0
+log_interval: 50
+eval_interval: 1
+save_interval: 5
+
+framesize: 32
+pts_size: 256
+dynamic_pts_size: false
+strict_load: false
+
+weights: ./work_dir/pmamba_branch/epoch110_two_stream_raw_warm.pt
+
+optimizer_args:
+  optimizer: Adam
+  base_lr: 0.00012
+  step:
+  - 200
+  weight_decay: 0.03
+  start_epoch: 100
+  nesterov: false
+
+train_loader_args:
+  phase: train
+  framerate: 32
+
+test_loader_args:
+  phase: test
+  framerate: 32
+
+model: models.two_stream_avg.TwoStreamAvg
+model_args:
+  pts_size: 256
+  num_classes: 25
+  knn:
+  - 32
+  - 24
+  - 48
+  - 24
+  topk: 8
+  alpha_init: 5.0
+  freeze_raw: true
