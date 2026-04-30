@@ -1,0 +1,56 @@
+# F8: F6 (aux=0.3) but seed=42 for different convergence path
+
+dataloader: nvidia_pts10_auxq_loader.NvidiaPts10AuxQLoader
+
+phase: train
+num_epoch: 130
+work_dir: ./work_dir/pmamba_pts10_qcyc_f8/
+batch_size: 8
+test_batch_size: 1
+num_worker: 8
+
+device: 0
+log_interval: 50
+eval_interval: 1
+save_interval: 5
+
+random_seed: 42
+
+framesize: 32
+pts_size: 256
+dynamic_pts_size: false
+strict_load: false
+
+weights: ./work_dir/pmamba_branch/epoch110_padded_stage1_22ch.pt
+
+optimizer_args:
+  optimizer: Adam
+  base_lr: 0.000012
+  step:
+  - 200
+  weight_decay: 0.03
+  start_epoch: 100
+  nesterov: false
+
+train_loader_args:
+  phase: train
+  framerate: 32
+
+test_loader_args:
+  phase: test
+  framerate: 32
+
+model: models.motion_auxq.MotionAuxQ
+model_args:
+  pts_size: 256
+  num_classes: 25
+  knn:
+  - 32
+  - 24
+  - 48
+  - 24
+  topk: 8
+  coord_channels: 4
+  stage1_in_channels: 22
+  aux_weight: 0.3
+  target_dim: 4
