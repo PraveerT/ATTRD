@@ -11,8 +11,8 @@
 dataloader: nvidia_pts10_loader.NvidiaPts10Loader
 
 phase: train
-num_epoch: 30
-work_dir: ./work_dir/pmamba_pts10_warmstart_freeze/
+num_epoch: 60
+work_dir: ./work_dir/pmamba_pts10_warmstart_freeze_long/
 batch_size: 8
 test_batch_size: 1
 num_worker: 8
@@ -27,14 +27,14 @@ pts_size: 256
 dynamic_pts_size: false
 strict_load: false
 
-weights: ./work_dir/pmamba_branch/epoch110_padded_stage1_10ch.pt
+weights: ./work_dir/pmamba_pts10_warmstart_freeze/epoch30_model.pt
 freeze: backbone
 
 optimizer_args:
   optimizer: Adam
   base_lr: 0.0001
   step:
-  - 20
+  - 40
   weight_decay: 0.03
   start_epoch: 0
   nesterov: false
