@@ -215,7 +215,7 @@ class MambaTemporalEncoder(nn.Module):
 
 class Motion(nn.Module):
     def __init__(self, num_classes, pts_size, topk=16, downsample=(2, 2, 2),
-                 knn=(16, 48, 48, 24), coord_channels=4):
+                 knn=(16, 48, 48, 24), coord_channels=4, multi_scale_num_scales=4):
         super(Motion, self).__init__()
         self.coord_channels = coord_channels
         self.stage1 = MLPBlock([coord_channels, 32, 64], 2)
@@ -239,7 +239,7 @@ class Motion(nn.Module):
         self.mamba = MambaTemporalEncoder(in_channels=256, hidden_dim=128, output_dim=256, num_layers=2)
         
         # Add Multi-scale Feature Processor layer after stage2
-        self.multi_scale = MultiScaleFeatureProcessor(in_channels=(coord_channels + 64) * 2 - coord_channels, num_scales=4, feature_dim=32)
+        self.multi_scale = MultiScaleFeatureProcessor(in_channels=(coord_channels + 64) * 2 - coord_channels, num_scales=multi_scale_num_scales, feature_dim=32)
         self.feature_dim = 1024
 
     def _sample_points(self, inputs):
