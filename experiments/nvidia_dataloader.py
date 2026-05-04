@@ -110,12 +110,12 @@ class NvidiaLoader(data.Dataset):
                 PointcloudScale(lo=0.85, hi=1.15),
                 PointcloudRotatePerturbation(angle_sigma=0.08, angle_clip=0.22),
                 PointcloudTranslate(translate_range=0.1),
-                # PointcloudJitter(std=0.015, clip=0.06),
                 TemporalSpeedChange(speed_range=(0.85, 1.15), prob=0.3),
                 TemporalTranslate(max_shift_ratio=0.2, prob=0.4),
                 TemporalCutout(max_cutout_ratio=0.2, num_holes=(1, 4), prob=0.6),
                 TemporalShuffle(window_size=7, num_shuffles=4, prob=0.4),
-                # PointcloudRandomInputDropout(max_dropout_ratio=0.25),
+                PointcloudJitter(std=0.015, clip=0.06),
+                PointcloudRandomInputDropout(max_dropout_ratio=0.25),
             ])
         else:
             transform = Compose([
@@ -171,6 +171,126 @@ class NvidiaREQNNLoader(NvidiaLoader):
                 PointcloudToTensor(),
             ])
         return transform
+
+
+class NvidiaFourierLoader(NvidiaLoader):
+    """Net2 dataloader for DS-QCC: returns xyzt (4) + multi-frequency Fourier
+    features of XYZ (24) = 28 channels per point. Sin/cos at k in {1,2,4,8}.
+    First 4 channels remain raw xyzt so PMamba's k-NN grouping (distance_dim=[0,1,2])
+    works on real spatial coords.
+    """
+
+    FOURIER_FREQS = [1.0, 2.0, 4.0, 8.0]  # 4 freqs * (sin+cos) * 3 dims = 24 channels
+
+    def normalize(self, pts, fs):
+        timestep, pts_size, channels = pts.shape
+
+        # xyzt from cols 4-8 of the 8-channel _pts.npy
+        if channels >= 8:
+            xyzt = pts[..., 4:8].astype(np.float32)
+        else:
+            raw_uvdt = pts[..., :4].astype(np.float32)
+            xyzt = np.zeros((timestep, pts_size, 4), dtype=np.float32)
+            for f in range(timestep):
+                xyzt[f] = dataset_utils.uvd2xyz_sherc(raw_uvdt[f].copy()).astype(np.float32)
+
+        # Time -> [-1, 1]
+        time_center = max((fs - 1) / 2.0, 1.0)
+        xyzt[..., 3] = (xyzt[..., 3] - time_center) / time_center
+
+        # Normalize XYZ to roughly unit-scale BEFORE Fourier encoding.
+        XYZ_SCALE = 50.0
+        xyzt[..., :3] = xyzt[..., :3] / XYZ_SCALE
+
+        # Geometric aug + tensorize on normalized 4-d xyzt
+        xyzt = self.transform(xyzt.reshape(-1, 4))
+        if hasattr(xyzt, 'numpy'):
+            xyzt_np = xyzt.numpy()
+        else:
+            xyzt_np = xyzt
+        xyzt_np = xyzt_np.reshape(timestep, pts_size, 4)
+
+        # Fourier-encode XYZ across all freqs
+        fourier_chans = []
+        for k in self.FOURIER_FREQS:
+            for axis in range(3):
+                fourier_chans.append(np.sin(2 * np.pi * k * xyzt_np[..., axis:axis+1]))
+                fourier_chans.append(np.cos(2 * np.pi * k * xyzt_np[..., axis:axis+1]))
+        fourier = np.concatenate(fourier_chans, axis=-1)  # (T, P, 24)
+
+        out = np.concatenate([xyzt_np, fourier.astype(np.float32)], axis=-1)  # (T, P, 28)
+        if hasattr(xyzt, 'numpy'):
+            import torch
+            out = torch.from_numpy(out)
+        return out
+
+    @staticmethod
+    def transform_init(phase):
+        if phase == 'train':
+            transform = Compose([
+                PointcloudToTensor(),
+                PointcloudScale(lo=0.9, hi=1.1),
+                PointcloudRotatePerturbation(angle_sigma=0.06, angle_clip=0.18),
+                PointcloudTranslate(translate_range=0.05),
+                PointcloudJitter(std=0.01, clip=0.03),
+            ])
+        else:
+            transform = Compose([PointcloudToTensor()])
+        return transform
+
+
+class NvidiaTransInvLoader(NvidiaLoader):
+    """Translation-invariant Net2 loader: subtract per-clip centroid of (u, v, d)
+    so model input has zero absolute position. Preserves inter-frame trajectory
+    (all frames shift by the same amount) and intra-frame relative geometry."""
+
+    def normalize(self, pts, fs):
+        # Base normalization: dataset mean/std on uvdt + transforms (incl PointcloudToTensor).
+        pts = super().normalize(pts, fs)
+        # Now subtract per-clip centroid of (u, v, d) -> removes absolute position.
+        # pts is a torch.Tensor of shape (T, P, channels) at this point.
+        import torch as _torch
+        if isinstance(pts, _torch.Tensor):
+            centroid = pts[..., :3].mean(dim=(0, 1), keepdim=True)
+            pts = pts.clone()
+            pts[..., :3] = pts[..., :3] - centroid
+        else:
+            import numpy as _np
+            centroid = pts[..., :3].mean(axis=(0, 1), keepdims=True)
+            pts[..., :3] = pts[..., :3] - centroid
+        return pts
+
+
+class NvidiaDTWLoader(NvidiaLoader):
+    """DTW time-rescale via cumulative-motion re-sampling.
+
+    Slow gestures expanded, fast gestures compressed. Each output frame represents
+    equal cumulative motion budget. The t channel is overwritten with uniform spacing
+    so the model sees gesture in motion-normalized time, decoupled from absolute pace.
+    """
+
+    def normalize(self, pts, fs):
+        import torch as _torch
+        pts = super().normalize(pts, fs)
+        if not isinstance(pts, _torch.Tensor):
+            pts = _torch.from_numpy(pts)
+        T = pts.shape[0]
+        if T < 2:
+            return pts
+        centroids = pts[..., :3].mean(dim=1)
+        motion = (centroids[1:] - centroids[:-1]).norm(dim=-1)
+        cum = _torch.cat([_torch.zeros(1, device=pts.device), motion.cumsum(0)])
+        total = cum[-1].item()
+        if total < 1e-6:
+            return pts
+        targets = _torch.linspace(0, total, T, device=pts.device)
+        new_idx = _torch.searchsorted(cum, targets).clamp(0, T - 1)
+        pts_rescaled = pts[new_idx].clone()
+        t_min = pts[..., 3].min().item()
+        t_max = pts[..., 3].max().item()
+        new_t = _torch.linspace(t_min, t_max, T, device=pts.device)
+        pts_rescaled[..., 3] = new_t.unsqueeze(-1).expand(T, pts.shape[1])
+        return pts_rescaled
 
 
 class NvidiaQuaternionQCCLoader(NvidiaLoader):

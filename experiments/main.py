@@ -477,6 +477,7 @@ class Processor():
         train_acc = 100. * correct / total
         if aux_loss_values:
             self.recoder.print_log('\tMean auxiliary loss: {:.10f}.'.format(np.mean(aux_loss_values)))
+        self.recoder.print_log('\tMean training acc:  {:.4f}%.'.format(train_acc))
         self.recoder.print_log('\tMean training loss: {:.10f}.'.format(train_loss))
         return train_acc, train_loss
 
