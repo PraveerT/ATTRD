@@ -293,6 +293,28 @@ class NvidiaDTWLoader(NvidiaLoader):
         return pts_rescaled
 
 
+class NvidiaPerPointDTWLoader(NvidiaDTWLoader):
+    """Frame-DTW + per-point t-channel modulation by spatial dist from centroid."""
+
+    KAPPA = 0.3  # modulation strength
+
+    def normalize(self, pts, fs):
+        import torch as _torch
+        pts = super().normalize(pts, fs)  # applies frame-level DTW first
+        if not isinstance(pts, _torch.Tensor):
+            pts = _torch.from_numpy(pts)
+        T, P, _ = pts.shape
+        # Per-frame: distance from centroid in (u, v, d) space
+        for t in range(T):
+            centroid = pts[t, :, :3].mean(dim=0, keepdim=True)  # (1, 3)
+            dist = (pts[t, :, :3] - centroid).norm(dim=-1)  # (P,)
+            mean_d = dist.mean()
+            std_d = dist.std() + 1e-6
+            dist_norm = (dist - mean_d) / std_d  # zero-mean unit-variance
+            pts[t, :, 3] = pts[t, :, 3] * (1.0 + self.KAPPA * dist_norm)
+        return pts
+
+
 class NvidiaQuaternionQCCLoader(NvidiaLoader):
     """Winner-compatible loader with correspondence supervision from raw depth clips."""
 
