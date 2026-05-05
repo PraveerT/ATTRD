@@ -1264,11 +1264,8 @@ class MotionRigidityContrastive(Motion):
                     self_mask = (anchor_set.unsqueeze(0) == a_idx.unsqueeze(1))
                     sim_pos = sim_pos.masked_fill(self_mask, -1e9)
 
-                    # Hard-negative mining: keep top-K most similar (hardest) negatives per anchor.
-                    K_neg = min(self.contrast_num_anchors, sim_neg.shape[-1])
-                    sim_neg_hard, _ = sim_neg.topk(K_neg, dim=-1)
                     exp_pos = (sim_pos / tau).exp()
-                    exp_neg = (sim_neg_hard / tau).exp()
+                    exp_neg = (sim_neg / tau).exp()
                     num = exp_pos.sum(dim=-1) + 1e-8
                     den = num + exp_neg.sum(dim=-1)
                     loss = -(num / den).log().mean()

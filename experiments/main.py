@@ -312,7 +312,7 @@ class Processor():
 
         # Apply qcc_weight_schedule if provided in config
         schedule = getattr(self.arg, 'qcc_weight_schedule', None)
-        if schedule and (hasattr(model_ref,'qcc_weights') or hasattr(model_ref,'qcc_weight') or hasattr(model_ref,'contrast_weight')):
+        if schedule and hasattr(model_ref, 'qcc_weights'):
             applicable = [w for ep_th, w in schedule if epoch >= ep_th]
             if applicable:
                 new_weight = applicable[-1]
@@ -320,8 +320,6 @@ class Processor():
                     model_ref.qcc_weights = [new_weight] * len(model_ref.qcc_weights)
                 if hasattr(model_ref, 'qcc_weight'):
                     model_ref.qcc_weight = new_weight
-                if hasattr(model_ref, 'contrast_weight'):
-                    model_ref.contrast_weight = new_weight
         
         # Check if a fixed pts_size was requested.
         if self.use_static_pts:
