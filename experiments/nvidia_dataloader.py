@@ -315,6 +315,128 @@ class NvidiaPerPointDTWLoader(NvidiaDTWLoader):
         return pts
 
 
+class NvidiaPerPointTrajDTWLoader(NvidiaLoader):
+    """Per-point trajectory DTW: t-channel = per-point cumulative motion."""
+
+    def normalize(self, pts, fs):
+        import torch as _torch
+        pts = super().normalize(pts, fs)
+        if not isinstance(pts, _torch.Tensor):
+            pts = _torch.from_numpy(pts)
+        T, P, _ = pts.shape
+        if T < 2:
+            return pts
+        # Per-point velocity via nearest-neighbor matching across consecutive frames.
+        velocities = _torch.zeros(T, P, device=pts.device)
+        for t in range(1, T):
+            cur = pts[t, :, :3]
+            prev = pts[t - 1, :, :3]
+            # Pairwise distance (P_cur, P_prev). Use min over P_prev.
+            d = (cur.unsqueeze(1) - prev.unsqueeze(0)).norm(dim=-1)
+            velocities[t] = d.min(dim=-1).values
+        # Per-point cumulative motion.
+        cum_motion = velocities.cumsum(dim=0)  # (T, P)
+        total = cum_motion[-1].clamp(min=1e-6).unsqueeze(0)  # (1, P)
+        normalized = cum_motion / total  # (T, P) in [0, 1]
+        t_min = pts[..., 3].min().item()
+        t_max = pts[..., 3].max().item()
+        new_t = t_min + normalized * (t_max - t_min)
+        pts = pts.clone()
+        pts[..., 3] = new_t
+        return pts
+
+
+
+
+class NvidiaInvDTWLoader(NvidiaLoader):
+    """Inverse DTW: equal stillness budget per output frame.
+
+    Opposite of NvidiaDTWLoader. Weight per frame = 1/(motion+eps), so still
+    segments contribute more to cum and get more output samples; high-motion
+    segments collapse. Trains the model to attend to *transitions* and posture-hold
+    portions rather than motion peaks. Designed to be content-orthogonal to DTW.
+    """
+
+    def normalize(self, pts, fs):
+        import torch as _torch
+        pts = super().normalize(pts, fs)
+        if not isinstance(pts, _torch.Tensor):
+            pts = _torch.from_numpy(pts)
+        T = pts.shape[0]
+        if T < 2:
+            return pts
+        centroids = pts[..., :3].mean(dim=1)
+        motion = (centroids[1:] - centroids[:-1]).norm(dim=-1)
+        inv_w = 1.0 / (motion + 1e-3)
+        cum = _torch.cat([_torch.zeros(1, device=pts.device), inv_w.cumsum(0)])
+        total = cum[-1].item()
+        if total < 1e-6:
+            return pts
+        targets = _torch.linspace(0, total, T, device=pts.device)
+        new_idx = _torch.searchsorted(cum, targets).clamp(0, T - 1)
+        pts_rescaled = pts[new_idx].clone()
+        t_min = pts[..., 3].min().item()
+        t_max = pts[..., 3].max().item()
+        new_t = _torch.linspace(t_min, t_max, T, device=pts.device)
+        pts_rescaled[..., 3] = new_t.unsqueeze(-1).expand(T, pts.shape[1])
+        return pts_rescaled
+
+
+
+
+class NvidiaDeformationLoader(NvidiaLoader):
+    """Rigid-deformation decomposition: replace xyz with non-rigid residual.
+
+    Per consecutive frame pair (t, t+1):
+      1. NN-match points (closest in centered xyz space).
+      2. Kabsch to get R, t aligning frame_t to frame_{t+1}[matched].
+      3. Deformation_t = frame_{t+1}[matched] - (R @ frame_t + t)  per-point.
+    Output xyz channels = deformation; t channel preserved.
+    Net1 sees full trajectory; this model sees only the non-rigid part —
+    orthogonal to Net1's coordinate-based view.
+    """
+
+    def normalize(self, pts, fs):
+        import torch as _torch
+        pts = super().normalize(pts, fs)
+        if not isinstance(pts, _torch.Tensor):
+            pts = _torch.from_numpy(pts)
+        T, P, C = pts.shape
+        if T < 2:
+            return pts
+        xyz = pts[..., :3]
+        defo = _torch.zeros_like(xyz)
+        eye3 = _torch.eye(3, dtype=xyz.dtype, device=xyz.device)
+        for t in range(T - 1):
+            p_src = xyz[t]
+            p_tgt = xyz[t + 1]
+            c_s = p_src.mean(dim=0, keepdim=True)
+            c_t = p_tgt.mean(dim=0, keepdim=True)
+            u = p_src - c_s
+            v = p_tgt - c_t
+            dist = _torch.cdist(u, v)
+            nn = dist.argmin(dim=-1)
+            v_m = v[nn]
+            H = u.t() @ v_m + 1e-5 * eye3
+            try:
+                U, S, Vh = _torch.linalg.svd(H)
+                V = Vh.t()
+                det = _torch.det(V @ U.t())
+                D = _torch.diag(_torch.tensor([1.0, 1.0, det.item()], dtype=H.dtype, device=H.device))
+                R = V @ D @ U.t()
+            except Exception:
+                R = eye3
+            pred = u @ R.t() + c_t
+            defo[t] = (p_tgt[nn] - pred)
+        defo[-1] = defo[-2]
+        # Scale deformation to match base xyz scale (consecutive-frame deltas are tiny).
+        scale = pts[..., :3].abs().mean().clamp(min=1e-3) / defo.abs().mean().clamp(min=1e-6)
+        defo = defo * scale
+        out = pts.clone()
+        out[..., :3] = defo
+        return out
+
+
 class NvidiaQuaternionQCCLoader(NvidiaLoader):
     """Winner-compatible loader with correspondence supervision from raw depth clips."""
 

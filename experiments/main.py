@@ -312,7 +312,7 @@ class Processor():
 
         # Apply qcc_weight_schedule if provided in config
         schedule = getattr(self.arg, 'qcc_weight_schedule', None)
-        if schedule and hasattr(model_ref, 'qcc_weights'):
+        if schedule and (hasattr(model_ref,'qcc_weights') or hasattr(model_ref,'qcc_weight') or hasattr(model_ref,'contrast_weight')):
             applicable = [w for ep_th, w in schedule if epoch >= ep_th]
             if applicable:
                 new_weight = applicable[-1]
@@ -320,6 +320,8 @@ class Processor():
                     model_ref.qcc_weights = [new_weight] * len(model_ref.qcc_weights)
                 if hasattr(model_ref, 'qcc_weight'):
                     model_ref.qcc_weight = new_weight
+                if hasattr(model_ref, 'contrast_weight'):
+                    model_ref.contrast_weight = new_weight
         
         # Check if a fixed pts_size was requested.
         if self.use_static_pts:
@@ -675,6 +677,14 @@ class Processor():
                 self.stat.reset_statistic()
                 self.eval(loader_name=['test'])
                 self.print_inf_log(self.arg.optimizer_args['start_epoch'], "Test", None, None)
+            import os as _os, numpy as _np
+            _dump = _os.environ.get('PMAMBA_DUMP_PROBS')
+            if _dump and self._eval_probs:
+                _pp = _np.concatenate(self._eval_probs, axis=0)
+                _ll = _np.concatenate(self._eval_labels, axis=0)
+                _np.savez_compressed(_dump, probs=_pp, labels=_ll)
+                self.recoder.print_log(f'[dump] saved probs '+str(_pp.shape)+f' -> {_dump}')
+
             self.recoder.print_log('Evaluation Done.\n')
 
     def print_inf_log(self, epoch, mode, train_acc=None, train_loss=None):
