@@ -1539,6 +1539,96 @@ class MotionRigidityContrastiveCorr(Motion):
         loss = total / count
         return loss, {"contrast_raw": loss.detach()}
 
+class MotionQCCRegressionNN(Motion):
+    """Direct quaternion regression aux with NN-matched Kabsch ground truth.
+
+    Per frame pair (t, t+1): NN-match points across centered xyz, run Kabsch->q.
+    Predict q from pooled features of frames t, t+1. Loss = 1 - |<q_pred, q_obs>|.
+    No correspondence loader needed.
+    """
+
+    def __init__(self, num_classes, pts_size, qcc_weight=0.5, **kwargs):
+        super().__init__(num_classes, pts_size, **kwargs)
+        self.qcc_weight = qcc_weight
+        feat_dim = 64
+        self.qcc_head = nn.Sequential(
+            nn.Linear(feat_dim * 2, feat_dim),
+            nn.GELU(),
+            nn.Linear(feat_dim, 4),
+        )
+        self.latest_aux_loss = None
+        self.latest_aux_metrics = {}
+
+    def get_auxiliary_loss(self):
+        return self.latest_aux_loss
+
+    def get_auxiliary_metrics(self):
+        return self.latest_aux_metrics
+
+    def _kabsch_q_nn(self, xyz):
+        B, _, T, P = xyz.shape
+        xyz_p = xyz.permute(0, 2, 3, 1)
+        qs = []
+        for t in range(T - 1):
+            p_src = xyz_p[:, t]
+            p_tgt = xyz_p[:, t + 1]
+            c_s = p_src.mean(dim=1, keepdim=True)
+            c_t = p_tgt.mean(dim=1, keepdim=True)
+            u = p_src - c_s
+            v = p_tgt - c_t
+            d = torch.cdist(u, v)
+            nn = d.argmin(dim=-1)
+            v_m = torch.gather(v, 1, nn.unsqueeze(-1).expand(-1, -1, 3))
+            q = _qcc_kabsch_quat(u, v_m)
+            qs.append(q)
+        return torch.stack(qs, dim=1)
+
+    def extract_features(self, inputs):
+        coords = self._sample_points(inputs)
+        B, in_dims, T, P = coords.shape
+
+        ret_array1 = self.group.group_points(
+            distance_dim=[0, 1, 2], array1=coords, array2=coords,
+            knn=self.knn[0], dim=3,
+        )
+        ret_array1 = ret_array1.reshape(B, in_dims, T * P, -1)
+        fea1_raw = self.pool1(self.stage1(ret_array1)).reshape(B, -1, T, P)
+
+        self.latest_aux_loss = None
+        self.latest_aux_metrics = {}
+        if self.training and self.qcc_weight > 0:
+            with torch.no_grad():
+                q_obs = self._kabsch_q_nn(coords[:, :3])
+            feat_per_frame = fea1_raw.mean(dim=-1)
+            feat_pairs = torch.cat([feat_per_frame[..., :-1], feat_per_frame[..., 1:]], dim=1)
+            q_pred = self.qcc_head(feat_pairs.permute(0, 2, 1))
+            q_pred = F.normalize(q_pred, dim=-1)
+            cos_sim = (q_pred * q_obs).sum(dim=-1).abs()
+            loss = (1 - cos_sim).mean()
+            self.latest_aux_loss = self.qcc_weight * loss
+            self.latest_aux_metrics = {"qcc_raw": loss.detach()}
+
+        fea1 = torch.cat((coords, fea1_raw), dim=1)
+        in_dims_2 = fea1.shape[1] * 2 - 4
+        pts_num = P // self.downsample[0]
+        rg2 = self.group.st_group_points(fea1, 3, [0, 1, 2], self.knn[1], 3)
+        ret2, coords = self.select_ind(rg2, coords, B, in_dims_2, T, pts_num)
+        fea2 = self.pool2(self.stage2(ret2)).reshape(B, -1, T, pts_num)
+        fea2 = torch.cat((coords, fea2), dim=1)
+        fea2 = self.multi_scale(fea2)
+        in_dims_3 = fea2.shape[1] * 2 - 4
+        pts_num //= self.downsample[1]
+        rg3 = self.group.st_group_points(fea2, 3, [0, 1, 2], self.knn[2], 3)
+        ret3, coords = self.select_ind(rg3, coords, B, in_dims_3, T, pts_num)
+        fea3 = self.pool3(self.stage3(ret3)).reshape(B, -1, T, pts_num)
+        fea3_mamba = self.mamba(fea3)
+        coords_fea3 = torch.cat((coords, fea3_mamba), dim=1)
+        output = self.stage5(coords_fea3)
+        output = self.pool5(output)
+        output = self.global_bn(output)
+        return output.flatten(1)
+
+
 def _qcc_hamilton(a, b):
     aw, ax, ay, az = a[..., 0], a[..., 1], a[..., 2], a[..., 3]
     bw, bx, by, bz = b[..., 0], b[..., 1], b[..., 2], b[..., 3]
