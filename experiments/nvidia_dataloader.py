@@ -601,6 +601,363 @@ class NvidiaAntiNet1ExpDTWLoader(NvidiaAntiNet1DTWLoader):
         return pts_rescaled, lbl, name
 
 
+
+
+class NvidiaAngularMomentumLoader(NvidiaLoader):
+    """Replace xyz with cross-product C = r x v (angular-momentum-like).
+
+    A = centered position (r = pos - centroid_per_frame)
+    B = velocity (centered finite difference along time)
+    C = r x v   per point per frame, an antisymmetric bilinear feature.
+    Net1 sees position; this sees the emergent rotation axis perpendicular to
+    both position and velocity. Cannot be derived from A or B alone.
+    """
+
+    def normalize(self, pts, fs):
+        import torch as _torch
+        pts = super().normalize(pts, fs)
+        if not isinstance(pts, _torch.Tensor):
+            pts = _torch.from_numpy(pts)
+        T, P, C = pts.shape
+        if T < 3:
+            return pts
+        xyz = pts[..., :3]
+        centroid = xyz.mean(dim=1, keepdim=True)
+        r = xyz - centroid
+        v = _torch.zeros_like(xyz)
+        v[1:-1] = (xyz[2:] - xyz[:-2]) / 2
+        v[0] = v[1]
+        v[-1] = v[-2]
+        L = _torch.cross(r, v, dim=-1)
+        for i in range(3):
+            mu = L[..., i].mean()
+            std = L[..., i].std().clamp(min=1e-3)
+            L[..., i] = (L[..., i] - mu) / std
+        out = pts.clone()
+        out[..., :3] = L
+        return out
+
+
+
+
+class NvidiaWritheLoader(NvidiaLoader):
+    """Add per-point trajectory writhe scalar as 5th spatial channel.
+
+    Writhe Wr(gamma_i) = (1/4pi) sum_{s<t} ((gamma(s)-gamma(t)) . (v(s) x v(t)))
+                                            / |gamma(s)-gamma(t)|^3
+    Captures self-twist / linking signature of each point's trajectory. Pure
+    topological invariant, rigid-motion + reparametrization invariant.
+    Broadcast across all frames; keeps xyz intact, replaces channel 4 with writhe.
+    """
+
+    def normalize(self, pts, fs):
+        import torch as _torch
+        pts = super().normalize(pts, fs)
+        if not isinstance(pts, _torch.Tensor):
+            pts = _torch.from_numpy(pts)
+        T, P, C = pts.shape
+        if T < 3:
+            return pts
+        xyz = pts[..., :3]  # (T, P, 3)
+        v = _torch.zeros_like(xyz)
+        v[1:-1] = (xyz[2:] - xyz[:-2]) / 2
+        v[0] = v[1]
+        v[-1] = v[-2]
+        # Per-point writhe scalar via double sum over time pairs (s,t), s<t
+        # Vectorize over P
+        traj = xyz.permute(1, 0, 2)  # (P, T, 3)
+        vp = v.permute(1, 0, 2)       # (P, T, 3)
+        # Broadcasting: pair indices s,t
+        # diff[p, s, t] = traj[p,s] - traj[p,t]    (P, T, T, 3)
+        diff = traj.unsqueeze(2) - traj.unsqueeze(1)
+        cross_v = _torch.cross(
+            vp.unsqueeze(2).expand(-1, -1, T, -1),
+            vp.unsqueeze(1).expand(-1, T, -1, -1),
+            dim=-1,
+        )  # (P, T, T, 3)
+        denom = diff.norm(dim=-1).clamp(min=1e-3) ** 3
+        contrib = (diff * cross_v).sum(dim=-1) / denom  # (P, T, T)
+        # Take upper triangle (s<t)
+        mask = _torch.triu(_torch.ones(T, T, dtype=_torch.bool, device=pts.device), diagonal=1)
+        writhe = contrib.masked_select(mask.unsqueeze(0)).reshape(P, -1).sum(dim=-1) / (4 * 3.14159265)
+        # Standardize
+        mu = writhe.mean()
+        std = writhe.std().clamp(min=1e-3)
+        w_n = (writhe - mu) / std  # (P,)
+        out = pts.clone()
+        # Replace channel 4 (index 4) with writhe broadcast
+        out[..., 4] = w_n.unsqueeze(0).expand(T, P)
+        return out
+
+
+
+
+class NvidiaVorticityLoader(NvidiaLoader):
+    """Replace xyz with per-point vorticity (curl of velocity field)."""
+
+    K_NN = 8
+
+    def normalize(self, pts, fs):
+        import torch as _torch
+        pts = super().normalize(pts, fs)
+        if not isinstance(pts, _torch.Tensor):
+            pts = _torch.from_numpy(pts)
+        T, P, C = pts.shape
+        if T < 3:
+            return pts
+        xyz = pts[..., :3]
+        v = _torch.zeros_like(xyz)
+        v[1:-1] = (xyz[2:] - xyz[:-2]) / 2
+        v[0] = v[1]; v[-1] = v[-2]
+        K = min(self.K_NN, P - 1)
+        omega = _torch.zeros(T, P, 3, dtype=pts.dtype, device=pts.device)
+        eye3 = _torch.eye(3, device=pts.device, dtype=pts.dtype)
+        for t in range(T):
+            x_t = xyz[t]; v_t = v[t]
+            d = _torch.cdist(x_t, x_t)
+            d.fill_diagonal_(float('inf'))
+            _, nn_idx = d.topk(K, dim=-1, largest=False)
+            x_nb = x_t[nn_idx]; v_nb = v_t[nn_idx]
+            dx = x_nb - x_t.unsqueeze(1)
+            dv = v_nb - v_t.unsqueeze(1)
+            dx_t_dx = _torch.einsum('pki,pkj->pij', dx, dx)
+            dx_t_dx = dx_t_dx + 1e-4 * eye3.unsqueeze(0)
+            dx_t_dv = _torch.einsum('pki,pkj->pij', dx, dv)
+            try:
+                inv = _torch.linalg.inv(dx_t_dx)
+            except Exception:
+                continue
+            grad_v_T = _torch.einsum('pij,pjk->pik', inv, dx_t_dv)
+            grad_v = grad_v_T.transpose(-1, -2)
+            Omega = 0.5 * (grad_v - grad_v.transpose(-1, -2))
+            omega[t, :, 0] = Omega[:, 2, 1]
+            omega[t, :, 1] = Omega[:, 0, 2]
+            omega[t, :, 2] = Omega[:, 1, 0]
+        for i in range(3):
+            mu = omega[..., i].mean()
+            std = omega[..., i].std().clamp(min=1e-3)
+            omega[..., i] = (omega[..., i] - mu) / std
+        out = pts.clone()
+        out[..., :3] = omega
+        return out
+
+
+
+
+class NvidiaSpatioTemporalDTWLoader(NvidiaLoader):
+    """2D DTW: frame re-sample by cum-motion, then per-frame point re-sample by cum-distance.
+
+    Time axis: standard Net2 DTW (cum centroid-motion budget).
+    Space axis: per output frame, sort points by distance to centroid, then
+    sample P new points uniformly in cum-distance space. Densely-clustered
+    regions get fewer samples, spread regions get more.
+    Final output: SSM sees spatially-ordered points within each motion-uniform frame.
+    """
+
+    def normalize(self, pts, fs):
+        import torch as _torch
+        pts = super().normalize(pts, fs)
+        if not isinstance(pts, _torch.Tensor):
+            pts = _torch.from_numpy(pts)
+        T, P, C = pts.shape
+        if T < 2:
+            return pts
+        # --- Time DTW ---
+        centroids_t = pts[..., :3].mean(dim=1)
+        motion_t = (centroids_t[1:] - centroids_t[:-1]).norm(dim=-1)
+        cum_t = _torch.cat([_torch.zeros(1, device=pts.device), motion_t.cumsum(0)])
+        total_t = cum_t[-1].item()
+        if total_t < 1e-6:
+            pts_t = pts
+        else:
+            targets_t = _torch.linspace(0, total_t, T, device=pts.device)
+            new_idx_t = _torch.searchsorted(cum_t, targets_t).clamp(0, T - 1)
+            pts_t = pts[new_idx_t].clone()
+            t_min = pts[..., 3].min().item()
+            t_max = pts[..., 3].max().item()
+            new_t = _torch.linspace(t_min, t_max, T, device=pts.device)
+            pts_t[..., 3] = new_t.unsqueeze(-1).expand(T, P)
+        # --- Spatial DTW per frame ---
+        out = pts_t.clone()
+        for f in range(T):
+            xyz = pts_t[f, :, :3]
+            centroid = xyz.mean(dim=0, keepdim=True)
+            dist = (xyz - centroid).norm(dim=-1)
+            sorted_dist, sort_idx = dist.sort()
+            cum_s = _torch.cat([_torch.zeros(1, device=pts.device), sorted_dist.cumsum(0)])
+            total_s = cum_s[-1].item()
+            if total_s < 1e-6:
+                continue
+            targets_s = _torch.linspace(0, total_s, P, device=pts.device)
+            new_idx_s = _torch.searchsorted(cum_s, targets_s).clamp(0, P - 1)
+            out[f] = pts_t[f, sort_idx[new_idx_s]]
+        return out
+
+
+
+
+class NvidiaAdaptiveYJDTWLoader(NvidiaLoader):
+    """Per-clip adaptive Yeo-Johnson DTW: fit lambda to per-clip motion distribution.
+
+    For each clip, MLE-estimate lambda that makes YJ(motion) closest to Gaussian
+    (standard YJ purpose). Use this lambda to power-warp the cum-motion budget
+    before frame resampling. Each clip gets its own warp intensity.
+    """
+
+    LAMBDA_GRID = [-2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+
+    def _yj(self, y, lam):
+        import torch as _torch
+        if lam == 0.0:
+            return _torch.log1p(y)
+        return ((y + 1).pow(lam) - 1) / lam
+
+    def _fit_lam(self, motion):
+        import torch as _torch, math
+        best_ll = float('-inf')
+        best_lam = 1.0
+        for lam in self.LAMBDA_GRID:
+            y = self._yj(motion, lam)
+            mu = y.mean()
+            var = y.var().clamp(min=1e-6)
+            n = y.numel()
+            ll = -0.5 * (((y - mu) ** 2 / var).sum() + n * (var.log() + math.log(2 * math.pi)))
+            log_jac = ((lam - 1) * _torch.log(motion + 1)).sum()
+            ll = ll + log_jac
+            if ll.item() > best_ll:
+                best_ll = ll.item()
+                best_lam = lam
+        return best_lam
+
+    def normalize(self, pts, fs):
+        import torch as _torch
+        pts = super().normalize(pts, fs)
+        if not isinstance(pts, _torch.Tensor):
+            pts = _torch.from_numpy(pts)
+        T = pts.shape[0]
+        if T < 2:
+            return pts
+        centroids = pts[..., :3].mean(dim=1)
+        motion = (centroids[1:] - centroids[:-1]).norm(dim=-1)
+        lam = self._fit_lam(motion)
+        w = self._yj(motion, lam)
+        cum = _torch.cat([_torch.zeros(1, device=pts.device), w.cumsum(0)])
+        total = cum[-1].item()
+        if total < 1e-6:
+            return pts
+        targets = _torch.linspace(0, total, T, device=pts.device)
+        new_idx = _torch.searchsorted(cum, targets).clamp(0, T - 1)
+        pts_rescaled = pts[new_idx].clone()
+        t_min = pts[..., 3].min().item()
+        t_max = pts[..., 3].max().item()
+        new_t = _torch.linspace(t_min, t_max, T, device=pts.device)
+        pts_rescaled[..., 3] = new_t.unsqueeze(-1).expand(T, pts.shape[1])
+        return pts_rescaled
+
+
+
+
+class NvidiaCombinedDTWLoader(NvidiaAntiNet1DTWLoader):
+    """Combine pace (Net2 motion budget) + anti-Net1 (Net14 exp(-imp)) in one DTW.
+
+    weight[t] = (motion[t]/motion_mean) * exp(-imp_standardized[t])
+    Single model sees frames re-sampled by both axes simultaneously.
+    """
+
+    def __getitem__(self, index):
+        import torch as _torch
+        import numpy as _np
+        pts, lbl, name = NvidiaLoader.__getitem__(self, index)
+        imp = self._importance.get(name, None)
+        if imp is None:
+            return pts, lbl, name
+        if not isinstance(pts, _torch.Tensor):
+            pts = _torch.from_numpy(pts) if isinstance(pts, _np.ndarray) else pts
+        T = pts.shape[0]
+        if imp.shape[0] != T or T < 2:
+            return pts, lbl, name
+        # Anti-Net1 weight (smooth)
+        imp_t = _torch.from_numpy(imp).float()
+        imp_n = (imp_t - imp_t.mean()) / imp_t.std().clamp(min=1e-6)
+        anti_w = _torch.exp(-imp_n)  # length T
+        # Motion weight (Net2 style)
+        centroids = pts[..., :3].mean(dim=1)
+        motion = (centroids[1:] - centroids[:-1]).norm(dim=-1)  # length T-1
+        motion_mean = motion.mean().clamp(min=1e-6)
+        motion_n = motion / motion_mean
+        # Combine: motion has T-1 entries, anti has T. Truncate anti to T-1 (per-pair) by averaging adjacent
+        anti_pair = 0.5 * (anti_w[:-1] + anti_w[1:])  # length T-1
+        weight = motion_n * anti_pair
+        cum = _torch.cat([_torch.zeros(1), weight.cumsum(0)])
+        total = cum[-1].item()
+        if total < 1e-6:
+            return pts, lbl, name
+        targets = _torch.linspace(0, total, T)
+        new_idx = _torch.searchsorted(cum, targets).clamp(0, T - 1)
+        pts_rescaled = pts[new_idx].clone()
+        t_min = pts[..., 3].min().item()
+        t_max = pts[..., 3].max().item()
+        new_t = _torch.linspace(t_min, t_max, T)
+        pts_rescaled[..., 3] = new_t.unsqueeze(-1).expand(T, pts.shape[1])
+        return pts_rescaled, lbl, name
+
+
+
+
+class NvidiaMultiScaleDTWLoader(NvidiaLoader):
+    """Multi-scale DTW: 2 motion-budget scales packed into 8 channels.
+
+    Channels 0-3: DTW with W=1 motion (consecutive frame deltas) — fine scale.
+    Channels 4-7: DTW with W=8 motion (8-frame window) — coarse scale.
+    Both with t-channel reset uniformly. Model sees two temporal views jointly.
+    """
+
+    W_FINE = 1
+    W_COARSE = 8
+
+    def _dtw_idx(self, centroids, T, W):
+        import torch as _torch
+        if T <= W:
+            return _torch.arange(T)
+        diff = centroids[W:] - centroids[:-W]
+        motion = diff.norm(dim=-1)  # (T-W,)
+        # Pad motion to length T-1 by edge repetition
+        pad_total = (T - 1) - motion.shape[0]
+        left = pad_total // 2
+        right = pad_total - left
+        if left > 0:
+            motion = _torch.cat([motion[:1].repeat(left), motion])
+        if right > 0:
+            motion = _torch.cat([motion, motion[-1:].repeat(right)])
+        cum = _torch.cat([_torch.zeros(1, device=centroids.device), motion.cumsum(0)])
+        total = cum[-1].item()
+        if total < 1e-6:
+            return _torch.arange(T, device=centroids.device)
+        targets = _torch.linspace(0, total, T, device=centroids.device)
+        return _torch.searchsorted(cum, targets).clamp(0, T - 1)
+
+    def normalize(self, pts, fs):
+        import torch as _torch
+        pts = super().normalize(pts, fs)
+        if not isinstance(pts, _torch.Tensor):
+            pts = _torch.from_numpy(pts)
+        T, P, C = pts.shape
+        if T < 2:
+            return pts
+        centroids = pts[..., :3].mean(dim=1)
+        idx_fine = self._dtw_idx(centroids, T, self.W_FINE)
+        idx_coarse = self._dtw_idx(centroids, T, self.W_COARSE)
+        out = pts.clone()
+        out[..., :4] = pts[idx_fine][..., :4]
+        out[..., 4:8] = pts[idx_coarse][..., :4]
+        t_min = pts[..., 3].min().item()
+        t_max = pts[..., 3].max().item()
+        new_t = _torch.linspace(t_min, t_max, T, device=pts.device)
+        out[..., 3] = new_t.unsqueeze(-1).expand(T, P)
+        out[..., 7] = new_t.unsqueeze(-1).expand(T, P)
+        return out
+
+
 class NvidiaQuaternionQCCLoader(NvidiaLoader):
     """Winner-compatible loader with correspondence supervision from raw depth clips."""
 
