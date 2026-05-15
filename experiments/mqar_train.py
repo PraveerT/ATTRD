@@ -153,12 +153,78 @@ class AttRDBlock(nn.Module):
 
 
 # -----------------------------------------------------------------------------
+# Transformer block: vanilla causal multi-head softmax attention + MLP
+# Reference baseline ("SOTA on MQAR" — attention is what MQAR rewards).
+# -----------------------------------------------------------------------------
+class TransformerBlock(nn.Module):
+    """Causal multi-head softmax attention + MLP with RoPE positional encoding.
+
+    RoPE is essential for MQAR — without positional information, attention is
+    permutation-equivariant and cannot distinguish position-1 key from
+    position-3 query.
+    """
+    def __init__(self, d_model, num_heads=4, head_dim=32, mlp_ratio=2, dropout=0.1,
+                 max_seq_len=4096, rope_base=10000.0):
+        super().__init__()
+        self.H = num_heads
+        self.D = head_dim
+        d_inner = num_heads * head_dim
+        self.qkv = nn.Linear(d_model, 3 * d_inner, bias=False)
+        self.o = nn.Linear(d_inner, d_model, bias=False)
+        self.ln1 = nn.LayerNorm(d_model)
+        self.ln2 = nn.LayerNorm(d_model)
+        d_ffn = mlp_ratio * d_model
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_ffn), nn.GELU(),
+            nn.Linear(d_ffn, d_model),
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.attn_dropout = nn.Dropout(dropout)
+        # RoPE cache: cos/sin tables for pair-rotation in head_dim halves
+        assert head_dim % 2 == 0, "RoPE needs even head_dim"
+        inv_freq = 1.0 / (rope_base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        pos = torch.arange(max_seq_len).float()
+        freqs = torch.einsum('i,j->ij', pos, inv_freq)         # (T_max, head_dim/2)
+        self.register_buffer('cos_cache', freqs.cos(), persistent=False)
+        self.register_buffer('sin_cache', freqs.sin(), persistent=False)
+
+    def _apply_rope(self, x):
+        # x: B,T,H,D
+        T = x.shape[1]
+        cos = self.cos_cache[:T].view(1, T, 1, -1)   # 1,T,1,D/2
+        sin = self.sin_cache[:T].view(1, T, 1, -1)
+        x1, x2 = x[..., 0::2], x[..., 1::2]
+        rot1 = x1 * cos - x2 * sin
+        rot2 = x1 * sin + x2 * cos
+        out = torch.stack([rot1, rot2], dim=-1).flatten(-2)
+        return out
+
+    def forward(self, x):
+        B, T, _ = x.shape
+        H, D = self.H, self.D
+        h = self.ln1(x)
+        qkv = self.qkv(h).view(B, T, 3, H, D)
+        q, k, v = qkv.unbind(dim=2)             # each B,T,H,D
+        q = self._apply_rope(q)
+        k = self._apply_rope(k)
+        scores = torch.einsum('bthd,bshd->bths', q, k) / math.sqrt(D)
+        mask = torch.ones(T, T, device=x.device).tril().bool()
+        scores = scores.masked_fill(~mask.view(1, T, 1, T), float('-inf'))
+        attn = self.attn_dropout(F.softmax(scores, dim=-1))
+        Y = torch.einsum('bths,bshd->bthd', attn, v).reshape(B, T, H * D)
+        x = x + self.dropout(self.o(Y))
+        x = x + self.dropout(self.mlp(self.ln2(x)))
+        return x
+
+
+# -----------------------------------------------------------------------------
 # Common wrapper: embed → stack of blocks (residual + norm) → LM head
 # -----------------------------------------------------------------------------
 class SeqModel(nn.Module):
     def __init__(self, arch, vocab, d_model=128, num_layers=2, num_heads=4,
-                 head_dim=32, d_read=32, dropout=0.1):
+                 head_dim=32, d_read=32, mlp_ratio=2, dropout=0.1):
         super().__init__()
+        self.arch = arch
         self.emb = nn.Embedding(vocab, d_model)
         blocks = []
         for _ in range(num_layers):
@@ -166,6 +232,8 @@ class SeqModel(nn.Module):
                 blocks.append(DeltaNetBlock(d_model, num_heads, head_dim, dropout))
             elif arch == 'attrd':
                 blocks.append(AttRDBlock(d_model, num_heads, head_dim, d_read, dropout))
+            elif arch == 'transformer':
+                blocks.append(TransformerBlock(d_model, num_heads, head_dim, mlp_ratio, dropout))
             else:
                 raise ValueError(arch)
         self.blocks = nn.ModuleList(blocks)
@@ -177,7 +245,11 @@ class SeqModel(nn.Module):
     def forward(self, x):
         h = self.emb(x)
         for blk, norm in zip(self.blocks, self.norms):
-            h = h + blk(norm(h))
+            if self.arch == 'transformer':
+                # Transformer block has its own internal residuals + pre-norms
+                h = blk(h)
+            else:
+                h = h + blk(norm(h))
         return self.head(self.final_norm(h))
 
 

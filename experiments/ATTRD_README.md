@@ -1,8 +1,8 @@
 # AttRD — Attention-Read DeltaNet
 
-A novel hybrid sequence architecture: keep DeltaRule's linear-time **recurrent write**, swap its single-state read for a **softmax attention read over the full state trajectory**.
+A hybrid sequence architecture: keep DeltaRule's linear-time **recurrent write**, swap its single-state read for a **softmax attention read over the full state trajectory**.
 
-> **Headline result (MQAR, matched budget):** AttRD **8.77%** vs DeltaNet **6.55%** test prec@1 — **+34% relative**. Random = 0.39%. See [Results](#results).
+> **⚠️ Original headline retracted** (2026-05-15). The "+34% rel on MQAR" claim was a confounded comparison (param mismatch + LR mismatch + single seed). Under rigorous testing (param-matched, LR sweep, 3 seeds, paired t-test), **AttRD ≈ DeltaNet** at every tested MQAR configuration (T ∈ {64, 128}, vocab ∈ {256, 8192}). The design is novel; the accuracy advantage is not detectable. See [Honest results](#honest-results).
 
 ---
 
@@ -83,18 +83,38 @@ The standard synthetic benchmark for associative memory in the linear-attention 
 
 Configuration: 60 epochs, batch=64, vocab=256, T=64, 8 KV pairs, 16 queries per sequence, 2 layers, 4 heads, head_dim=32, matched training schedule.
 
+**Original (now-retracted) comparison** — single seed, unmatched params (DN 0.17M vs AT 0.23M), single LR (3e-4 for both):
+
 | Model | Params | Best test p@1 | Best test p@5 |
 |---|---|---|---|
 | DeltaNet | 0.17M | 6.55% | 30.56% |
-| **AttRD** | **0.23M** | **8.77%** | **39.81%** |
-| Δ | +0.06M | **+2.22 pp (+34% rel)** | **+9.25 pp (+30% rel)** |
+| AttRD | 0.23M | 8.77% | 39.81% |
 
-Random baseline = 0.39% (1/256). Both models produce real signal; AttRD wins decisively on both top-1 and top-5 recall.
+This +34% rel gap was an artifact. Audit:
 
-Reproduce:
+| Source | Contribution to original gap |
+|---|---|
+| Param mismatch (0.17M → 0.23M) | ~50% |
+| LR mistuning (3e-4 was DN's worst LR) | ~45% |
+| Single-seed noise | ~5% |
+| True architectural effect | **~0.04 – 0.42pp** (not significant) |
+
+**Honest results** — param-matched, best-LR per arch, 3 seeds, paired t-tests:
+
+| Config | DN mean ± std | AT mean ± std | Δ | paired t (df=2) | p | significant? |
+|---|---|---|---|---|---|---|
+| T=64, vocab=256, S (165.6K) | 8.09 ± 0.24 | 8.51 ± 0.31 | +0.42 | 1.53 | 0.27 | NO |
+| T=64, vocab=256, L (231.2K) | 8.55 ± 0.20 | 8.67 ± 0.16 | +0.12 | 4.31 | 0.05 | borderline |
+| T=64, vocab=8192, L (1.247M) | 4.70 ± 0.35 | 4.74 ± 0.18 | +0.04 | 0.29 | 0.80 | NO |
+| T=128, vocab=8192, L | 1.76 ± 0.01 | 1.67 ± 0.35 | −0.09 | −0.43 | 0.71 | NO |
+
+**Verdict**: AttRD ≈ DeltaNet at every tested MQAR configuration under matched compute and parameter budgets. The mechanism (attention-over-state-trajectory) does not translate to a detectable accuracy advantage.
+
+Reproduce the rigorous evaluation:
 ```bash
-python mqar_train.py --arch deltanet --epochs 60
-python mqar_train.py --arch attrd    --epochs 60
+python mqar_grid.py --stage 1  # param-match retest, vocab=256
+python mqar_grid.py --stage 2 --size L --lr_dn 1e-3 --lr_at 1e-3 --lr_tx 1e-3 \
+                    --T_values 64,128 --arches deltanet,attrd,transformer
 ```
 
 ### NVGesture (skeleton-based gesture recognition)
@@ -110,7 +130,7 @@ Originally developed for NVGesture fusion. As a *solo* model (482-sample test se
 | Motion-gated β | 88.80% |
 | DSN (external CVPR depth) | 90.25% |
 
-AttRD is competitive with the strongest delta-rule variant as a solo model. **Its real value shows up in fusion**: AttRD provides the most error-decorrelated signal of the family — replacing RD with AttRD in a trio with DSN + BRD lifts the honest 5-way fusion ceiling from 91.49% to **92.53%** (current SOTA on NVGesture with this protocol). Details in `LEADERBOARD.md`.
+AttRD is competitive with the strongest delta-rule variant as a solo model. The **honest 5-way fusion ceiling of 92.53%** (DSN + RD + BRD(N2) + AttRD + DN2(N1)) is reported in `LEADERBOARD.md`, but this number is from a single-seed experiment and **awaits re-verification** under the same rigorous protocol applied to MQAR (multi-seed retrains, ablation of AttRD from the pool, paired t-tests). Until that verification completes, the fusion result should be treated as preliminary.
 
 ---
 
