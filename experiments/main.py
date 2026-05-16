@@ -335,10 +335,22 @@ class Processor():
                 'Training epoch: {} | pts_size: {} (static from {})'.format(epoch + 1, pts_size, static_source)
             )
         else:
-            # Dynamic pts_size scheduling
-            # Epoch 0-50: 48 -> 128 (slow increase)
-            # Epoch 50-100: 128 -> 256 (fast increase)
-            if epoch < 50:
+            # Optional: custom linear ramp from 48 to pts_ramp_target over pts_ramp_epochs
+            ramp_target = getattr(self.arg, 'pts_ramp_target', None)
+            ramp_epochs = getattr(self.arg, 'pts_ramp_epochs', None)
+            freeze_after = getattr(self.arg, 'pts_freeze_after_ep', None)
+            if ramp_target is not None and ramp_epochs is not None:
+                if epoch < ramp_epochs:
+                    pts_size = int(48 + (ramp_target - 48) * (epoch / ramp_epochs))
+                else:
+                    pts_size = ramp_target
+                model_ref.pts_size = pts_size
+                self.recoder.print_log('Training epoch: {} | pts_size: {} (custom ramp -> {})'.format(epoch + 1, pts_size, ramp_target))
+            elif freeze_after is not None and epoch >= freeze_after:
+                pts_size = int(48 + (128 - 48) * (freeze_after / 50))
+                model_ref.pts_size = pts_size
+                self.recoder.print_log('Training epoch: {} | pts_size: {} (frozen after ep {})'.format(epoch + 1, pts_size, freeze_after))
+            elif epoch < 50:
                 # Slow linear increase from 48 to 128 over 50 epochs
                 pts_size = int(48 + (128 - 48) * (epoch / 50))
             elif epoch < 100:
@@ -640,7 +652,7 @@ class Processor():
                 pass  # Ignore if we can't send the initial message
             
             for epoch in range(self.arg.optimizer_args['start_epoch'], self.arg.num_epoch):
-                eval_interval = self.arg.eval_interval
+                eval_interval = 10 if (epoch + 1) < 100 else 1
                 _si = self.arg.save_interval if (epoch + 1) < 100 else 1
                 save_model = ((epoch + 1) % _si == 0) or \
                              (epoch + 1 == self.arg.num_epoch)

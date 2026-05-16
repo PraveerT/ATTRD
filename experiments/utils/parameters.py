@@ -87,6 +87,21 @@ def get_parser():
         default=None,
         help='if set [lo, hi], sample pts uniformly each epoch in this range (overrides default dynamic past ep 100)')
     parser.add_argument(
+        '--pts-ramp-target',
+        type=int,
+        default=None,
+        help='target pts at end of custom linear ramp (used with --pts-ramp-epochs)')
+    parser.add_argument(
+        '--pts-ramp-epochs',
+        type=int,
+        default=None,
+        help='number of epochs for custom linear ramp from 48 to pts_ramp_target')
+    parser.add_argument(
+        '--pts-freeze-after-ep',
+        type=int,
+        default=None,
+        help='freeze pts_size at the value it had at this epoch for all subsequent epochs')
+    parser.add_argument(
         '--freeze',
         type=str,
         default=None,
