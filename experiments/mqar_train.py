@@ -95,6 +95,463 @@ class DeltaNetBlock(nn.Module):
         return self.o(self.dropout(y))
 
 
+# =============================================================================
+# Stage-3 novel architectures (designed to beat DN on MQAR)
+# =============================================================================
+
+class TwoPhaseDeltaBlock(nn.Module):
+    """TP-DN: explicit write/query phase gate per step.
+
+    Standard DN writes at every step with sigmoid β. TP-DN multiplies β by an
+    additional sigmoid gate ψ that the model can learn to drive to 0 during
+    query positions — so registration writes are clean and queries don't
+    overwrite past KV pairs.
+
+    Write: S_t = S_{t-1} + (ψ_t · β_t) · (v_t - S_{t-1} k_t) k_t^T
+    Read:  y_t = q_t^T S_t                                  (same as DN)
+    """
+    def __init__(self, d_model, num_heads=4, head_dim=32, dropout=0.1):
+        super().__init__()
+        self.H = num_heads
+        self.D = head_dim
+        d_inner = num_heads * head_dim
+        self.q = nn.Linear(d_model, d_inner, bias=False)
+        self.k = nn.Linear(d_model, d_inner, bias=False)
+        self.v = nn.Linear(d_model, d_inner, bias=False)
+        self.beta = nn.Linear(d_model, num_heads)
+        self.phase = nn.Linear(d_model, num_heads)        # write-mode gate
+        self.o = nn.Linear(d_inner, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, T, _ = x.shape
+        H, D = self.H, self.D
+        q = self.q(x).view(B, T, H, D)
+        k = F.normalize(self.k(x).view(B, T, H, D), dim=-1)
+        v = self.v(x).view(B, T, H, D)
+        beta = torch.sigmoid(self.beta(x)).view(B, T, H, 1)
+        psi  = torch.sigmoid(self.phase(x)).view(B, T, H, 1)
+        q = F.silu(q)
+
+        S = torch.zeros(B, H, D, D, device=x.device, dtype=x.dtype)
+        ys = []
+        for t in range(T):
+            kt = k[:, t]; vt = v[:, t]
+            bt = beta[:, t] * psi[:, t]    # write-mode gated rate
+            Sk = torch.einsum('bhij,bhj->bhi', S, kt)
+            err = vt - Sk
+            S = S + bt.unsqueeze(-1) * torch.einsum('bhi,bhj->bhij', err, kt)
+            yt = torch.einsum('bhij,bhj->bhi', S, q[:, t])
+            ys.append(yt)
+        y = torch.stack(ys, dim=1).reshape(B, T, H * D)
+        return self.o(self.dropout(y))
+
+
+class AdaptiveBetaDeltaBlock(nn.Module):
+    """AdaB-DN: β adapts to whether the state already contains the current key.
+
+    β_t = σ(W·x_t + γ · ||S_{t-1} k_t||)
+    When state already contains k_t direction → high ||S k|| → high β → overwrite.
+    When k_t is novel → low ||S k|| → β follows the input-driven term.
+
+    Gives the model a content-aware overwrite rate, in contrast to DN's
+    input-only β.
+    """
+    def __init__(self, d_model, num_heads=4, head_dim=32, dropout=0.1):
+        super().__init__()
+        self.H = num_heads
+        self.D = head_dim
+        d_inner = num_heads * head_dim
+        self.q = nn.Linear(d_model, d_inner, bias=False)
+        self.k = nn.Linear(d_model, d_inner, bias=False)
+        self.v = nn.Linear(d_model, d_inner, bias=False)
+        self.beta_lin = nn.Linear(d_model, num_heads)
+        self.gamma = nn.Parameter(torch.zeros(num_heads))     # learned scale, init 0 (= plain DN)
+        self.o = nn.Linear(d_inner, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, T, _ = x.shape
+        H, D = self.H, self.D
+        q = self.q(x).view(B, T, H, D)
+        k = F.normalize(self.k(x).view(B, T, H, D), dim=-1)
+        v = self.v(x).view(B, T, H, D)
+        beta_inp = self.beta_lin(x).view(B, T, H)             # pre-sigmoid
+        q = F.silu(q)
+        gamma = self.gamma.view(1, H)                          # 1,H
+
+        S = torch.zeros(B, H, D, D, device=x.device, dtype=x.dtype)
+        ys = []
+        for t in range(T):
+            kt = k[:, t]; vt = v[:, t]
+            Sk = torch.einsum('bhij,bhj->bhi', S, kt)         # B,H,D
+            Sk_norm = Sk.norm(dim=-1)                          # B,H — how loaded state is along k_t
+            bt = torch.sigmoid(beta_inp[:, t] + gamma * Sk_norm).unsqueeze(-1)  # B,H,1
+            err = vt - Sk
+            S = S + bt.unsqueeze(-1) * torch.einsum('bhi,bhj->bhij', err, kt)
+            yt = torch.einsum('bhij,bhj->bhi', S, q[:, t])
+            ys.append(yt)
+        y = torch.stack(ys, dim=1).reshape(B, T, H * D)
+        return self.o(self.dropout(y))
+
+
+class ForgetDeltaBlock(nn.Module):
+    """FD-N: explicit forget op along k_t before the rank-1 write.
+
+    S_t = (I - m_t k_t k_t^T) S_{t-1} + β_t (v_t - S_{t-1} k_t) k_t^T
+    The (I - m_t k_t k_t^T) is a soft projection: subtracts contribution along
+    the k_t direction with magnitude m_t ∈ [0,1]. m_t=0 → plain DN; m_t=1 →
+    fully clears the k_t component before writing.
+
+    Surgical forgetting vs DN's "overwrite-only" semantics.
+    """
+    def __init__(self, d_model, num_heads=4, head_dim=32, dropout=0.1):
+        super().__init__()
+        self.H = num_heads
+        self.D = head_dim
+        d_inner = num_heads * head_dim
+        self.q = nn.Linear(d_model, d_inner, bias=False)
+        self.k = nn.Linear(d_model, d_inner, bias=False)
+        self.v = nn.Linear(d_model, d_inner, bias=False)
+        self.beta = nn.Linear(d_model, num_heads)
+        self.forget = nn.Linear(d_model, num_heads)
+        self.o = nn.Linear(d_inner, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, T, _ = x.shape
+        H, D = self.H, self.D
+        q = self.q(x).view(B, T, H, D)
+        k = F.normalize(self.k(x).view(B, T, H, D), dim=-1)
+        v = self.v(x).view(B, T, H, D)
+        beta = torch.sigmoid(self.beta(x)).view(B, T, H, 1)
+        mt = torch.sigmoid(self.forget(x)).view(B, T, H, 1)
+        q = F.silu(q)
+
+        S = torch.zeros(B, H, D, D, device=x.device, dtype=x.dtype)
+        ys = []
+        for t in range(T):
+            kt = k[:, t]; vt = v[:, t]
+            # Subtract m_t * k_t k_t^T S along k_t direction:
+            Sk = torch.einsum('bhij,bhj->bhi', S, kt)
+            S = S - mt[:, t].unsqueeze(-1) * torch.einsum('bhi,bhj->bhij', Sk, kt)
+            # Now standard delta write:
+            Sk = torch.einsum('bhij,bhj->bhi', S, kt)
+            err = vt - Sk
+            S = S + beta[:, t].unsqueeze(-1) * torch.einsum('bhi,bhj->bhij', err, kt)
+            yt = torch.einsum('bhij,bhj->bhi', S, q[:, t])
+            ys.append(yt)
+        y = torch.stack(ys, dim=1).reshape(B, T, H * D)
+        return self.o(self.dropout(y))
+
+
+class SlotHopfieldBlock(nn.Module):
+    """SH-Mem: Slot-based content-addressable memory + Hopfield read.
+
+    Fundamentally different substrate from rank-1 delta accumulation:
+      State = N "slots", each a (key, value) pair (B, N, H, D)
+      Write: content-addressable. Softmax over N slots gives soft assignment;
+             each token's (k, v) is blended into the most-similar slot.
+      Read:  Modern Hopfield retrieval. Softmax(β · q · slot_k / √D) over slots,
+             with learned inverse temperature β. High β → hard pattern retrieval.
+
+    Hypothesis for MQAR: bounded N slots = N independent KV pairs, no rank-1
+    collisions. Different memory primitive than every prior variant.
+    """
+    def __init__(self, d_model, num_heads=4, head_dim=32,
+                 num_slots=16, dropout=0.1):
+        super().__init__()
+        self.H = num_heads
+        self.D = head_dim
+        self.N = num_slots
+        d_inner = num_heads * head_dim
+        self.q = nn.Linear(d_model, d_inner, bias=False)
+        self.k = nn.Linear(d_model, d_inner, bias=False)
+        self.v = nn.Linear(d_model, d_inner, bias=False)
+        self.write_addr = nn.Linear(d_model, num_heads * num_slots, bias=False)
+        # Hopfield inverse temperature (learned, init to 1/sqrt(D) like standard attention)
+        self.log_beta = nn.Parameter(torch.zeros(num_heads))
+        self.o = nn.Linear(d_inner, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        self.attn_dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, T, _ = x.shape
+        H, D, N = self.H, self.D, self.N
+        q = self.q(x).view(B, T, H, D)
+        k = F.normalize(self.k(x).view(B, T, H, D), dim=-1)
+        v = self.v(x).view(B, T, H, D)
+        q = F.silu(q)
+        # B,T,H,N soft write addresses
+        w_logits = self.write_addr(x).view(B, T, H, N)
+        w_addr = F.softmax(w_logits, dim=-1)
+        # Slot memory: (B, H, N, D)
+        slot_k = torch.zeros(B, H, N, D, device=x.device, dtype=x.dtype)
+        slot_v = torch.zeros(B, H, N, D, device=x.device, dtype=x.dtype)
+        beta = (1.0 / math.sqrt(D)) * torch.exp(self.log_beta).view(1, H, 1)  # 1,H,1
+
+        ys = []
+        for t in range(T):
+            kt = k[:, t]; vt = v[:, t]; wa = w_addr[:, t]   # wa: B,H,N
+            # Soft write: blend (kt, vt) into slots by wa
+            # New slot = (1 - wa) * old + wa * new_value
+            wa_exp = wa.unsqueeze(-1)                        # B,H,N,1
+            slot_k = (1 - wa_exp) * slot_k + wa_exp * kt.unsqueeze(-2)
+            slot_v = (1 - wa_exp) * slot_v + wa_exp * vt.unsqueeze(-2)
+            # Hopfield read: softmax(β · q · slot_k) over N slots
+            scores = torch.einsum('bhd,bhnd->bhn', q[:, t], slot_k) * beta  # B,H,N
+            attn = self.attn_dropout(F.softmax(scores, dim=-1))
+            yt = torch.einsum('bhn,bhnd->bhd', attn, slot_v)
+            ys.append(yt)
+        y = torch.stack(ys, dim=1).reshape(B, T, H * D)
+        return self.o(self.dropout(y))
+
+
+class TTTDeltaBlock(nn.Module):
+    """TTT-DN: Test-Time Training applied to the delta state.
+
+    Standard DeltaNet does ONE gradient step per token on the inner loss
+    ||S k_t - v_t||² (with step size β). TTT-DN takes K inner steps per token
+    with a learned per-step LR. State refinement is more thorough; small writes
+    accumulate to higher recall.
+
+    For K=1 with input-driven step, equals plain DN. For K>1 it's strictly
+    a generalisation. Mechanism resembles TTT (Sun 2024) but applied to a
+    delta-rule outer-product state rather than an MLP.
+    """
+    def __init__(self, d_model, num_heads=4, head_dim=32, K=3, dropout=0.1):
+        super().__init__()
+        self.H = num_heads
+        self.D = head_dim
+        self.K_steps = K
+        d_inner = num_heads * head_dim
+        self.q = nn.Linear(d_model, d_inner, bias=False)
+        self.k = nn.Linear(d_model, d_inner, bias=False)
+        self.v = nn.Linear(d_model, d_inner, bias=False)
+        # K learned step sizes per head, all softplus-positive
+        self.step_log = nn.Parameter(torch.zeros(K, num_heads))
+        # Plus input-dep gate scaling on the first step (like β)
+        self.beta = nn.Linear(d_model, num_heads)
+        self.o = nn.Linear(d_inner, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, T, _ = x.shape
+        H, D = self.H, self.D
+        K = self.K_steps
+        q = self.q(x).view(B, T, H, D)
+        k = F.normalize(self.k(x).view(B, T, H, D), dim=-1)
+        v = self.v(x).view(B, T, H, D)
+        beta = torch.sigmoid(self.beta(x)).view(B, T, H, 1, 1)
+        q = F.silu(q)
+        steps = F.softplus(self.step_log)                                   # K,H
+
+        S = torch.zeros(B, H, D, D, device=x.device, dtype=x.dtype)
+        ys = []
+        for t in range(T):
+            kt = k[:, t]; vt = v[:, t]
+            for ki in range(K):
+                eta = steps[ki].view(1, H, 1, 1)                            # 1,H,1,1
+                Sk = torch.einsum('bhij,bhj->bhi', S, kt)
+                err = vt - Sk
+                # 1st step also modulated by β (input-driven gate)
+                if ki == 0:
+                    eta = eta * beta[:, t]
+                S = S + eta * torch.einsum('bhi,bhj->bhij', err, kt)
+            yt = torch.einsum('bhij,bhj->bhi', S, q[:, t])
+            ys.append(yt)
+        y = torch.stack(ys, dim=1).reshape(B, T, H * D)
+        return self.o(self.dropout(y))
+
+
+class Mamba2Block(nn.Module):
+    """Mamba-2 / SSD: selective scan with diagonal scalar A.
+
+    State recurrence per head:
+        h_t = a_t * h_{t-1} + b_t * v_t · k_t^T          (rank-1 add, scalar gate)
+        y_t = q_t^T h_t
+
+    a_t = exp(-softplus(W_a x_t))   scalar in (0,1) (forget gate per head)
+    b_t = σ(W_b x_t)                scalar in (0,1) (input gate per head)
+    Selective: a_t and b_t depend on x_t.
+
+    This is the SSD (state-space duality) form: A is diagonal scalar per head
+    so the scan can be matmul-ified. We do a sequential scan here for
+    simplicity at T=64-128 sizes.
+    """
+    def __init__(self, d_model, num_heads=4, head_dim=32, dropout=0.1):
+        super().__init__()
+        self.H = num_heads
+        self.D = head_dim
+        d_inner = num_heads * head_dim
+        self.q = nn.Linear(d_model, d_inner, bias=False)
+        self.k = nn.Linear(d_model, d_inner, bias=False)
+        self.v = nn.Linear(d_model, d_inner, bias=False)
+        self.a_proj = nn.Linear(d_model, num_heads)
+        self.b_proj = nn.Linear(d_model, num_heads)
+        self.o = nn.Linear(d_inner, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, T, _ = x.shape
+        H, D = self.H, self.D
+        q = self.q(x).view(B, T, H, D)
+        k = self.k(x).view(B, T, H, D)
+        v = self.v(x).view(B, T, H, D)
+        # Discretized A and B; A in (0,1), B in (0,1) via gates.
+        a = torch.exp(-F.softplus(self.a_proj(x))).view(B, T, H, 1, 1)   # forget
+        b = torch.sigmoid(self.b_proj(x)).view(B, T, H, 1, 1)             # write
+        q = F.silu(q)
+
+        h = torch.zeros(B, H, D, D, device=x.device, dtype=x.dtype)
+        ys = []
+        for t in range(T):
+            kt = k[:, t]; vt = v[:, t]
+            kv = torch.einsum('bhi,bhj->bhij', vt, kt)    # rank-1 outer
+            h = a[:, t] * h + b[:, t] * kv
+            yt = torch.einsum('bhij,bhj->bhi', h, q[:, t])
+            ys.append(yt)
+        y = torch.stack(ys, dim=1).reshape(B, T, H * D)
+        return self.o(self.dropout(y))
+
+
+class MoEDeltaBlock(nn.Module):
+    """MoE-DN: Mixture-of-Experts DeltaNet.
+
+    Each token is routed (top-k softmax over E experts) into k of E independent
+    delta heads. Each expert maintains its own state S^e ∈ R^{D×D}. The router
+    is a linear classifier on x_t. Read combines top-k experts weighted by
+    router scores.
+
+    Hypothesis: MQAR's K distinct KV pairs can be stored in K distinct experts
+    without rank-1 interference. Standard DN crams them all into one S.
+    """
+    def __init__(self, d_model, num_heads=4, head_dim=32,
+                 num_experts=8, top_k=2, dropout=0.1):
+        super().__init__()
+        self.H = num_heads
+        self.D = head_dim
+        self.E = num_experts
+        self.K = top_k
+        d_inner = num_heads * head_dim
+        self.q = nn.Linear(d_model, d_inner, bias=False)
+        self.k = nn.Linear(d_model, d_inner, bias=False)
+        self.v = nn.Linear(d_model, d_inner, bias=False)
+        self.beta = nn.Linear(d_model, num_heads)
+        self.router = nn.Linear(d_model, num_experts, bias=False)
+        self.o = nn.Linear(d_inner, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, T, _ = x.shape
+        H, D, E, K = self.H, self.D, self.E, self.K
+        q = self.q(x).view(B, T, H, D)
+        k = F.normalize(self.k(x).view(B, T, H, D), dim=-1)
+        v = self.v(x).view(B, T, H, D)
+        beta = torch.sigmoid(self.beta(x)).view(B, T, H, 1)
+        q = F.silu(q)
+        # Router: B,T,E logits → top-k indices + weights
+        router_logits = self.router(x)                       # B,T,E
+        top_w, top_idx = router_logits.topk(K, dim=-1)        # both B,T,K
+        top_w = F.softmax(top_w, dim=-1)                      # normalize within top-k
+
+        # Per-expert states: (B, E, H, D, D). Allocating all is fine since E small.
+        S = torch.zeros(B, E, H, D, D, device=x.device, dtype=x.dtype)
+        ys = []
+        for t in range(T):
+            kt = k[:, t]; vt = v[:, t]; bt = beta[:, t]
+            idx_t = top_idx[:, t]                              # B,K
+            w_t = top_w[:, t]                                  # B,K
+            # For each of the K routed experts, write update on their state.
+            # We do this in a loop over K (small) for clarity.
+            for ki in range(K):
+                ei = idx_t[:, ki]                              # B
+                Se = S[torch.arange(B), ei]                    # B,H,D,D
+                Sk = torch.einsum('bhij,bhj->bhi', Se, kt)
+                err = vt - Sk
+                S[torch.arange(B), ei] = Se + (w_t[:, ki:ki+1].unsqueeze(-1).unsqueeze(-1) *
+                                                bt.unsqueeze(-1) *
+                                                torch.einsum('bhi,bhj->bhij', err, kt))
+            # Read: weighted sum over routed experts
+            y_t = torch.zeros(B, H, D, device=x.device, dtype=x.dtype)
+            for ki in range(K):
+                ei = idx_t[:, ki]
+                Se = S[torch.arange(B), ei]
+                y_t = y_t + w_t[:, ki:ki+1].unsqueeze(-1) * torch.einsum('bhij,bhj->bhi', Se, q[:, t])
+            ys.append(y_t)
+        y = torch.stack(ys, dim=1).reshape(B, T, H * D)
+        return self.o(self.dropout(y))
+
+
+class BufferedDeltaBlock(nn.Module):
+    """BD-N: short attention KV-cache for recent + delta state for distant.
+
+    Maintains a sliding window of (k, v) pairs (size W). At time t, output is
+    formed by:
+      buf-attention: softmax(q_t · K_buf / sqrt(D)) · V_buf
+      delta-read:    q_t^T S_t                        (S = long-term delta state)
+      y_t = buf_out + delta_out
+
+    On each step the new (k_t, v_t) enters the buffer; the *oldest* entry
+    rolls into the delta state via the standard rank-1 delta update.
+
+    Hypothesis: registration of W consecutive distinct KV pairs lives cleanly
+    in the buffer (no rank-1 collisions); distant context still accessible
+    via S. Directly addresses MQAR's KV-then-query structure.
+    """
+    def __init__(self, d_model, num_heads=4, head_dim=32, buffer_size=16, dropout=0.1):
+        super().__init__()
+        self.H = num_heads
+        self.D = head_dim
+        self.W = buffer_size
+        d_inner = num_heads * head_dim
+        self.q = nn.Linear(d_model, d_inner, bias=False)
+        self.k = nn.Linear(d_model, d_inner, bias=False)
+        self.v = nn.Linear(d_model, d_inner, bias=False)
+        self.beta = nn.Linear(d_model, num_heads)
+        self.o = nn.Linear(d_inner, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        self.attn_dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, T, _ = x.shape
+        H, D, W = self.H, self.D, self.W
+        q = self.q(x).view(B, T, H, D)
+        k = F.normalize(self.k(x).view(B, T, H, D), dim=-1)
+        v = self.v(x).view(B, T, H, D)
+        beta = torch.sigmoid(self.beta(x)).view(B, T, H, 1)
+        q = F.silu(q)
+
+        # Long-term delta state
+        S = torch.zeros(B, H, D, D, device=x.device, dtype=x.dtype)
+        # Buffer of recent (k, v); start empty. Use lists for simplicity.
+        K_buf = []      # entries are tensors B,H,D
+        V_buf = []
+        ys = []
+        for t in range(T):
+            kt = k[:, t]; vt = v[:, t]; bt = beta[:, t]
+            # Eject oldest entry from buffer into delta state (if buffer full)
+            if len(K_buf) >= W:
+                kt_old = K_buf.pop(0)
+                vt_old = V_buf.pop(0)
+                Sk = torch.einsum('bhij,bhj->bhi', S, kt_old)
+                err = vt_old - Sk
+                S = S + bt.unsqueeze(-1) * torch.einsum('bhi,bhj->bhij', err, kt_old)
+            K_buf.append(kt); V_buf.append(vt)
+            # Buffer attention (causal: only over current buffer contents)
+            K_stack = torch.stack(K_buf, dim=2)   # B,H,L,D where L=len(K_buf)
+            V_stack = torch.stack(V_buf, dim=2)
+            scores = torch.einsum('bhd,bhld->bhl', q[:, t], K_stack) / math.sqrt(D)
+            attn = self.attn_dropout(F.softmax(scores, dim=-1))
+            buf_out = torch.einsum('bhl,bhld->bhd', attn, V_stack)        # B,H,D
+            # Delta read of long-term state
+            delta_out = torch.einsum('bhij,bhj->bhi', S, q[:, t])
+            yt = buf_out + delta_out
+            ys.append(yt)
+        y = torch.stack(ys, dim=1).reshape(B, T, H * D)
+        return self.o(self.dropout(y))
+
+
 # -----------------------------------------------------------------------------
 # AttRD block: same DeltaRule write, attention read over the full {S_τ} sequence
 # -----------------------------------------------------------------------------
@@ -222,7 +679,7 @@ class TransformerBlock(nn.Module):
 # -----------------------------------------------------------------------------
 class SeqModel(nn.Module):
     def __init__(self, arch, vocab, d_model=128, num_layers=2, num_heads=4,
-                 head_dim=32, d_read=32, mlp_ratio=2, dropout=0.1):
+                 head_dim=32, d_read=32, mlp_ratio=2, buffer_size=16, dropout=0.1):
         super().__init__()
         self.arch = arch
         self.emb = nn.Embedding(vocab, d_model)
@@ -234,6 +691,23 @@ class SeqModel(nn.Module):
                 blocks.append(AttRDBlock(d_model, num_heads, head_dim, d_read, dropout))
             elif arch == 'transformer':
                 blocks.append(TransformerBlock(d_model, num_heads, head_dim, mlp_ratio, dropout))
+            elif arch == 'tpdn':
+                blocks.append(TwoPhaseDeltaBlock(d_model, num_heads, head_dim, dropout))
+            elif arch == 'adabdn':
+                blocks.append(AdaptiveBetaDeltaBlock(d_model, num_heads, head_dim, dropout))
+            elif arch == 'fdn':
+                blocks.append(ForgetDeltaBlock(d_model, num_heads, head_dim, dropout))
+            elif arch == 'bdn':
+                blocks.append(BufferedDeltaBlock(d_model, num_heads, head_dim,
+                                                   buffer_size=buffer_size, dropout=dropout))
+            elif arch == 'moedn':
+                blocks.append(MoEDeltaBlock(d_model, num_heads, head_dim, dropout=dropout))
+            elif arch == 'mamba2':
+                blocks.append(Mamba2Block(d_model, num_heads, head_dim, dropout=dropout))
+            elif arch == 'tttdn':
+                blocks.append(TTTDeltaBlock(d_model, num_heads, head_dim, dropout=dropout))
+            elif arch == 'slothop':
+                blocks.append(SlotHopfieldBlock(d_model, num_heads, head_dim, dropout=dropout))
             else:
                 raise ValueError(arch)
         self.blocks = nn.ModuleList(blocks)

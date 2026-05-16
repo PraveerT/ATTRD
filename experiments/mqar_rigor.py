@@ -42,8 +42,11 @@ def evaluate(model, args, device, rng, n_steps):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--arch', choices=['deltanet', 'attrd', 'transformer'], required=True)
+    p.add_argument('--arch', choices=['deltanet', 'attrd', 'transformer',
+                                       'tpdn', 'adabdn', 'fdn', 'bdn', 'moedn',
+                                       'mamba2', 'tttdn', 'slothop'], required=True)
     p.add_argument('--mlp_ratio', type=int, default=2)
+    p.add_argument('--buffer_size', type=int, default=16)
     p.add_argument('--vocab', type=int, default=256)
     p.add_argument('--T', type=int, default=64)
     p.add_argument('--kv', type=int, default=8)
@@ -60,6 +63,7 @@ def main():
     p.add_argument('--val_steps', type=int, default=20)
     p.add_argument('--test_steps', type=int, default=40)
     p.add_argument('--seed', type=int, default=0)
+    p.add_argument('--warmup_frac', type=float, default=0.0)
     p.add_argument('--out_json', type=str, required=True)
     p.add_argument('--tag', type=str, default='')
     args = p.parse_args()
@@ -69,7 +73,8 @@ def main():
 
     model = SeqModel(args.arch, args.vocab, args.d_model, args.layers,
                      args.heads, args.head_dim, args.d_read,
-                     mlp_ratio=args.mlp_ratio, dropout=0.1).to(device)
+                     mlp_ratio=args.mlp_ratio, buffer_size=args.buffer_size,
+                     dropout=0.1).to(device)
     n_params = sum(p.numel() for p in model.parameters())
 
     print(f'run: {args.tag or args.arch}', flush=True)
@@ -79,7 +84,19 @@ def main():
           f'lr={args.lr} seed={args.seed}', flush=True)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
+    if args.warmup_frac > 0:
+        # per-step LR: linear warmup over warmup_frac of total batches, then cosine to 0
+        total_steps = args.epochs * args.steps_per_epoch
+        warmup_steps = int(args.warmup_frac * total_steps)
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return (step + 1) / max(1, warmup_steps)
+            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            return 0.5 * (1 + math.cos(math.pi * progress))
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+    else:
+        # per-epoch (back-compat for prior runs)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
 
     # Separate RNGs: train, val, test — disjoint seeds, deterministic across runs.
     train_rng = np.random.default_rng(1000 + args.seed)
@@ -101,13 +118,16 @@ def main():
             opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
+            if args.warmup_frac > 0:
+                sched.step()       # per-step when warmup is enabled
             with torch.no_grad():
                 pred = logits.argmax(-1)
                 m = (y != -100)
                 tot_correct += ((pred == y) & m).sum().item()
                 tot_tokens  += m.sum().item()
                 tot_loss    += loss.item()
-        sched.step()
+        if args.warmup_frac == 0:
+            sched.step()           # per-epoch when no warmup (backward compatible)
         tr_acc = 100 * tot_correct / max(1, tot_tokens)
         tr_loss = tot_loss / args.steps_per_epoch
 
