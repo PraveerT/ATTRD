@@ -157,11 +157,19 @@ class BDeltaQBlock(nn.Module):
 
 
 class BDeltaQTemporalEncoder(nn.Module):
-    """Bidirectional BDN-Q encoder. Mirrors RealDeltaNetTemporalEncoder."""
+    """Bidirectional BDN-Q encoder. Mirrors RealDeltaNetTemporalEncoder.
+
+    scan_axis: 'T' (default) scans length-T per-point trajectories;
+               'N' scans length-N per-frame point traversals. With T<<N,
+               'N' gives buf=1 ejections=N-1 (vs T-1 for 'T'), exercising
+               the long-term delta state.
+    """
     def __init__(self, in_channels, hidden_dim=128, output_dim=None, num_layers=2,
                  num_heads=4, n_q=4, n_v=8, buffer_size=4, dropout=0.3,
-                 bidirectional=True):
+                 bidirectional=True, scan_axis='T'):
         super().__init__()
+        assert scan_axis in ('T', 'N'), f'scan_axis must be T or N, got {scan_axis}'
+        self.scan_axis = scan_axis
         self.in_channels = in_channels
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim if output_dim is not None else hidden_dim
@@ -193,7 +201,12 @@ class BDeltaQTemporalEncoder(nn.Module):
 
     def forward(self, x):
         Bz, C, T, N = x.shape
-        x = x.permute(0, 3, 2, 1).reshape(Bz * N, T, C)
+        if self.scan_axis == 'T':
+            # per-point trajectories: each of N points gets a length-T sequence.
+            x = x.permute(0, 3, 2, 1).reshape(Bz * N, T, C)            # (Bz*N, T, C)
+        else:
+            # per-frame point traversals: each of T frames gets a length-N sequence.
+            x = x.permute(0, 2, 3, 1).reshape(Bz * T, N, C)            # (Bz*T, N, C)
         x = self.input_proj(x)
         fwd = self._stack(x, self.fwd_blocks, self.fwd_norms)
         out = fwd
@@ -202,7 +215,10 @@ class BDeltaQTemporalEncoder(nn.Module):
             out = out + bwd
         out = self.final_norm(out)
         out = self.output_proj(out)
-        out = out.reshape(Bz, N, T, self.output_dim).permute(0, 3, 2, 1)
+        if self.scan_axis == 'T':
+            out = out.reshape(Bz, N, T, self.output_dim).permute(0, 3, 2, 1)   # (Bz, hidden, T, N)
+        else:
+            out = out.reshape(Bz, T, N, self.output_dim).permute(0, 3, 1, 2)   # (Bz, hidden, T, N)
         return out
 
 
@@ -210,7 +226,7 @@ class MotionBDeltaQ(Motion):
     """PMamba with BDN-Q (buffered delta on quaternion-shape substrate)."""
     def __init__(self, *args, bdnq_hidden_dim=128, bdnq_num_layers=2, bdnq_num_heads=4,
                  bdnq_n_q=4, bdnq_n_v=8, bdnq_buffer_size=1, bdnq_dropout=0.3,
-                 bdnq_bidirectional=True, **kwargs):
+                 bdnq_bidirectional=True, bdnq_scan_axis='T', **kwargs):
         super().__init__(*args, **kwargs)
         old = self.mamba
         in_c = old.in_channels
@@ -220,4 +236,5 @@ class MotionBDeltaQ(Motion):
             num_layers=bdnq_num_layers, num_heads=bdnq_num_heads,
             n_q=bdnq_n_q, n_v=bdnq_n_v, buffer_size=bdnq_buffer_size,
             dropout=bdnq_dropout, bidirectional=bdnq_bidirectional,
+            scan_axis=bdnq_scan_axis,
         )
