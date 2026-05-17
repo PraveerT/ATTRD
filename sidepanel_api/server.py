@@ -20,6 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, 'static')
 LOG_GLOB = '/notebooks/PMamba/experiments/work_dir/*.log'
+LEADERBOARD = '/notebooks/PMamba/experiments/LEADERBOARD.md'
 
 _cache = {'ts': 0, 'data': None}
 _CACHE_SEC = 5
@@ -95,6 +96,63 @@ def disk_stats():
         return None
 
 
+def leaderboard_md():
+    try:
+        with open(LEADERBOARD, 'r', errors='replace') as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
+def _parse_md_table(lines, start):
+    """Parse a markdown pipe table starting at start (header line). Returns (rows, end_idx).
+    rows is a list of dicts using the header names as keys."""
+    if start >= len(lines) or '|' not in lines[start]:
+        return [], start
+    header_cells = [c.strip() for c in lines[start].strip().strip('|').split('|')]
+    # next line should be separator |---|---|
+    if start + 1 >= len(lines) or '---' not in lines[start + 1]:
+        return [], start
+    rows = []
+    i = start + 2
+    while i < len(lines):
+        ln = lines[i].rstrip()
+        if '|' not in ln or not ln.strip():
+            break
+        cells = [c.strip() for c in ln.strip().strip('|').split('|')]
+        if len(cells) != len(header_cells):
+            break
+        rows.append(dict(zip(header_cells, cells)))
+        i += 1
+    return rows, i
+
+
+def leaderboard_summary():
+    md = leaderboard_md()
+    if not md:
+        return None
+    lines = md.splitlines()
+    sections = {}  # heading-text -> list of rows
+    current = None
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        if ln.startswith('## '):
+            current = ln[3:].strip()
+            sections[current] = []
+            i += 1
+            continue
+        # Look for table start under current section
+        if current and '|' in ln and i + 1 < len(lines) and '---' in lines[i + 1]:
+            rows, end = _parse_md_table(lines, i)
+            if rows:
+                sections[current].append(rows)
+                i = end
+                continue
+        i += 1
+    return sections
+
+
 def build_status():
     log = latest_log()
     parsed = parse_log(log) if log else {'epochs': [], 'best': None, 'now': {}}
@@ -105,6 +163,7 @@ def build_status():
         'gpu': gpu_stats(),
         'ram': ram_stats(),
         'disk': disk_stats(),
+        'leaderboard': leaderboard_summary(),
         **parsed,
     }
 
