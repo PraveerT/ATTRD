@@ -359,12 +359,21 @@ class Processor():
                 # Use quadratic progression for faster increase
                 pts_size = int(128 + (256 - 128) * (progress ** 2))
             else:
-                rr = getattr(self.arg, 'pts_random_range', None)
-                if rr:
-                    import random as _rnd
-                    pts_size = _rnd.randint(int(rr[0]), int(rr[1]))
+                extra_target = getattr(self.arg, 'pts_extra_target', None)
+                extra_epochs = getattr(self.arg, 'pts_extra_epochs', None)
+                if extra_target is not None and extra_epochs is not None:
+                    if epoch < 100 + extra_epochs:
+                        progress = (epoch - 100) / extra_epochs
+                        pts_size = int(256 + (extra_target - 256) * progress)
+                    else:
+                        pts_size = extra_target
                 else:
-                    pts_size = 256
+                    rr = getattr(self.arg, 'pts_random_range', None)
+                    if rr:
+                        import random as _rnd
+                        pts_size = _rnd.randint(int(rr[0]), int(rr[1]))
+                    else:
+                        pts_size = 256
             
             # Update model's pts_size
             model_ref.pts_size = pts_size
@@ -563,6 +572,12 @@ class Processor():
                 optimizer = Optimizer(model, optimizer_args)
                 optimizer.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
                 optimizer.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+                # Override scheduler milestones with new config (for resume + new schedule)
+                if hasattr(optimizer.scheduler, "milestones") and self.arg.optimizer_args.get("step"):
+                    from collections import Counter
+                    new_steps = self.arg.optimizer_args["step"]
+                    optimizer.scheduler.milestones = Counter(new_steps)
+                    self.recoder.print_log("Override scheduler milestones to {} (new config step)".format(new_steps))
             else:
                 if self.arg.weights:
                     self.recoder.print_log('Initializing model weights from {}.'.format(self.arg.weights))

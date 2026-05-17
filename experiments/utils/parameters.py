@@ -97,6 +97,16 @@ def get_parser():
         default=None,
         help='number of epochs for custom linear ramp from 48 to pts_ramp_target')
     parser.add_argument(
+        '--pts-extra-target',
+        type=int,
+        default=None,
+        help='extend ramp past 256 to this target after ep 100')
+    parser.add_argument(
+        '--pts-extra-epochs',
+        type=int,
+        default=None,
+        help='epochs to spend ramping 256 -> pts_extra_target after ep 100')
+    parser.add_argument(
         '--pts-freeze-after-ep',
         type=int,
         default=None,
