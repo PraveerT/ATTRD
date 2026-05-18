@@ -37,6 +37,7 @@ class Processor:
         if self.arg.random_fix:
             self.rng = RandomState(seed=self.arg.random_seed)
         self.device = GpuDataParallel()
+        self.device.set_device(self.arg.device)
         self.recoder = Recorder(self.arg.work_dir, self.arg.print_log)
         self.data_loader = {}
         self.topk = (1, 5)
