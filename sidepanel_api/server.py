@@ -19,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, 'static')
-LOG_GLOB = '/notebooks/Anemon/experiments/work_dir/*.log'
+LOG_GLOB = '/notebooks/Anemon/experiments/work_dir/**/log.txt'
 LEADERBOARD = '/notebooks/Anemon/experiments/LEADERBOARD.md'
 
 _cache = {'ts': 0, 'data': None}
@@ -27,7 +27,7 @@ _CACHE_SEC = 5
 
 
 def latest_log():
-    files = sorted(glob.glob(LOG_GLOB), key=os.path.getmtime, reverse=True)
+    files = sorted(glob.glob(LOG_GLOB, recursive=True), key=os.path.getmtime, reverse=True)
     return files[0] if files else None
 
 
@@ -165,7 +165,7 @@ def build_status():
     parsed = parse_log(log) if log else {'epochs': [], 'best': None, 'now': {}}
     return {
         'ts': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'run': os.path.basename(log).replace('.log', '') if log else None,
+        'run': os.path.basename(os.path.dirname(log)) if log else None,
         'log': log,
         'gpu': gpu_stats(),
         'ram': ram_stats(),
