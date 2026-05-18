@@ -140,7 +140,7 @@ class Processor:
         self.arg.model_args['pts_size'] = pts_size
 
         loader = self.data_loader['train']
-        loss_value, aux_loss_values = [], []
+        loss_value = []
         correct, total = 0, 0
         self.recoder.timer_reset()
         cur_lr = [g['lr'] for g in self.optimizer.optimizer.param_groups]
@@ -155,16 +155,7 @@ class Processor:
             output = self.model(image)
             self.recoder.record_timer('forward')
 
-            classification_loss = torch.mean(self.loss(output, label))
-            loss = classification_loss
-
-            # Optional auxiliary loss exposed by the model
-            aux_loss = None
-            if hasattr(model_ref, 'get_auxiliary_loss'):
-                aux_loss = model_ref.get_auxiliary_loss()
-                if aux_loss is not None:
-                    loss = loss + aux_loss
-                    aux_loss_values.append(aux_loss.detach().item())
+            loss = torch.mean(self.loss(output, label))
 
             self.optimizer.zero_grad()
             loss.backward()

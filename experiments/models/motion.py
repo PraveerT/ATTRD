@@ -4,7 +4,6 @@ import torch.nn.functional as F
 from models.op import MLPBlock, MotionBlock, GroupOperation
 
 # Use installed mamba_ssm for optimal performance
-from mamba_ssm.modules.mamba_simple import Mamba
 
 
 class MultiScaleFeatureProcessor(nn.Module):
@@ -82,136 +81,6 @@ class MultiScaleFeatureProcessor(nn.Module):
         return output + x
 
 
-class QuaternionLinear(nn.Module):
-    """Simplified quaternion linear transformation for rotation-equivariant features."""
-    
-    def __init__(self, in_features: int, out_features: int):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        
-        # Quaternion components: real, i, j, k (adjusted for quaternion structure)
-        quat_in = in_features // 4 if in_features % 4 == 0 else (in_features + 4 - in_features % 4) // 4
-        quat_out = out_features // 4 if out_features % 4 == 0 else (out_features + 4 - out_features % 4) // 4
-        
-        self.weight_r = nn.Parameter(torch.randn(quat_out, quat_in) * 0.02)
-        self.weight_i = nn.Parameter(torch.randn(quat_out, quat_in) * 0.02)
-        self.weight_j = nn.Parameter(torch.randn(quat_out, quat_in) * 0.02)
-        self.weight_k = nn.Parameter(torch.randn(quat_out, quat_in) * 0.02)
-        
-        # Adjust bias for quaternion output
-        quat_out_total = quat_out * 4
-        self.bias = nn.Parameter(torch.zeros(quat_out_total))
-        
-        # Add dropout for regularization
-        self.dropout = nn.Dropout(0.2)
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # For simplicity, treat input as quaternion by splitting into 4 parts
-        B, T, C = x.shape
-        
-        if C % 4 != 0:
-            # Pad to make divisible by 4
-            pad_size = 4 - (C % 4)
-            x = F.pad(x, (0, pad_size))
-            C = x.shape[2]
-        
-        # Split into quaternion components
-        x = x.view(B, T, 4, C // 4)
-        x_r, x_i, x_j, x_k = x[:, :, 0], x[:, :, 1], x[:, :, 2], x[:, :, 3]
-        
-        # Quaternion multiplication (simplified)
-        out_r = torch.matmul(x_r, self.weight_r.t()) - torch.matmul(x_i, self.weight_i.t()) - \
-                torch.matmul(x_j, self.weight_j.t()) - torch.matmul(x_k, self.weight_k.t())
-                
-        out_i = torch.matmul(x_r, self.weight_i.t()) + torch.matmul(x_i, self.weight_r.t()) + \
-                torch.matmul(x_j, self.weight_k.t()) - torch.matmul(x_k, self.weight_j.t())
-                
-        out_j = torch.matmul(x_r, self.weight_j.t()) - torch.matmul(x_i, self.weight_k.t()) + \
-                torch.matmul(x_j, self.weight_r.t()) + torch.matmul(x_k, self.weight_i.t())
-                
-        out_k = torch.matmul(x_r, self.weight_k.t()) + torch.matmul(x_i, self.weight_j.t()) - \
-                torch.matmul(x_j, self.weight_i.t()) + torch.matmul(x_k, self.weight_r.t())
-        
-        # Stack and reshape
-        out = torch.stack([out_r, out_i, out_j, out_k], dim=2)
-        out = out.view(B, T, -1)
-        
-        # Adjust output size to match expected dimensions and add bias
-        if out.shape[2] != self.out_features:
-            if out.shape[2] > self.out_features:
-                out = out[:, :, :self.out_features]
-            else:
-                pad_size = self.out_features - out.shape[2]
-                out = F.pad(out, (0, pad_size))
-        
-        out = out + self.bias[:out.shape[2]]
-        
-        # Apply dropout during training
-        out = self.dropout(out)
-        
-        return out
-
-
-class MambaTemporalEncoder(nn.Module):
-    """Mamba-based temporal encoder for point cloud sequences"""
-    def __init__(self, in_channels, hidden_dim, output_dim=None, num_layers=2):
-        super().__init__()
-        self.in_channels = in_channels
-        self.hidden_dim = hidden_dim
-        self.output_dim = output_dim if output_dim is not None else hidden_dim
-        
-        # Input projection with quaternion transformation
-        self.input_proj = QuaternionLinear(in_channels, hidden_dim)
-        
-        # Mamba blocks - using direct Mamba layers instead of Block wrapper
-        self.mamba_layers = nn.ModuleList([
-            Mamba(
-                d_model=hidden_dim,
-                d_state=16,
-                d_conv=4,
-                expand=2,
-            )
-            for _ in range(num_layers)
-        ])
-        
-        # Layer norms for each block
-        self.norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
-        
-        # Dropout for regularization
-        self.dropout = nn.Dropout(0.3)
-        
-        # Output projection with quaternion transformation
-        self.output_proj = QuaternionLinear(hidden_dim, self.output_dim)
-        self.final_norm = nn.LayerNorm(hidden_dim)
-        
-    def forward(self, x):
-        # x shape: B, C, T, N
-        B, C, T, N = x.shape
-        
-        # Reshape to B*N, T, C for temporal processing
-        x = x.permute(0, 3, 2, 1).reshape(B * N, T, C)
-        
-        # Project to hidden dimension
-        x = self.input_proj(x)
-        
-        # Apply Mamba layers with residual connections
-        for mamba, norm in zip(self.mamba_layers, self.norms):
-            residual = x
-            x = norm(x)
-            x = mamba(x)
-            x = self.dropout(x)
-            x = x + residual
-            
-        # Output projection and normalization
-        x = self.final_norm(x)
-        x = self.output_proj(x)
-        
-        # Reshape back to B, output_dim, T, N
-        x = x.reshape(B, N, T, self.output_dim).permute(0, 3, 2, 1)
-        
-        return x
-
 
 class Motion(nn.Module):
     def __init__(self, num_classes, pts_size, topk=16, downsample=(2, 2, 2),
@@ -236,7 +105,10 @@ class Motion(nn.Module):
         self.group = GroupOperation()
         # Replace LSTM with Mamba temporal encoder
         # Process features from stage3 (256 channels) with temporal modeling
-        self.mamba = MambaTemporalEncoder(in_channels=256, hidden_dim=128, output_dim=256, num_layers=2)
+        # self.mamba is replaced by subclasses (e.g. MotionCleanestLinXL)
+        self.mamba = nn.Identity()
+        self.mamba.in_channels = 256
+        self.mamba.output_dim = 256
         
         # Add Multi-scale Feature Processor layer after stage2
         self.multi_scale = MultiScaleFeatureProcessor(in_channels=(coord_channels + 64) * 2 - coord_channels, num_scales=multi_scale_num_scales, feature_dim=32)
