@@ -703,7 +703,7 @@ class RigidityEnsemble(nn.Module):
         # Return log of fused probs so cross-entropy -> NLL works as usual.
         return torch.log(fused.clamp(min=1e-9))
 
-class the modelDepthEarlyFusion(nn.Module):
+class DepthEarlyFusion(nn.Module):
     """Feature-level early-fusion of Motion (the model) + DepthCNNLSTM (v9c-style).
 
     pm_feat:  (B, 1024)  = Motion.extract_features
@@ -763,12 +763,12 @@ class the modelDepthEarlyFusion(nn.Module):
         if isinstance(inputs, (tuple, list)) and len(inputs) == 3:
             pts, depth, rig = inputs
         else:
-            raise ValueError("the modelDepthEarlyFusion expects (pts, depth, rigidity) tuple")
+            raise ValueError("DepthEarlyFusion expects (pts, depth, rigidity) tuple")
         pm_feat = self.backbone.extract_features(pts)
         dp_feat = self.depth.extract_features((depth, rig))
         return self.fusion_head(torch.cat([pm_feat, dp_feat], dim=1))
 
-class the modelRigidityReweight(Motion):
+class RigidityReweight(Motion):
     """the model Motion with v9c-clean per-clip CE reweighting.
 
     Accepts forward input as either a tensor (no reweighting) or a
@@ -809,7 +809,7 @@ class the modelRigidityReweight(Motion):
             self.latest_sample_weights = None
         return super().forward(pts)
 
-class the modelFlowAux(Motion):
+class FlowAux(Motion):
     """Motion with auxiliary per-frame rigidity-summary prediction head.
 
     Input accepted as either pts tensor or (pts, rigidity_tensor) tuple.
