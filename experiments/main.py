@@ -186,10 +186,6 @@ class Processor:
         train_loss = float(np.mean(loss_value)) if loss_value else 0.0
         self.recoder.print_log(f'\tMean training acc:  {train_acc:.4f}%.')
         self.recoder.print_log(f'\tMean training loss: {train_loss:.10f}.')
-        if aux_loss_values:
-            self.recoder.print_log(
-                f'\tMean auxiliary loss: {float(np.mean(aux_loss_values)):.10f}.'
-            )
 
         self.optimizer.scheduler.step()
         return train_acc, train_loss
