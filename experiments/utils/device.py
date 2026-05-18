@@ -57,7 +57,7 @@ class GpuDataParallel(object):
         elif torch.is_tensor(data):
             if data.dtype == torch.float64:
                 data = data.float()
-            return data.to(self.output_device)
+            return data.to(self.output_device, non_blocking=True)
         else:
             return data
 

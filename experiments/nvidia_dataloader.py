@@ -14,6 +14,9 @@ from utils.pts_transform import *
 from dataset import utils as dataset_utils
 
 class NvidiaLoader(data.Dataset):
+    # Per-worker in-process RAM cache for decoded npy files (filled lazily).
+    _npy_cache = {}
+
     def __init__(self, framerate, valid_subject=None, phase="train", datatype="depth", inputs_type="pts"):
         self.phase = phase
         self.datatype = datatype
@@ -22,7 +25,7 @@ class NvidiaLoader(data.Dataset):
         self.valid_subject = valid_subject
         self.inputs_list = self.get_inputs_list()
         self.r = re.compile('[ \t\n\r:]+')
-        
+
         # Load global dataset statistics
         try:
             self.dataset_stats = np.load('nvidia_dataset_stats.npy', allow_pickle=True).item()
@@ -38,10 +41,18 @@ class NvidiaLoader(data.Dataset):
             self.transform = self.transform_init("test")
 
     def __getitem__(self, index):
-        label = int(self.r.split(self.inputs_list[index])[-2])
-        input_data = np.load(f"../dataset/{self.r.split(self.inputs_list[index])[1][1:-4]}_pts.npy").astype(float)
+        line = self.inputs_list[index]
+        label = int(self.r.split(line)[-2])
+        path = f"../dataset/{self.r.split(line)[1][1:-4]}_pts.npy"
+        # RAM cache: first access loads from disk; subsequent epochs hit memory.
+        cached = NvidiaLoader._npy_cache.get(path)
+        if cached is None:
+            cached = np.load(path).astype(np.float32)
+            NvidiaLoader._npy_cache[path] = cached
+        # Copy because normalize/transform mutate in place.
+        input_data = cached.copy()
         input_data = self.normalize(input_data, self.framerate)
-        return input_data, label, self.inputs_list[index]
+        return input_data, label, line
 
     def get_inputs_list(self):
         prefix = "../dataset/Nvidia/Processed"
@@ -82,45 +93,19 @@ class NvidiaLoader(data.Dataset):
     def normalize(self, pts, fs):
         timestep, pts_size, channels = pts.shape
         pts = pts.reshape(-1, channels)
-        
-        # if self.dataset_stats is not None:
-        # Use global dataset statistics for consistent normalization
         pts[:, 0] = (pts[:, 0] - self.dataset_stats['x_mean']) / self.dataset_stats['x_std']
         pts[:, 1] = (pts[:, 1] - self.dataset_stats['y_mean']) / self.dataset_stats['y_std']
         pts[:, 2] = (pts[:, 2] - self.dataset_stats['z_mean']) / self.dataset_stats['z_std']
         pts[:, 3] = (pts[:, 3] - self.dataset_stats['t_mean']) / self.dataset_stats['t_std']
-        # else:
-        #     # Fallback to original per-sample normalization if stats not available
-        #     pts[:, 0] = (pts[:, 0] - np.mean(pts[:, 0])) / 120
-        #     pts[:, 1] = (pts[:, 1] - np.mean(pts[:, 1])) / 160
-        #     pts[:, 3] = (pts[:, 3] - fs / 2) / fs * 2
-        #     if (pts[:, 2].max() - pts[:, 2].min()) != 0:
-        #         pts[:, 2] = (pts[:, 2] - np.mean(pts[:, 2])) / (pts[:, 2].max() - pts[:, 2].min()) * 2
-        
         pts = self.transform(pts)
         pts = pts.reshape(timestep, pts_size, channels)
         return pts
 
     @staticmethod
     def transform_init(phase):
-        if phase == 'train':
-            transform = Compose([
-                PointcloudToTensor(),
-                PointcloudScale(lo=0.85, hi=1.15),
-                PointcloudRotatePerturbation(angle_sigma=0.08, angle_clip=0.22),
-                PointcloudTranslate(translate_range=0.1),
-                TemporalSpeedChange(speed_range=(0.85, 1.15), prob=0.3),
-                TemporalTranslate(max_shift_ratio=0.2, prob=0.4),
-                TemporalCutout(max_cutout_ratio=0.2, num_holes=(1, 4), prob=0.6),
-                TemporalShuffle(window_size=7, num_shuffles=4, prob=0.4),
-                PointcloudJitter(std=0.015, clip=0.06),
-                PointcloudRandomInputDropout(max_dropout_ratio=0.25),
-            ])
-        else:
-            transform = Compose([
-                PointcloudToTensor(),
-            ])
-        return transform
+        # All heavy augmentations moved to GpuAugmentor (utils/gpu_augment.py).
+        # Loader only does float-tensor conversion; train aug runs on GPU in main.train().
+        return Compose([PointcloudToTensor()])
 
     @staticmethod
     def key_frame_sampling(key_cnt, frame_size):

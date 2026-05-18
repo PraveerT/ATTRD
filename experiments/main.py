@@ -17,6 +17,7 @@ from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from utils import get_parser, import_class, GpuDataParallel, Optimizer, Recorder, Stat, RandomState
+from utils.gpu_augment import GpuAugmentor
 
 
 def dynamic_pts_size(epoch, arg):
@@ -44,6 +45,8 @@ class Processor:
         self.stat = Stat(self.arg.model_args['num_classes'], self.topk)
         self.model, self.optimizer = self.Loading()
         self.loss = self.criterion()
+        self.augmentor = GpuAugmentor()
+        self.device.model_to_device(self.augmentor)
         self.best_accuracy = 0.0
         self.use_static_pts = ('--pts-size' in sys.argv) or (
             not getattr(self.arg, 'dynamic_pts_size', True)
@@ -111,18 +114,19 @@ class Processor:
             self.data_loader['train'] = torch.utils.data.DataLoader(
                 dataset_class(**self.arg.train_loader_args),
                 batch_size=self.arg.batch_size, shuffle=True,
-                num_workers=self.arg.num_worker, pin_memory=True,
+                num_workers=self.arg.num_worker, pin_memory=True, persistent_workers=True, prefetch_factor=4,
             )
         self.data_loader['test'] = torch.utils.data.DataLoader(
             dataset_class(**self.arg.test_loader_args),
             batch_size=self.arg.test_batch_size, shuffle=False,
-            num_workers=self.arg.num_worker, pin_memory=True,
+            num_workers=self.arg.num_worker, pin_memory=True, persistent_workers=True, prefetch_factor=4,
         )
         self.recoder.print_log('Loading data finished.')
 
     # ---------------------------------------------------------------- training
     def train(self, epoch):
         self.model.train()
+        self.augmentor.train()
         model_ref = self.model.module if hasattr(self.model, 'module') else self.model
 
         # pts_size scheduling
@@ -152,6 +156,7 @@ class Processor:
             image = self.device.data_to_device(data[0])
             label = self.device.data_to_device(data[1])
             self.recoder.record_timer('device')
+            image = self.augmentor(image)
 
             output = self.model(image)
             self.recoder.record_timer('forward')
