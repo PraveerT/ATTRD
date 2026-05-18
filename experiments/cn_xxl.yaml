@@ -1,11 +1,11 @@
-# Ablation: same arch as QHDeltaNet but with Hamilton products replaced by
-# elementwise products. Tests whether the quaternion algebra is the active
-# ingredient, or whether the DeltaNet skeleton suffices.
+# CN-XXL: wider per-frame MLP encoder, deeper + wider than CN-XL.
+# Tests whether further increasing encoder params past CN-XL gets us
+# beyond RD's ~88-90% solo accuracy.
 
 dataloader: nvidia_dataloader.NvidiaLoader
 phase: train
 num_epoch: 120
-work_dir: ./work_dir/pmamba_baseline_mamba2/
+work_dir: ./work_dir/cn_xxl/
 batch_size: 8
 test_batch_size: 1
 num_worker: 8
@@ -31,19 +31,17 @@ optimizer_args:
 train_loader_args: {phase: train, framerate: 32}
 test_loader_args:  {phase: test,  framerate: 32}
 
-model: models.motion_mamba2.MotionMamba2
+model: models.motion_cleanest.MotionCleanestLinXL
 model_args:
   pts_size: 96
   num_classes: 25
   knn: [32, 24, 48, 24]
   topk: 8
   multi_scale_num_scales: 5
-  m2_hidden_dim: 256
-  m2_num_layers: 2
-  
-  m2_d_state: 64
-  m2_d_conv: 4
-  m2_dropout: 0.3
-  m2_bidirectional: true
-  m2_expand: 2
-  m2_headdim: 64
+  # Encoder hyperparams: wider AND deeper than CN-XL
+  lxl_hidden_dim: 256          # 128 -> 256 (2x wider state)
+  lxl_mlp_dim: 512             # 256 -> 512 (2x wider MLP)
+  lxl_num_layers: 4            # 2 -> 4 (2x deeper per direction)
+  lxl_dropout: 0.3
+  lxl_bidirectional: true
+  lxl_residual_scale: 0.7

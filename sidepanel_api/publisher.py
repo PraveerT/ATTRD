@@ -4,7 +4,7 @@ Usage:
   ANEMON_PUBLISH_TOKEN=... ANEMON_PUBLISH_URL=https://.../api/anemon-publish \
     python3 publisher.py [--interval 30]
 
-Token+URL can also be read from /notebooks/PMamba/sidepanel_api/state/publisher.env
+Token+URL can also be read from /notebooks/Anemon/sidepanel_api/state/publisher.env
 as KEY=VALUE lines.
 """
 import argparse, json, os, sys, time, urllib.request, urllib.error

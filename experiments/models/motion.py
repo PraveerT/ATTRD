@@ -433,8 +433,8 @@ if __name__ == '__main__':
     pass
 
 
-class PMambaTopsMotion(Motion):
-    """PMamba with tops field fed only into stage1. Downstream coords stay xyz+time."""
+class TopsMotion(Motion):
+    """the model with tops field fed only into stage1. Downstream coords stay xyz+time."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -646,22 +646,22 @@ class TemporalFirstMambaMotion(nn.Module):
         feat = self.dropout(feat)
         return self.classifier(feat)
 
-class PMambaRigidityEnsemble(nn.Module):
-    """Late-fusion ensemble: PMamba (point-cloud) + RigidityOnlyClassifier
+class RigidityEnsemble(nn.Module):
+    """Late-fusion ensemble: the model (point-cloud) + RigidityOnlyClassifier
     (per-frame sorted residuals). Logits fused via softmax(alpha) weighted mean
-    of softmax probs. alpha starts biased toward PMamba (init logit 2.0
-    -> softmax ~0.88 weight on PMamba).
+    of softmax probs. alpha starts biased toward the model (init logit 2.0
+    -> softmax ~0.88 weight on the model).
     """
 
     def __init__(self, num_classes=25, pts_size=256,
                  knn=(32, 24, 48, 24), topk=8,
                  rigidity_dim=256, rigidity_hidden=128, rigidity_lstm_layers=2,
                  rigidity_dropout=0.3,
-                 pmamba_weights=None, rigidity_weights=None,
-                 freeze_pmamba=False, freeze_rigidity=False,
+                 backbone_weights=None, rigidity_weights=None,
+                 freeze_backbone=False, freeze_rigidity=False,
                  init_alpha_logit=2.0, **kwargs):
         super().__init__()
-        self.pmamba = Motion(num_classes=num_classes, pts_size=pts_size,
+        self.backbone = Motion(num_classes=num_classes, pts_size=pts_size,
                              knn=list(knn), topk=topk)
         from depth_branch.model import RigidityOnlyClassifier
         self.rigidity = RigidityOnlyClassifier(
@@ -672,29 +672,29 @@ class PMambaRigidityEnsemble(nn.Module):
         # Learnable fusion scalar (softmax of two logits).
         self.fusion_logits = nn.Parameter(torch.tensor([init_alpha_logit, 0.0]))
 
-        if pmamba_weights:
-            sd = torch.load(pmamba_weights, map_location='cpu')
+        if backbone_weights:
+            sd = torch.load(backbone_weights, map_location='cpu')
             sd = sd.get('model_state_dict', sd)
-            missing, unexpected = self.pmamba.load_state_dict(sd, strict=False)
-            print(f"PMamba weights: missing={len(missing)} unexpected={len(unexpected)}")
+            missing, unexpected = self.backbone.load_state_dict(sd, strict=False)
+            print(f"the model weights: missing={len(missing)} unexpected={len(unexpected)}")
         if rigidity_weights:
             sd = torch.load(rigidity_weights, map_location='cpu')
             sd = sd.get('model_state_dict', sd)
             missing, unexpected = self.rigidity.load_state_dict(sd, strict=False)
             print(f"Rigidity weights: missing={len(missing)} unexpected={len(unexpected)}")
 
-        if freeze_pmamba:
-            for p in self.pmamba.parameters(): p.requires_grad_(False)
+        if freeze_backbone:
+            for p in self.backbone.parameters(): p.requires_grad_(False)
         if freeze_rigidity:
             for p in self.rigidity.parameters(): p.requires_grad_(False)
 
     def forward(self, inputs):
-        # Expect a tuple (pmamba_input, rigidity_tensor).
+        # Expect a tuple (cn_xxl_input, rigidity_tensor).
         if isinstance(inputs, (tuple, list)) and len(inputs) == 2:
             pm_in, rig = inputs
         else:
-            raise ValueError("PMambaRigidityEnsemble expects (pts, rigidity) tuple")
-        pm_logits = self.pmamba(pm_in)
+            raise ValueError("RigidityEnsemble expects (pts, rigidity) tuple")
+        pm_logits = self.backbone(pm_in)
         rig_logits = self.rigidity(rig)
         weights = torch.softmax(self.fusion_logits, dim=0)              # (2,)
         pm_p = torch.softmax(pm_logits, dim=-1)
@@ -703,8 +703,8 @@ class PMambaRigidityEnsemble(nn.Module):
         # Return log of fused probs so cross-entropy -> NLL works as usual.
         return torch.log(fused.clamp(min=1e-9))
 
-class PMambaDepthEarlyFusion(nn.Module):
-    """Feature-level early-fusion of Motion (PMamba) + DepthCNNLSTM (v9c-style).
+class the modelDepthEarlyFusion(nn.Module):
+    """Feature-level early-fusion of Motion (the model) + DepthCNNLSTM (v9c-style).
 
     pm_feat:  (B, 1024)  = Motion.extract_features
     dpt_feat: (B, 1024)  = DepthCNNLSTM.extract_features  (lstm_hidden * 4)
@@ -716,13 +716,13 @@ class PMambaDepthEarlyFusion(nn.Module):
                  depth_in_channels=4, depth_feat_dim=256, depth_lstm_hidden=256,
                  depth_lstm_layers=2, depth_bidir=True, depth_dropout=0.3,
                  clip_reweight_beta=1.5,
-                 pmamba_weights=None, depth_weights=None,
-                 freeze_pmamba=False, freeze_depth=False,
-                 pmamba_feat_dim=1024, fusion_hidden=512, fusion_dropout=0.3,
+                 backbone_weights=None, depth_weights=None,
+                 freeze_backbone=False, freeze_depth=False,
+                 cn_xxl_feat_dim=1024, fusion_hidden=512, fusion_dropout=0.3,
                  **kwargs):
         super().__init__()
         from depth_branch.model import DepthCNNLSTM
-        self.pmamba = Motion(num_classes=num_classes, pts_size=pts_size,
+        self.backbone = Motion(num_classes=num_classes, pts_size=pts_size,
                              knn=list(knn), topk=topk)
         self.depth = DepthCNNLSTM(
             num_classes=num_classes, in_channels=depth_in_channels,
@@ -732,25 +732,25 @@ class PMambaDepthEarlyFusion(nn.Module):
             rigidity_dim=0, rigidity_aux_dim=0, clip_reweight_beta=clip_reweight_beta,
         )
 
-        if pmamba_weights:
-            sd = torch.load(pmamba_weights, map_location='cpu')
+        if backbone_weights:
+            sd = torch.load(backbone_weights, map_location='cpu')
             sd = sd.get('model_state_dict', sd)
-            m, u = self.pmamba.load_state_dict(sd, strict=False)
-            print(f"PMamba weights: missing={len(m)} unexpected={len(u)}")
+            m, u = self.backbone.load_state_dict(sd, strict=False)
+            print(f"the model weights: missing={len(m)} unexpected={len(u)}")
         if depth_weights:
             sd = torch.load(depth_weights, map_location='cpu')
             sd = sd.get('model_state_dict', sd)
             m, u = self.depth.load_state_dict(sd, strict=False)
             print(f"Depth weights: missing={len(m)} unexpected={len(u)}")
 
-        if freeze_pmamba:
-            for p in self.pmamba.parameters(): p.requires_grad_(False)
+        if freeze_backbone:
+            for p in self.backbone.parameters(): p.requires_grad_(False)
         if freeze_depth:
             for p in self.depth.parameters(): p.requires_grad_(False)
 
         mult = 2 if depth_bidir else 1
         depth_feat_out = depth_lstm_hidden * mult * 2
-        total = pmamba_feat_dim + depth_feat_out
+        total = cn_xxl_feat_dim + depth_feat_out
         self.fusion_head = nn.Sequential(
             nn.Linear(total, fusion_hidden),
             nn.GELU(),
@@ -763,13 +763,13 @@ class PMambaDepthEarlyFusion(nn.Module):
         if isinstance(inputs, (tuple, list)) and len(inputs) == 3:
             pts, depth, rig = inputs
         else:
-            raise ValueError("PMambaDepthEarlyFusion expects (pts, depth, rigidity) tuple")
-        pm_feat = self.pmamba.extract_features(pts)
+            raise ValueError("the modelDepthEarlyFusion expects (pts, depth, rigidity) tuple")
+        pm_feat = self.backbone.extract_features(pts)
         dp_feat = self.depth.extract_features((depth, rig))
         return self.fusion_head(torch.cat([pm_feat, dp_feat], dim=1))
 
-class PMambaRigidityReweight(Motion):
-    """PMamba Motion with v9c-clean per-clip CE reweighting.
+class the modelRigidityReweight(Motion):
+    """the model Motion with v9c-clean per-clip CE reweighting.
 
     Accepts forward input as either a tensor (no reweighting) or a
     (pts, rigidity_tensor) tuple. Rigidity shape (B, T, K) or (B, T, P).
@@ -809,7 +809,7 @@ class PMambaRigidityReweight(Motion):
             self.latest_sample_weights = None
         return super().forward(pts)
 
-class PMambaFlowAux(Motion):
+class the modelFlowAux(Motion):
     """Motion with auxiliary per-frame rigidity-summary prediction head.
 
     Input accepted as either pts tensor or (pts, rigidity_tensor) tuple.
@@ -875,10 +875,10 @@ class PMambaFlowAux(Motion):
         return self.latest_aux_metrics
 
 class MotionTops(Motion):
-    """PMamba Motion + centroid-radial tops direction as extra stage1 input.
+    """the model Motion + centroid-radial tops direction as extra stage1 input.
 
     Only stage1 sees 7-ch [xyz, tops_xyz, t]. fea1 concat uses original
-    4-ch coords, so stages 2-3 are identical to vanilla PMamba.
+    4-ch coords, so stages 2-3 are identical to vanilla the model.
     """
 
     def __init__(self, num_classes, pts_size, **kwargs):
@@ -937,7 +937,7 @@ class MotionTops(Motion):
         return torch.cat((coords, fea3_mamba), dim=1)
 
 class MotionTopsMag(Motion):
-    """PMamba + tops + |rel|. 8-ch [xyz(3), tops(3), |rel|, t]."""
+    """the model + tops + |rel|. 8-ch [xyz(3), tops(3), |rel|, t]."""
 
     def __init__(self, num_classes, pts_size, **kwargs):
         super().__init__(num_classes, pts_size, **kwargs)
@@ -978,7 +978,7 @@ class MotionTopsMag(Motion):
 
 
 class MotionTopsClip(Motion):
-    """PMamba + tops from CLIP-mean centroid (stable reference)."""
+    """the model + tops from CLIP-mean centroid (stable reference)."""
 
     def __init__(self, num_classes, pts_size, **kwargs):
         super().__init__(num_classes, pts_size, **kwargs)
@@ -1019,7 +1019,7 @@ class MotionTopsClip(Motion):
 
 
 class MotionDTops(Motion):
-    """PMamba + Δtops (frame-to-frame tops delta). Captures angular velocity."""
+    """the model + Δtops (frame-to-frame tops delta). Captures angular velocity."""
 
     def __init__(self, num_classes, pts_size, **kwargs):
         super().__init__(num_classes, pts_size, **kwargs)
@@ -1062,7 +1062,7 @@ class MotionDTops(Motion):
 
 
 class MotionTopsFull(Motion):
-    """PMamba + tops + Δtops. 10-ch [xyz, tops, dtops, t]."""
+    """the model + tops + Δtops. 10-ch [xyz, tops, dtops, t]."""
 
     def __init__(self, num_classes, pts_size, **kwargs):
         super().__init__(num_classes, pts_size, **kwargs)
@@ -1103,7 +1103,7 @@ class MotionTopsFull(Motion):
         return torch.cat((coords, self.mamba(fea3)), dim=1)
 
 class MotionRigidityContrastive(Motion):
-    """PMamba + InfoNCE contrastive aux on per-point rigidity residuals.
+    """the model + InfoNCE contrastive aux on per-point rigidity residuals.
 
     Residuals computed on-the-fly via NN-matching Kabsch between consecutive
     frames. No preprocess, no correspondence data loader needed.
@@ -1283,7 +1283,7 @@ class MotionRigidityContrastive(Motion):
         return loss, metrics
 
 class MotionRigidityContrastiveCorr(Motion):
-    """PMamba + InfoNCE contrastive aux with clean correspondence-aligned
+    """the model + InfoNCE contrastive aux with clean correspondence-aligned
     per-point residuals."""
 
     def __init__(self, num_classes, pts_size, contrast_weight=0.05,
@@ -1733,7 +1733,7 @@ def _qcc_kabsch_quat(src, tgt, weights=None):
 
 
 class MotionQCCAnchored(Motion):
-    """PMamba + Mittal-anchored quaternion-pair + transitivity aux.
+    """the model + Mittal-anchored quaternion-pair + transitivity aux.
 
     Features: stage1 output pooled per-frame. Head predicts q(t, t+1); anchor
     is Kabsch q_obs from correspondence-aligned sampled points.
@@ -1916,7 +1916,7 @@ class MotionQCCAnchored(Motion):
         }
 
 class MotionRigiditySegmentation(Motion):
-    """PMamba + per-point rigid/articulating binary segmentation aux.
+    """the model + per-point rigid/articulating binary segmentation aux.
 
     Aux target: 1 if Kabsch residual > per-frame median, else 0. Tiny linear
     head on fea1 per-point features. Binary CE aux averaged over
@@ -2105,7 +2105,7 @@ class MotionRigiditySegmentation(Motion):
         return loss, {"seg_raw": loss.detach(), "seg_acc": acc}
 
 class MotionCentroidAux(Motion):
-    """PMamba + per-frame centroid regression aux."""
+    """the model + per-frame centroid regression aux."""
 
     def __init__(self, num_classes, pts_size, centroid_weight=0.05, **kwargs):
         super().__init__(num_classes, pts_size, **kwargs)
@@ -2245,7 +2245,7 @@ def _dq_kabsch_rt(src, tgt, weights):
 
 
 class MotionDQAux(Motion):
-    """PMamba + dual-quaternion regression aux."""
+    """the model + dual-quaternion regression aux."""
 
     def __init__(self, num_classes, pts_size, dq_weight=0.05, **kwargs):
         super().__init__(num_classes, pts_size, **kwargs)
@@ -2482,7 +2482,7 @@ def _dqcc_kabsch_rt(src, tgt, weights):
 
 
 class MotionDQCC(Motion):
-    """PMamba + full DQCC aux: anchor + cycle."""
+    """the model + full DQCC aux: anchor + cycle."""
 
     def __init__(self, num_classes, pts_size, anchor_weight=0.05,
                  cycle_weight=0.02, **kwargs):
@@ -2693,7 +2693,7 @@ def _rr_kabsch(src, tgt, weights):
 
 
 class MotionRigidRes(Motion):
-    """PMamba + rigid-subtraction residual as extra 3-ch stage1 input."""
+    """the model + rigid-subtraction residual as extra 3-ch stage1 input."""
 
     def __init__(self, num_classes, pts_size, **kwargs):
         super().__init__(num_classes, pts_size, **kwargs)
@@ -2894,7 +2894,7 @@ def _rrfbq_kabsch_quat(src, tgt, weights):
 
 
 class MotionRigidResFBQ(Motion):
-    """PMamba + fwd+bwd quaternion Kabsch residuals as extra 6-ch stage1 input."""
+    """the model + fwd+bwd quaternion Kabsch residuals as extra 6-ch stage1 input."""
 
     def __init__(self, num_classes, pts_size, **kwargs):
         super().__init__(num_classes, pts_size, **kwargs)
@@ -3016,11 +3016,11 @@ class MotionRigidResFBQ(Motion):
         return output.flatten(1)
 
 class MotionRigidStabilize(Motion):
-    """PMamba over rigid-motion-removed pointcloud.
+    """the model over rigid-motion-removed pointcloud.
 
-    Replaces xyz with frame-0-referenced (stabilized) xyz before PMamba.
+    Replaces xyz with frame-0-referenced (stabilized) xyz before the model.
     Reuses _rrfbq_* quaternion math from MotionRigidResFBQ.
-    Stage1 input is 4-ch [xyz_stable, t] — vanilla PMamba shape.
+    Stage1 input is 4-ch [xyz_stable, t] — vanilla the model shape.
     """
 
     def _corr_sample(self, points, aux_input):

@@ -58,21 +58,21 @@ class Processor():
         # Telegram Bot Configuration
         self.telegram_bot_token = "8049556095:AAH0c0KB0DmzFtcW0s97ZS_kQ8ux9gX72eE"
         self.telegram_chat_id = None
-        # Oracle/fusion telemetry vs PMamba @ e110 (cached probs).
-        self._pmamba_probs = None
-        self._pmamba_labels = None
+        # Oracle/fusion telemetry vs the model @ e110 (cached probs).
+        self._cached_probs = None
+        self._cached_labels = None
         self._eval_probs = []
         self._eval_labels = []
         self._latest_oracle = None
         self._latest_fusion = None
         self._latest_fusion_alpha = None
         try:
-            _cache = "work_dir/pmamba_branch/pmamba_test_preds.npz"
+            _cache = "work_dir/cn_xxl/test_preds.npz"
             import numpy as _np, os as _os
             if _os.path.exists(_cache):
                 _d = _np.load(_cache)
-                self._pmamba_probs = _d["probs"]
-                self._pmamba_labels = _d["labels"]
+                self._cached_probs = _d["probs"]
+                self._cached_labels = _d["labels"]
         except Exception:
             pass
         self.best_accuracy = 0.0  # Track best accuracy within current run
@@ -706,7 +706,7 @@ class Processor():
                 self.eval(loader_name=['test'])
                 self.print_inf_log(self.arg.optimizer_args['start_epoch'], "Test", None, None)
             import os as _os, numpy as _np
-            _dump = _os.environ.get('PMAMBA_DUMP_PROBS')
+            _dump = _os.environ.get('DUMP_PROBS')
             if _dump and self._eval_probs:
                 _pp = _np.concatenate(self._eval_probs, axis=0)
                 _ll = _np.concatenate(self._eval_labels, axis=0)
@@ -744,7 +744,7 @@ class Processor():
         try:
             # Compute oracle first so best_metric selection can use it.
             self._maybe_compute_oracle(epoch, mode)
-            # Pick best-metric: oracle if cached PMamba available, else prec1.
+            # Pick best-metric: oracle if cached the model available, else prec1.
             best_metric = self._latest_oracle if self._latest_oracle is not None else prec1
             best_label = "oracle" if self._latest_oracle is not None else "prec1"
             # Check if this is a new best (by the chosen metric).
@@ -782,31 +782,31 @@ class Processor():
 
     def _maybe_compute_oracle(self, epoch, mode):
         """Populate self._latest_oracle and self._latest_fusion (percentages)
-        using cached PMamba test-set probs + this eval pass' accumulated probs.
+        using cached the model test-set probs + this eval pass' accumulated probs.
         """
         self._latest_oracle = None
         self._latest_fusion = None
         self._latest_fusion_alpha = None
-        if self._pmamba_probs is None or not self._eval_probs:
+        if self._cached_probs is None or not self._eval_probs:
             return
         try:
             import numpy as np
             probs = np.concatenate(self._eval_probs, axis=0)                 # (N, 25)
             labels = np.concatenate(self._eval_labels, axis=0)               # (N,)
-            if probs.shape[0] != self._pmamba_probs.shape[0]:
+            if probs.shape[0] != self._cached_probs.shape[0]:
                 self.recoder.print_log(
-                    f"[oracle] skip: {probs.shape[0]} model preds vs {self._pmamba_probs.shape[0]} cached PMamba preds"
+                    f"[oracle] skip: {probs.shape[0]} model preds vs {self._cached_probs.shape[0]} cached the model preds"
                 )
                 return
             # Labels should agree with cache; use cache labels as reference.
-            ref_labels = self._pmamba_labels if self._pmamba_labels.shape[0] == probs.shape[0] else labels
-            pm_correct = self._pmamba_probs.argmax(1) == ref_labels
+            ref_labels = self._cached_labels if self._cached_labels.shape[0] == probs.shape[0] else labels
+            pm_correct = self._cached_probs.argmax(1) == ref_labels
             md_correct = probs.argmax(1) == ref_labels
             oracle = (pm_correct | md_correct).mean() * 100
             best_a, best_acc = 1.0, (pm_correct).mean() * 100
             for ai in range(0, 105, 5):
                 a = ai / 100.0
-                fp = (a * self._pmamba_probs + (1 - a) * probs).argmax(1)
+                fp = (a * self._cached_probs + (1 - a) * probs).argmax(1)
                 acc = (fp == ref_labels).mean() * 100
                 if acc > best_acc:
                     best_acc = acc; best_a = a

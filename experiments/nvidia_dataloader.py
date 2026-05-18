@@ -173,7 +173,7 @@ class NvidiaREQNNLoader(NvidiaLoader):
 class NvidiaFourierLoader(NvidiaLoader):
     """Net2 dataloader for DS-QCC: returns xyzt (4) + multi-frequency Fourier
     features of XYZ (24) = 28 channels per point. Sin/cos at k in {1,2,4,8}.
-    First 4 channels remain raw xyzt so PMamba's k-NN grouping (distance_dim=[0,1,2])
+    First 4 channels remain raw xyzt so the model's k-NN grouping (distance_dim=[0,1,2])
     works on real spatial coords.
     """
 
@@ -521,7 +521,7 @@ class NvidiaAntiNet1DTWLoader(NvidiaLoader):
     """DTW resampling weighted by INVERSE Net1 per-frame importance.
 
     Pre-computed importance via single-frame ablation against Net1
-    (work_dir/pmamba_branch/epoch115_model.pt). For each frame t in clip:
+    (work_dir/cn_xxl/epoch115_model.pt). For each frame t in clip:
       importance[t] = ||softmax(full) - softmax(ablate_frame_t)||_2
     DTW weight per frame = 1/(importance + eps). Sample frames Net1 ignores.
     Orthogonal-by-construction to Net1.

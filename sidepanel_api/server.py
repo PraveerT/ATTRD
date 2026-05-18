@@ -4,7 +4,7 @@ JSON shape:
   {
     "ts": "2026-05-17 07:42:11",
     "run": "bdn_buf1_train",
-    "log": "/notebooks/PMamba/.../bdn_buf1_train.log",
+    "log": "/notebooks/Anemon/.../bdn_buf1_train.log",
     "gpu": {"used_gb": 11.2, "total_gb": 47.6, "util_pct": 87},
     "ram": {"used_gb": 14, "total_gb": 64},
     "disk": {"used_gb": 22.1, "total_gb": 50},
@@ -19,8 +19,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, 'static')
-LOG_GLOB = '/notebooks/PMamba/experiments/work_dir/*.log'
-LEADERBOARD = '/notebooks/PMamba/experiments/LEADERBOARD.md'
+LOG_GLOB = '/notebooks/Anemon/experiments/work_dir/*.log'
+LEADERBOARD = '/notebooks/Anemon/experiments/LEADERBOARD.md'
 
 _cache = {'ts': 0, 'data': None}
 _CACHE_SEC = 5
@@ -38,6 +38,8 @@ def parse_log(path):
     cur_batch = None
     ta = None
     tl = None
+    al = None
+    cur_lr = None
     best = None
     try:
         with open(path, 'r', errors='replace') as f:
@@ -46,8 +48,12 @@ def parse_log(path):
                 if m: ta = float(m.group(1))
                 m = re.search(r'Mean training loss:\s+(\d+(?:\.\d+)?)', line)
                 if m: tl = float(m.group(1))
+                m = re.search(r'Mean auxiliary loss:\s+(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)', line)
+                if m: al = float(m.group(1))
                 m = re.search(r'Training epoch:\s+(\d+)', line)
                 if m: cur_ep = int(m.group(1))
+                m = re.search(r'lr:\s*(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)', line)
+                if m: cur_lr = float(m.group(1))
                 m = re.search(r'(\d+)/(\d+) \[', line)
                 if m: cur_batch = f"{m.group(1)}/{m.group(2)}"
                 m = re.search(r'Epoch (\d+), Test, Evaluation: prec1 (\d+(?:\.\d+)?), prec5 (\d+(?:\.\d+)?)', line)
@@ -57,13 +63,14 @@ def parse_log(path):
                     p5 = float(m.group(3))
                     epochs.append({
                         'ep': ep, 'tr_acc': ta, 'tr_loss': tl,
+                        'aux_loss': al,
                         'te_p1': round(p1, 2), 'te_p5': round(p5, 2),
                     })
                     if best is None or p1 > best['p1']:
                         best = {'ep': ep, 'p1': round(p1, 2)}
     except FileNotFoundError:
         pass
-    return {'epochs': epochs[-40:], 'best': best, 'now': {'ep': cur_ep, 'batch': cur_batch}}
+    return {'epochs': epochs[-40:], 'best': best, 'now': {'ep': cur_ep, 'batch': cur_batch, 'lr': cur_lr}}
 
 
 def gpu_stats():
