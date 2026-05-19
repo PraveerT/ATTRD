@@ -21,14 +21,11 @@ from utils.gpu_augment import GpuAugmentor
 
 
 def dynamic_pts_size(epoch, arg):
-    """Linear ramp 48->128 over ep [0,50), quadratic ramp 128->256 over [50,100),
-    fixed 256 after. Can be overridden by --pts-size CLI or static config."""
+    """Linear ramp 48->172 over ep [0,50), constant 172 after.
+    Can be overridden by --pts-size CLI or static config."""
     if epoch < 50:
-        return int(48 + (128 - 48) * (epoch / 50))
-    if epoch < 100:
-        progress = (epoch - 50) / 50
-        return int(128 + (256 - 128) * (progress ** 2))
-    return 256
+        return int(48 + (172 - 48) * (epoch / 50))
+    return 172
 
 
 class Processor:
@@ -220,7 +217,7 @@ class Processor:
     def start(self):
         if self.arg.phase == 'train':
             for epoch in range(self.arg.optimizer_args['start_epoch'], self.arg.num_epoch):
-                eval_interval = 10 if (epoch + 1) < 100 else 1
+                eval_interval = 10 if (epoch + 1) < 75 else 1
                 save_interval = self.arg.save_interval if (epoch + 1) < 100 else 1
                 save_now = (epoch + 1) % save_interval == 0 or (epoch + 1) == self.arg.num_epoch
                 eval_now = (epoch + 1) % eval_interval == 0 or (epoch + 1) == self.arg.num_epoch
