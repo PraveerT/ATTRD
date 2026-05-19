@@ -21,6 +21,9 @@ strict_load: false
 weights: null
 
 optimizer_args:
+  scheduler: constant_then_cosine
+  cosine_start: 75
+  num_epochs: 100
   optimizer: Adam
   base_lr: 0.00012
   step: [60, 70, 75]

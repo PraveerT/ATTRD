@@ -67,17 +67,28 @@ class Optimizer(object):
         if scheduler_type == 'cosine':
             num_epochs = self.optim_dict.get('num_epochs', milestones[-1] if milestones else 200)
             start_epoch = self.optim_dict.get('start_epoch', 0)
-            lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            return optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
                 T_max=num_epochs - start_epoch,
                 eta_min=self.optim_dict['base_lr'] * 0.01,
             )
-            return lr_scheduler
-        elif self.optim_dict["optimizer"] in ['SGD', 'Adam']:
-            lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=milestones, gamma=0.1)
-            return lr_scheduler
-        else:
-            raise ValueError()
+        if scheduler_type == 'constant_then_cosine':
+            # Constant base_lr until cosine_start, then cosine decay to num_epochs.
+            num_epochs = self.optim_dict['num_epochs']
+            cosine_start = self.optim_dict['cosine_start']
+            eta_min = self.optim_dict['base_lr'] * self.optim_dict.get('eta_min_ratio', 0.01)
+            constant = optim.lr_scheduler.ConstantLR(
+                optimizer, factor=1.0, total_iters=cosine_start,
+            )
+            cosine = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=num_epochs - cosine_start, eta_min=eta_min,
+            )
+            return optim.lr_scheduler.SequentialLR(
+                optimizer, [constant, cosine], milestones=[cosine_start],
+            )
+        if self.optim_dict["optimizer"] in ['SGD', 'Adam']:
+            return optim.lr_scheduler.MultiStepLR(optimizer, milestones=milestones, gamma=0.1)
+        raise ValueError()
 
     def zero_grad(self):
         self.optimizer.zero_grad()
