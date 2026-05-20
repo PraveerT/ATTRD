@@ -111,12 +111,12 @@ class Processor:
             self.data_loader['train'] = torch.utils.data.DataLoader(
                 dataset_class(**self.arg.train_loader_args),
                 batch_size=self.arg.batch_size, shuffle=True,
-                num_workers=self.arg.num_worker, pin_memory=True, persistent_workers=True, prefetch_factor=4,
+                num_workers=4, pin_memory=False, persistent_workers=True,
             )
         self.data_loader['test'] = torch.utils.data.DataLoader(
             dataset_class(**self.arg.test_loader_args),
             batch_size=self.arg.test_batch_size, shuffle=False,
-            num_workers=self.arg.num_worker, pin_memory=True, persistent_workers=True, prefetch_factor=4,
+            num_workers=4, pin_memory=False, persistent_workers=True,
         )
         self.recoder.print_log('Loading data finished.')
 
