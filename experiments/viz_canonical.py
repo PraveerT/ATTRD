@@ -1,6 +1,8 @@
-"""Render canonical-vs-input animations across 12 gesture classes.
-v3: fades each canonical point by its opacity so "inactive" queries
-disappear instead of cluttering the plot.
+"""Render v2 canonical-vs-input animations across 12 gesture classes.
+
+v2: no opacity, fixed K=1024 active every frame. Each canonical index
+has a stable color across all 32 frames so correspondence is visible
+as colors carrying through the gesture.
 """
 import os
 import sys
@@ -34,21 +36,19 @@ dec = FrameDecoder(
 dec.load_state_dict(ckpt['decoder']); dec.eval()
 
 ds = NvidiaLoader(framerate=32, phase='test')
-print(f'AE config: K={K}, sparsity_target={cfg["sparsity_target"]}')
-print(f'AE pretrain chamfer={ckpt["best_score"]:.4f} at ep{ckpt["best_epoch"]}')
+print(f'AE config K={K}, chamfer={ckpt["best_score"]:.4f}')
 
-n_total = len(ds)
-seen_classes = set()
+seen = set()
 chosen = []
-for idx in range(n_total):
+for idx in range(len(ds)):
     lbl = int(ds[idx][1])
-    if lbl in seen_classes:
+    if lbl in seen:
         continue
-    seen_classes.add(lbl)
+    seen.add(lbl)
     chosen.append((idx, lbl))
     if len(chosen) >= 12:
         break
-print(f'chosen samples: {chosen}')
+print(f'chosen: {chosen}')
 
 rng = np.random.RandomState(7)
 idx_colors = rng.rand(K, 3) * 0.7 + 0.2
@@ -58,18 +58,12 @@ for s_i, (ds_idx, label) in enumerate(chosen):
     xyz_full = pts[..., :3].unsqueeze(0).cuda()
 
     with torch.no_grad():
-        feats = enc(xyz_full)
-        canonical, opacity = dec(feats)
-
+        canonical = dec(enc(xyz_full))                                # (1, 32, K, 3)
     inp_np = pts[..., :3].cpu().numpy()
     can_np = canonical[0].cpu().numpy()
-    op_np = opacity[0].cpu().numpy()                                 # (32, K)
-    # Per-point alpha = opacity. Combine with color: RGBA.
-    rgba = np.concatenate([np.broadcast_to(idx_colors, (32, K, 3)), op_np[..., None]], axis=-1)
 
     all_pts = np.concatenate([inp_np.reshape(-1, 3), can_np.reshape(-1, 3)], axis=0)
-    mn = all_pts.min(axis=0)
-    mx = all_pts.max(axis=0)
+    mn = all_pts.min(axis=0); mx = all_pts.max(axis=0)
     pad = (mx - mn) * 0.05
 
     fig = plt.figure(figsize=(6, 3), dpi=72)
@@ -84,17 +78,12 @@ for s_i, (ds_idx, label) in enumerate(chosen):
             ax.set_zlim(mn[2] - pad[2], mx[2] + pad[2])
             ax.set_xticks([]); ax.set_yticks([]); ax.set_zticks([])
             ax.view_init(elev=15, azim=-60)
-
         ax1.scatter(inp_np[t, :, 0], inp_np[t, :, 1], inp_np[t, :, 2],
                     s=1.5, c='#2080d0', alpha=0.5)
         ax1.set_title(f'input N=512 | t={t}', fontsize=8)
-
-        # Active count this frame
-        n_active = int((op_np[t] > 0.5).sum())
         ax2.scatter(can_np[t, :, 0], can_np[t, :, 1], can_np[t, :, 2],
-                    s=4, c=rgba[t], edgecolors='none')
-        ax2.set_title(f'canonical K={K} (active={n_active})', fontsize=8)
-
+                    s=4, c=idx_colors, alpha=0.85)
+        ax2.set_title(f'canonical K={K}', fontsize=8)
         fig.suptitle(f'sample {ds_idx} · class {label}', fontsize=9)
         return ()
 
