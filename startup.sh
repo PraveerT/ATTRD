@@ -26,3 +26,29 @@ pip install -r requirements.txt
 # Export Jupyter token for jlab CLI auto-connect
 echo "$JUPYTER_TOKEN" > /notebooks/.jlab-token
 echo "jlab: token saved to /notebooks/.jlab-token"
+
+# Sidepanel publisher: auto-restart watchdog. Container restarts kill all
+# processes; running jlab setup again re-installs this watchdog cleanly.
+SIDEPANEL_DIR="/notebooks/Anemon/sidepanel_api"
+if [ -d "$SIDEPANEL_DIR" ]; then
+  pkill -f publisher_watchdog.sh 2>/dev/null || true
+  pkill -f 'publisher.py' 2>/dev/null || true
+  cat > "$SIDEPANEL_DIR/publisher_watchdog.sh" <<'WATCHDOG_EOF'
+#!/usr/bin/env bash
+# Re-launch the publisher whenever it exits. The publisher itself catches
+# transient network errors; this loop covers hard kills (container 503,
+# kernel restart, OOM).
+cd /notebooks/Anemon/sidepanel_api
+while true; do
+  python3 -u publisher.py --interval 30 >> state/publisher.log 2>&1
+  echo "[watchdog] $(date '+%F %T') publisher exited, restarting in 5s..." >> state/publisher.log
+  sleep 5
+done
+WATCHDOG_EOF
+  chmod +x "$SIDEPANEL_DIR/publisher_watchdog.sh"
+  mkdir -p "$SIDEPANEL_DIR/state"
+  nohup bash "$SIDEPANEL_DIR/publisher_watchdog.sh" \
+    > "$SIDEPANEL_DIR/state/watchdog.log" 2>&1 &
+  disown
+  echo "sidepanel publisher watchdog started (pid $!)"
+fi
