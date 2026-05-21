@@ -159,6 +159,9 @@ class Processor:
             self.recoder.record_timer('forward')
 
             loss = torch.mean(self.loss(output, label))
+            aux = getattr(model_ref, 'aux_loss', None)
+            if aux is not None:
+                loss = loss + aux
 
             self.optimizer.zero_grad()
             loss.backward()
