@@ -1,0 +1,55 @@
+# Baseline: send v2 AE canonical through the 91.08 quat-head setup.
+# Data: dataset/Nvidia/Processed/canonical_{train,test}.npy
+#   (baked from work_dir/ae_pretrain/ae_pretrain.pt, K=1024 -> first-512)
+# Model: MotionCleanestLinXLQuatHead, unchanged from cn_xxl_quat_head.yaml.
+# Trainer: identical schedule to quat-head 91.08 (constant_then_cosine,
+#   pts_size ramp 48 -> 172 over ep[0,50), random-perm sampling).
+# Establishes the canonical-replace baseline before per-point quaternion work.
+
+dataloader: canonical_nvidia_loader.CanonicalNvidiaLoader
+phase: train
+num_epoch: 100
+work_dir: ./work_dir/cn_xxl_canonical/
+batch_size: 8
+test_batch_size: 8
+num_worker: 8
+device: 0
+log_interval: 50
+eval_interval: 1
+save_interval: 5
+
+framesize: 32
+pts_size: 172
+dynamic_pts_size: true
+strict_load: false
+weights: null
+
+optimizer_args:
+  scheduler: constant_then_cosine
+  cosine_start: 75
+  num_epochs: 100
+  optimizer: Adam
+  base_lr: 0.00012
+  step: [60, 70, 75]
+  weight_decay: 0.03
+  start_epoch: 0
+  nesterov: false
+
+train_loader_args: {phase: train, framerate: 32}
+test_loader_args:  {phase: test,  framerate: 32}
+
+model: models.motion_cleanest_quat_head.MotionCleanestLinXLQuatHead
+model_args:
+  pts_size: 172
+  num_classes: 25
+  knn: [32, 24, 48, 24]
+  topk: 8
+  multi_scale_num_scales: 5
+  lxl_hidden_dim: 256
+  lxl_mlp_dim: 512
+  lxl_num_layers: 4
+  lxl_dropout: 0.3
+  lxl_bidirectional: true
+  lxl_residual_scale: 0.7
+  quat_head_hidden: 128
+  quat_head_scale: 0.3
