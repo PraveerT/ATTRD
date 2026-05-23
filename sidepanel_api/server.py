@@ -160,17 +160,88 @@ def leaderboard_summary():
     return sections
 
 
+def _load_latest_sd(run_dir):
+    """Return (epoch, state_dict) of latest epochN_model.pt in run_dir, or (None, None)."""
+    if not run_dir or not os.path.isdir(run_dir):
+        return None, None
+    ckpts = [f for f in os.listdir(run_dir)
+             if f.startswith('epoch') and f.endswith('_model.pt')]
+    if not ckpts:
+        return None, None
+    ckpts.sort(key=lambda f: int(f.replace('epoch', '').replace('_model.pt', '')))
+    latest = os.path.join(run_dir, ckpts[-1])
+    ep = int(ckpts[-1].replace('epoch', '').replace('_model.pt', ''))
+    import torch
+    sd = torch.load(latest, map_location='cpu')
+    sd = sd.get('model_state_dict', sd) if isinstance(sd, dict) else sd
+    return ep, sd
+
+
+def engram_stats(run_dir):
+    """engram.out_proj norm (zero-init residual; grows iff model uses engram path)."""
+    try:
+        ep, sd = _load_latest_sd(run_dir)
+        if sd is None:
+            return None
+        out_w = sd.get('engram.out_proj.weight')
+        if out_w is None:
+            return None
+        return {
+            'epoch': ep,
+            'out_norm': float(out_w.norm()),
+            'out_max': float(out_w.abs().max()),
+        }
+    except Exception:
+        return None
+
+
+def qcc_stats(run_dir):
+    """Track QCC mechanism usage:
+      - qcc_scale: scalar gate for qcc_head aux output (init 0)
+      - quat_inject_scale: scalar gate for fea3 quat residual (init 0; v4)
+      - quat_inject_norm: norm of the LayerNorm-bounded quat_proj output's
+        deepest weight matrix (legacy); for v4 this measures the projection
+        MLP weights, not the gated residual.
+    """
+    try:
+        ep, sd = _load_latest_sd(run_dir)
+        if sd is None or 'qcc_scale' not in sd:
+            return None
+        qs = sd['qcc_scale']
+        out = {
+            'epoch': ep,
+            'qcc_scale': float(qs.item() if hasattr(qs, 'item') else qs),
+        }
+        # v4: gated post-Mamba residual
+        if 'quat_inject_scale' in sd:
+            qis = sd['quat_inject_scale']
+            out['quat_inject_scale'] = float(qis.item() if hasattr(qis, 'item') else qis)
+        # MLP weight norm (informational across versions)
+        for key in ('quat_proj.2.weight', 'quat_to_coords.weight'):
+            if key in sd:
+                w = sd[key]
+                out['quat_inject_norm'] = float(w.norm())
+                out['quat_inject_max'] = float(w.abs().max())
+                break
+        return out
+    except Exception:
+        return None
+
+
 def build_status():
     log = latest_log()
     parsed = parse_log(log) if log else {'epochs': [], 'best': None, 'now': {}}
+    run_dir = os.path.dirname(log) if log else None
     return {
         'ts': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'run': os.path.basename(os.path.dirname(log)) if log else None,
+        'run': os.path.basename(run_dir) if run_dir else None,
         'log': log,
         'gpu': gpu_stats(),
         'ram': ram_stats(),
         'disk': disk_stats(),
         'leaderboard': leaderboard_summary(),
+        'engram': engram_stats(run_dir),
+        'qcc': qcc_stats(run_dir),
         **parsed,
     }
 
