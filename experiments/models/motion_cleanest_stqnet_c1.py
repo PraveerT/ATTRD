@@ -100,6 +100,9 @@ class MotionCleanestLinXLSTQNetC1(MotionCleanestLinXLQuatHead):
             nn.init.zeros_(self.cycle_proj.weight)
             nn.init.zeros_(self.cycle_proj.bias)
 
+        # EMA of per-cluster mass for sidepanel inspection.
+        self.register_buffer('cluster_mass_ema', torch.full((self.K,), 1.0 / self.K))
+
         self.aux_loss = None
 
     def no_decay_param_names(self):
@@ -229,6 +232,9 @@ class MotionCleanestLinXLSTQNetC1(MotionCleanestLinXLQuatHead):
         if self.training and (self.lambda_cycle > 0 or self.lambda_recon > 0):
             alpha, xyz_centered, Q_act, Q_pred = self._compute_cluster_quats(fea3)
             self.aux_loss = self._cluster_aux_loss(alpha, xyz_centered, Q_act, Q_pred)
+            with torch.no_grad():
+                mean_alpha = alpha.mean(dim=(0, 1, 2))
+                self.cluster_mass_ema.mul_(0.99).add_(0.01 * mean_alpha)
         else:
             self.aux_loss = None
 

@@ -201,6 +201,7 @@ class Processor:
         self.stat.reset_statistic()
         eval_loss_values = []
         n_samples = 0
+        test_logits, test_labels, test_sigs = [], [], []
         with torch.no_grad():
             for name in loader_name:
                 loader = self.data_loader[name]
@@ -213,8 +214,30 @@ class Processor:
                     eval_loss_values.append(loss.item() * label.size(0))
                     n_samples += label.size(0)
                     self.stat.update_accuracy(output.data.cpu(), label.cpu(), topk=self.topk)
+                    if name == 'test':
+                        test_logits.append(output.detach().cpu().numpy())
+                        test_labels.append(label.detach().cpu().numpy())
+                        if len(data) >= 3:
+                            test_sigs.extend([str(s) for s in data[2]])
         mean_loss = sum(eval_loss_values) / max(1, n_samples)
         self.recoder.print_log(f'mean loss: {mean_loss}')
+        if test_logits:
+            try:
+                import re as _re
+                L = np.concatenate(test_logits)
+                Y = np.concatenate(test_labels)
+
+                def _sig(s):
+                    m = _re.search(r'class_(\d+)/subject(\d+)_r(\d+)', s)
+                    return (f'class_{m.group(1)}/subject{m.group(2)}_r{m.group(3)}'
+                            if m else s)
+
+                S = np.array([_sig(s) for s in test_sigs]) if test_sigs                     else np.array([str(i) for i in range(len(Y))])
+                out_path = os.path.join(self.arg.work_dir, 'test_logits')
+                ep_marker = np.array([self._eval_epoch_marker], dtype=np.int64)                     if hasattr(self, '_eval_epoch_marker') else np.array([-1], dtype=np.int64)
+                np.savez(out_path, logits=L, labels=Y, sigs=S, epoch=ep_marker)
+            except Exception as e:
+                self.recoder.print_log(f'test_logits dump skipped: {e}')
 
     # ---------------------------------------------------------------- main loop
     def start(self):
@@ -230,6 +253,7 @@ class Processor:
                     self.save_model(epoch, self.model, self.optimizer,
                                     f'{self.arg.work_dir}/epoch{epoch + 1}_model.pt')
                 if eval_now:
+                    self._eval_epoch_marker = epoch + 1
                     self.eval(loader_name=['test'])
                     self.print_inf_log(epoch + 1, 'Test', train_acc, train_loss)
         elif self.arg.phase == 'test':

@@ -51,10 +51,11 @@ model_args:
   lxl_residual_scale: 0.7
   quat_head_hidden: 128
   quat_head_scale: 0.3
-  K: 5
+  K: 6
   lambda_cycle: 0.05
   lambda_recon: 0.025
   lambda_balance: 0.01
   cluster_feat_dim: 256
   cluster_hidden: 64
   cluster_alpha_mode: time_stable
+  gumbel_tau: 0.5

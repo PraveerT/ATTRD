@@ -219,9 +219,173 @@ def cluster_stats(run_dir):
             ch_w = sd.get('cluster_head.0.weight')
         if ch_w is not None:
             out['cluster_head_norm'] = float(ch_w.norm())
+        # Per-cluster mass EMA (if model registered the buffer).
+        cm = sd.get('cluster_mass_ema')
+        if cm is not None:
+            out['cluster_mass'] = [round(float(x), 4) for x in cm.tolist()]
         return out
     except Exception:
         return None
+
+
+_CNXXL_BASELINE = {  # train,test pairs per epoch from cnxxlquat 91.08 run
+    10: (72.29, 74.48), 20: (89.14, 83.82), 30: (91.33, 85.68),
+    40: (93.62, 81.74), 50: (94.38, 87.76), 60: (93.62, 87.34),
+    70: (93.33, 87.14), 75: (93.52, 88.17), 80: (93.43, 87.14),
+    85: (93.24, 87.55), 88: (94.48, 89.63), 90: (93.43, 89.63),
+    95: (95.05, 90.66), 96: (96.67, 90.66), 97: (95.71, 90.25),
+    98: (96.29, 90.25), 99: (95.90, 90.66), 100: (96.00, 91.08),
+}
+
+
+def param_counts(run_dir):
+    """Total / trainable / per-mechanism param counts from latest ckpt."""
+    try:
+        ep, sd = _load_latest_sd(run_dir)
+        if sd is None:
+            return None
+        total = sum(v.numel() for v in sd.values() if hasattr(v, 'numel'))
+        # Group by prefix to bucket aux vs main.
+        aux_prefixes = ('cluster_head', 'cycle_gru', 'cycle_proj',
+                        'cluster_classifier', 'cluster_clf_scale',
+                        'engram', 'qcc_head', 'qcc_scale',
+                        'quat_to_coords', 'quat_proj', 'quat_inject_scale')
+        aux = 0
+        for k, v in sd.items():
+            if not hasattr(v, 'numel'): continue
+            if any(k.startswith(p) for p in aux_prefixes):
+                aux += v.numel()
+        return {
+            'epoch': ep,
+            'total_m': round(total / 1e6, 3),
+            'aux_m': round(aux / 1e6, 3),
+            'main_m': round((total - aux) / 1e6, 3),
+        }
+    except Exception:
+        return None
+
+
+_WORK_DIR = '/notebooks/Anemon/experiments/work_dir'
+_REF_LABELS = {
+    'cn_xxl_quat_head': 'cnxxlquat 91.08',
+    'cn_xxl_quat_head_stqnet_c1_gumbel': 'k6 gumbel (ep126) 90.66',
+}
+
+
+def _perclass_from_cm(path):
+    """Load confusion matrix and return [(cls_idx_1based, wrong, total), ...]."""
+    import numpy as np
+    cm = np.load(path)
+    out = []
+    for c in range(cm.shape[0]):
+        tot = int(cm[c].sum())
+        if tot == 0: continue
+        wr = tot - int(cm[c, c])
+        out.append((c + 1, wr, tot))
+    return out
+
+
+def available_refs(exclude_run=None):
+    """Scan work_dir for directories with Test_confusion_mat.npy; return their
+    per-class breakdowns so the client can pick which to compare against.
+
+    exclude_run: directory path (basename matched) to skip — used to drop the
+    currently-tracked run from the list of comparison targets.
+    """
+    if not os.path.isdir(_WORK_DIR):
+        return None
+    skip_name = os.path.basename(exclude_run.rstrip('/')) if exclude_run else None
+    out = []
+    for d in sorted(os.listdir(_WORK_DIR)):
+        if skip_name and d == skip_name:
+            continue
+        p = os.path.join(_WORK_DIR, d)
+        if not os.path.isdir(p): continue
+        cm = os.path.join(p, 'Test_confusion_mat.npy')
+        if not os.path.isfile(cm): continue
+        try:
+            pc = _perclass_from_cm(cm)
+            tot = sum(t for _, _, t in pc)
+            cor = sum(t - w for _, w, t in pc)
+            out.append({
+                'name': d,
+                'label': _REF_LABELS.get(d, d),
+                'acc': round(100.0 * cor / max(tot, 1), 2),
+                'perclass': [{'cls': c, 'wrong': w, 'total': t} for c, w, t in pc],
+            })
+        except Exception:
+            continue
+    return out or None
+
+
+def current_perclass(run_dir):
+    """Current run's per-class breakdown from its Test_confusion_mat.npy."""
+    if not run_dir:
+        return None
+    p = os.path.join(run_dir, 'Test_confusion_mat.npy')
+    if not os.path.isfile(p):
+        return None
+    try:
+        pc = _perclass_from_cm(p)
+        return [{'cls': c, 'wrong': w, 'total': t} for c, w, t in pc]
+    except Exception:
+        return None
+
+
+_FUSION_CACHE = os.path.join(HERE, 'state', 'fusion_cache.json')
+
+
+def fusion_cache():
+    """Latest fusion result written by the fusion watcher background process."""
+    if not os.path.isfile(_FUSION_CACHE):
+        return None
+    try:
+        with open(_FUSION_CACHE) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+# K=6 v2 run best (per-epoch trajectory lost when this work_dir was reused).
+_V2_K6_BEST = 90.04
+
+
+def reference_baselines(parsed):
+    """Return current best + delta vs reference best scores (v2, cnxxlquat)."""
+    if not parsed:
+        return None
+    best = None
+    for e in parsed.get('epochs') or []:
+        te = e.get('te_p1')
+        if te is None: continue
+        if best is None or te > best:
+            best = te
+    if best is None:
+        return None
+    return {
+        'current_best': round(best, 2),
+        'refs': [
+            {'name': 'v2 k6', 'value': _V2_K6_BEST, 'delta': round(best - _V2_K6_BEST, 2)},
+            {'name': 'cnxxlquat', 'value': 91.08, 'delta': round(best - 91.08, 2)},
+        ],
+    }
+
+
+def cnxxl_delta(parsed):
+    """For each recent test eval, compute test - cnxxlquat_baseline at same ep.
+    parsed: dict with 'epochs' list from parse_log."""
+    if not parsed or not parsed.get('epochs'):
+        return None
+    out = []
+    for e in parsed['epochs'][-20:]:
+        ep = e.get('ep')
+        te = e.get('te_p1')
+        if ep is None or te is None: continue
+        base = _CNXXL_BASELINE.get(ep)
+        if base is None: continue
+        out.append({'ep': ep, 'te': te, 'base_te': base[1],
+                    'delta': round(te - base[1], 2)})
+    return out or None
 
 
 def qcc_stats(run_dir):
@@ -272,6 +436,12 @@ def build_status():
         'engram': engram_stats(run_dir),
         'qcc': qcc_stats(run_dir),
         'cluster': cluster_stats(run_dir),
+        'param_counts': param_counts(run_dir),
+        'cnxxl_delta': cnxxl_delta(parsed),
+        'refs': reference_baselines(parsed),
+        'available_refs': available_refs(exclude_run=run_dir),
+        'current_perclass': current_perclass(run_dir),
+        'fusion': fusion_cache(),
         **parsed,
     }
 
