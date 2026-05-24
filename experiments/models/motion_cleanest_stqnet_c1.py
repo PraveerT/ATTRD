@@ -69,12 +69,18 @@ class MotionCleanestLinXLSTQNetC1(MotionCleanestLinXLQuatHead):
                  lambda_balance=0.01,
                  cluster_feat_dim=256,
                  cluster_hidden=64,
+                 cluster_alpha_mode='per_frame',
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.K = int(K)
         self.lambda_cycle = float(lambda_cycle)
         self.lambda_recon = float(lambda_recon)
         self.lambda_balance = float(lambda_balance)
+        # 'per_frame' (default): alpha computed independently per frame.
+        # 'time_stable': alpha computed from time-pooled features once per
+        # sample then broadcast over T. Needed when input lacks point
+        # correspondence (e.g. raw NvidiaLoader vs canonical).
+        self.cluster_alpha_mode = str(cluster_alpha_mode)
 
         # Cluster assignment head: per-point feature (256-d post-Mamba) -> K logits.
         self.cluster_head = nn.Sequential(
@@ -97,7 +103,14 @@ class MotionCleanestLinXLSTQNetC1(MotionCleanestLinXLQuatHead):
         self.aux_loss = None
 
     def no_decay_param_names(self):
-        return ['cycle_proj.weight', 'cycle_proj.bias']
+        # cluster_head dies if subjected to weight decay -- its only gradient
+        # path is through softmax + cycle loss, magnitudes too small to
+        # counteract Adam's wd-driven zeroing. Exempt entirely.
+        return [
+            'cycle_proj.weight', 'cycle_proj.bias',
+            'cluster_head.0.weight', 'cluster_head.0.bias',
+            'cluster_head.2.weight', 'cluster_head.2.bias',
+        ]
 
     def _compute_cluster_quats(self, fea3):
         """fea3: (B, 4+F, T, P_eff). Returns (alpha, xyz_centered, Q_act, Q_pred).
@@ -111,8 +124,15 @@ class MotionCleanestLinXLSTQNetC1(MotionCleanestLinXLQuatHead):
 
         # Per-point features (B, T, P_eff, F)
         feat_pp = feat_eff.permute(0, 2, 3, 1).contiguous()
-        cluster_logits = self.cluster_head(feat_pp)          # (B, T, P_eff, K)
-        alpha = torch.softmax(cluster_logits, dim=-1)
+        if self.cluster_alpha_mode == 'time_stable':
+            # Time-pooled assignment: same cluster IDs at every frame.
+            feat_pp_time = feat_pp.mean(dim=1)                         # (B, P_eff, F)
+            cluster_logits_static = self.cluster_head(feat_pp_time)    # (B, P_eff, K)
+            alpha_static = torch.softmax(cluster_logits_static, dim=-1)
+            alpha = alpha_static.unsqueeze(1).expand(B, T, P_eff, self.K).contiguous()
+        else:
+            cluster_logits = self.cluster_head(feat_pp)      # (B, T, P_eff, K)
+            alpha = torch.softmax(cluster_logits, dim=-1)
         mass = alpha.sum(dim=2).clamp(min=1e-6)              # (B, T, K)
 
         # xyz downsampled (B, T, P_eff, 3)

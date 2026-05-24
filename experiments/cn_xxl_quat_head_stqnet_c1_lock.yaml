@@ -1,11 +1,10 @@
-# ST-QNet-C1 from scratch (no warm-start). Tests if cluster-rotation cycle
-# improves canonical solo when applied during full training (vs fine-tune
-# capacity-steal).
+# Resume raw+C1 from ep99 best (89.83) with LOCKED low LR.
+# MultiStepLR with empty milestones = constant base_lr throughout.
 
-dataloader: canonical_nvidia_loader.CanonicalNvidiaLoader
+dataloader: nvidia_dataloader.NvidiaLoader
 phase: train
-num_epoch: 100
-work_dir: ./work_dir/cn_xxl_canonical_stqnet_c1_K4/
+num_epoch: 150
+work_dir: ./work_dir/cn_xxl_quat_head_stqnet_c1/
 batch_size: 8
 test_batch_size: 8
 num_worker: 8
@@ -18,18 +17,18 @@ framesize: 32
 pts_size: 172
 dynamic_pts_size: true
 strict_load: false
-weights: null
+weights: ./work_dir/cn_xxl_quat_head_stqnet_c1/best_model.pt
 
 optimizer_args:
-  scheduler: constant_then_cosine
-  cosine_start: 75
-  num_epochs: 100
+  scheduler: constant
   optimizer: Adam
-  base_lr: 0.00012
-  step: [60, 70, 75]
+  base_lr: 0.000001
+  step: []
   weight_decay: 0.03
-  start_epoch: 0
+  start_epoch: 100
   nesterov: false
+  num_epochs: 150
+  cosine_start: 999
 
 train_loader_args: {phase: train, framerate: 32}
 test_loader_args:  {phase: test,  framerate: 32}
@@ -49,9 +48,10 @@ model_args:
   lxl_residual_scale: 0.7
   quat_head_hidden: 128
   quat_head_scale: 0.3
-  K: 4
+  K: 6
   lambda_cycle: 0.05
   lambda_recon: 0.025
   lambda_balance: 0.01
   cluster_feat_dim: 256
   cluster_hidden: 64
+  cluster_alpha_mode: time_stable

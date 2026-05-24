@@ -195,6 +195,35 @@ def engram_stats(run_dir):
         return None
 
 
+def cluster_stats(run_dir):
+    """ST-QNet-C1 cluster-rotation mechanism inspection.
+      - cycle_proj_norm: zero-init residual; grows iff mechanism active.
+      - cluster_head_norm: aux classifier head weight magnitude.
+    """
+    try:
+        ep, sd = _load_latest_sd(run_dir)
+        if sd is None:
+            return None
+        cycle_proj_w = sd.get('cycle_proj.weight')
+        if cycle_proj_w is None:
+            return None
+        out = {
+            'epoch': ep,
+            'cycle_proj_norm': float(cycle_proj_w.norm()),
+            'cycle_proj_max': float(cycle_proj_w.abs().max()),
+        }
+        # cluster_head is Sequential: 0=Linear, 2=Linear (final).
+        # Use explicit is-None check; `or` on tensors raises ambiguity error.
+        ch_w = sd.get('cluster_head.2.weight')
+        if ch_w is None:
+            ch_w = sd.get('cluster_head.0.weight')
+        if ch_w is not None:
+            out['cluster_head_norm'] = float(ch_w.norm())
+        return out
+    except Exception:
+        return None
+
+
 def qcc_stats(run_dir):
     """Track QCC mechanism usage:
       - qcc_scale: scalar gate for qcc_head aux output (init 0)
@@ -242,6 +271,7 @@ def build_status():
         'leaderboard': leaderboard_summary(),
         'engram': engram_stats(run_dir),
         'qcc': qcc_stats(run_dir),
+        'cluster': cluster_stats(run_dir),
         **parsed,
     }
 
