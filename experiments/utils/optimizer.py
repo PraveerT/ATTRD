@@ -14,13 +14,39 @@ class Optimizer(object):
         spatial_params = []
         temporal_params = []
         fusion_params = []
+        no_decay_params = []
+        low_lr_params = []
 
         fusion_lr_mult = self.optim_dict.get('fusion_lr_mult', 1.0)
+        low_lr_mult = self.optim_dict.get('low_lr_mult', 0.05)
+
+        # Optional: model may expose .no_decay_param_names() to exempt some
+        # parameters from weight decay, and .low_lr_param_names() to put some
+        # parameters in a small-LR group (soft-freeze).
+        no_decay_names = set()
+        low_lr_names = set()
+        m = model.module if hasattr(model, 'module') else model
+        if hasattr(m, 'no_decay_param_names'):
+            try:
+                no_decay_names = set(m.no_decay_param_names())
+            except Exception:
+                no_decay_names = set()
+        if hasattr(m, 'low_lr_param_names'):
+            try:
+                low_lr_names = set(m.low_lr_param_names())
+            except Exception:
+                low_lr_names = set()
 
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
             normalized_name = name[7:] if name.startswith('module.') else name
+            if normalized_name in no_decay_names:
+                no_decay_params.append(param)
+                continue
+            if normalized_name in low_lr_names:
+                low_lr_params.append(param)
+                continue
             if self.spatial_prefix and (
                 normalized_name == self.spatial_prefix
                 or normalized_name.startswith(self.spatial_prefix + '.')
@@ -35,6 +61,7 @@ class Optimizer(object):
                 fusion_params.append(param)
 
         base_lr = self.optim_dict['base_lr']
+        global_wd = self.optim_dict['weight_decay']
 
         param_groups = []
         if temporal_params:
@@ -43,20 +70,37 @@ class Optimizer(object):
             param_groups.append({'params': spatial_params, 'lr': base_lr, 'name': 'spatial'})
         if fusion_params:
             param_groups.append({'params': fusion_params, 'lr': base_lr * fusion_lr_mult, 'name': 'fusion'})
+        if low_lr_params:
+            param_groups.append({
+                'params': low_lr_params,
+                'lr': base_lr * low_lr_mult,
+                'name': 'low_lr',
+            })
+            print(f'[optimizer] {sum(p.numel() for p in low_lr_params)} '
+                  f'params in low_lr group (lr_mult={low_lr_mult})')
+        if no_decay_params:
+            param_groups.append({
+                'params': no_decay_params,
+                'lr': base_lr,
+                'name': 'no_decay',
+                'weight_decay': 0.0,
+            })
+            print(f'[optimizer] {sum(p.numel() for p in no_decay_params)} '
+                  f'params in no_decay group')
         if not param_groups:
             raise ValueError("No trainable parameters were found for optimizer setup.")
-        
+
         if self.optim_dict["optimizer"] == 'SGD':
             self.optimizer = optim.SGD(
                 param_groups,
                 momentum=0.9,
                 nesterov=self.optim_dict['nesterov'],
-                weight_decay=self.optim_dict['weight_decay']
+                weight_decay=global_wd,
             )
         elif self.optim_dict["optimizer"] == 'Adam':
             self.optimizer = optim.Adam(
                 param_groups,
-                weight_decay=self.optim_dict['weight_decay']
+                weight_decay=global_wd,
             )
         else:
             raise ValueError()
