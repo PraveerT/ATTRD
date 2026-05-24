@@ -29,3 +29,6 @@ __pycache__/
 *.npy
 *.npz
 *.bak
+
+# External pretrained ckpts (not our weights, do not commit)
+external_ckpts/
