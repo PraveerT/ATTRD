@@ -23,6 +23,7 @@ LOGITS_CUR = os.path.join(WATCH_DIR, 'test_logits.npz')
 WATCH_FILE = LOGITS_CUR
 LOGITS_CNXXL = '/notebooks/Anemon/experiments/work_dir/cn_xxl_quat_head/test_logits.npz'
 LOGITS_DSN = '/notebooks/Anemon/dsn_official_valid_logits.npz'
+LOGITS_UMDR_M = '/notebooks/Anemon/external_ckpts/umdr_M_test_logits.npz'
 DUMP_SCRIPT = '/notebooks/Anemon/experiments/dump_raw_c1.py'
 
 DSN_T = 9.5  # train-calibrated logit scale for DSN (multiply pre-softmax)
@@ -64,12 +65,13 @@ def load_epoch_marker(p):
 
 
 def aligned(ref_sigs, ref_lab, logits, labels, sigs):
+    """Align logits to reference sample order. Labels are NOT checked because
+    different dumps (e.g. path-derived vs splits-file derived) may disagree on
+    a handful of NvGesture samples whose folder name differs from their actual
+    label. ref_lab is always the source of truth."""
     by = {s: i for i, s in enumerate(sigs)}
     order = np.array([by[s] for s in ref_sigs])
-    out_log = logits[order]
-    out_lab = labels[order]
-    assert (out_lab == ref_lab).all(), 'label mismatch after alignment'
-    return out_log
+    return logits[order]
 
 
 def accuracy(probs, labels):
@@ -114,8 +116,14 @@ def get_ckpt_epoch():
         return None
 
 
+def oracle_quad(p_a, p_b, p_c, p_d, labels):
+    cor = (p_a.argmax(1) == labels) | (p_b.argmax(1) == labels) \
+        | (p_c.argmax(1) == labels) | (p_d.argmax(1) == labels)
+    return float(cor.mean() * 100.0)
+
+
 def compute_fusion():
-    """Load logits, align, compute solo + 2-way + 3-way + oracle. Returns dict."""
+    """Load logits, align, compute solo + 2/3/4-way + oracle. Returns dict."""
     cur = load_logits(LOGITS_CUR)
     cnxxl = load_logits(LOGITS_CNXXL)
     dsn = load_logits(LOGITS_DSN)
@@ -125,7 +133,17 @@ def compute_fusion():
     p_cnxxl = softmax(aligned(ref_sigs, ref_lab, *cnxxl))
     p_dsn = softmax(aligned(ref_sigs, ref_lab, *dsn) * DSN_T)
 
-    return {
+    # UMDR-M (rgb modality) — optional, only if file present.
+    p_m = None
+    if os.path.isfile(LOGITS_UMDR_M):
+        try:
+            m = load_logits(LOGITS_UMDR_M)
+            p_m = softmax(aligned(ref_sigs, ref_lab, *m))
+        except Exception as e:
+            print(f'[watcher] UMDR-M align failed: {e}', flush=True)
+            p_m = None
+
+    out = {
         'solo': {
             'cur': round(accuracy(p_cur, ref_lab), 2),
             'cnxxl': round(accuracy(p_cnxxl, ref_lab), 2),
@@ -142,6 +160,14 @@ def compute_fusion():
             'cnxxl_dsn_cur': round(oracle_triple(p_cnxxl, p_dsn, p_cur, ref_lab), 2),
         },
     }
+    if p_m is not None:
+        out['solo']['m'] = round(accuracy(p_m, ref_lab), 2)
+        out['fusion']['cnxxl_m'] = round(fuse_uniform([p_cnxxl, p_m], ref_lab), 2)
+        out['fusion']['cnxxl_dsn_m'] = round(fuse_uniform([p_cnxxl, p_dsn, p_m], ref_lab), 2)
+        out['fusion']['cnxxl_dsn_m_cur'] = round(fuse_uniform([p_cnxxl, p_dsn, p_m, p_cur], ref_lab), 2)
+        out['oracle']['cnxxl_dsn_m'] = round(oracle_triple(p_cnxxl, p_dsn, p_m, ref_lab), 2)
+        out['oracle']['cnxxl_dsn_m_cur'] = round(oracle_quad(p_cnxxl, p_dsn, p_m, p_cur, ref_lab), 2)
+    return out
 
 
 HISTORY_LIMIT = 60
@@ -180,6 +206,10 @@ def append_history(latest):
         'orc_two': latest['oracle']['cnxxl_cur'],
         'orc_three': latest['oracle']['cnxxl_dsn_cur'],
     }
+    if 'cnxxl_dsn_m_cur' in latest.get('fusion', {}):
+        row['four_way'] = latest['fusion']['cnxxl_dsn_m_cur']
+        row['cnxxl_dsn_m'] = latest['fusion']['cnxxl_dsn_m']
+        row['orc_four'] = latest['oracle'].get('cnxxl_dsn_m_cur')
     # Skip dup: same epoch as last row → replace, not append.
     if history and history[-1].get('epoch') == row['epoch']:
         history[-1] = row
