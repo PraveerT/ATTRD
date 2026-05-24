@@ -1,12 +1,10 @@
-# ST-QNet-C1 mechanism on RAW (no correspondence) cnxxlquat input.
-# Time-stable alpha for cluster correspondence across frames (canonical's
-# input correspondence isn't there to anchor clusters implicitly).
-# K=6 (palm + 5 fingers), lambda_cycle=0.05 (winning settings on canonical).
-# From-scratch training.
+# raw + ST-QNet-C1 mechanism, K=26 finger-joint count.
+# Schedule: constant LR ep1-74, cosine decay ep75-100 to eta_min, lock at
+# eta_min ep100-150. Single-yaml replaces the old run-then-lock-resume flow.
 
 dataloader: nvidia_dataloader.NvidiaLoader
 phase: train
-num_epoch: 100
+num_epoch: 150
 work_dir: ./work_dir/cn_xxl_quat_head_stqnet_c1/
 batch_size: 8
 test_batch_size: 8
@@ -23,11 +21,13 @@ strict_load: false
 weights: null
 
 optimizer_args:
-  scheduler: constant_then_cosine
+  scheduler: constant_then_cosine_then_lock
   cosine_start: 75
-  num_epochs: 100
+  lock_start: 100
+  num_epochs: 150
   optimizer: Adam
   base_lr: 0.00012
+  eta_min_ratio: 0.01
   step: [60, 70, 75]
   weight_decay: 0.03
   start_epoch: 0
@@ -51,7 +51,7 @@ model_args:
   lxl_residual_scale: 0.7
   quat_head_hidden: 128
   quat_head_scale: 0.3
-  K: 6
+  K: 5
   lambda_cycle: 0.05
   lambda_recon: 0.025
   lambda_balance: 0.01

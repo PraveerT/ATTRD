@@ -130,6 +130,29 @@ class Optimizer(object):
             return optim.lr_scheduler.SequentialLR(
                 optimizer, [constant, cosine], milestones=[cosine_start],
             )
+        if scheduler_type == 'constant_then_cosine_then_lock':
+            # Phase 1: constant base_lr until cosine_start.
+            # Phase 2: cosine decay to eta_min between cosine_start and lock_start.
+            # Phase 3: lock at eta_min from lock_start to num_epochs.
+            num_epochs = self.optim_dict['num_epochs']
+            cosine_start = self.optim_dict['cosine_start']
+            lock_start = self.optim_dict.get('lock_start', num_epochs)
+            base_lr = self.optim_dict['base_lr']
+            eta_min = base_lr * self.optim_dict.get('eta_min_ratio', 0.01)
+            constant1 = optim.lr_scheduler.ConstantLR(
+                optimizer, factor=1.0, total_iters=cosine_start,
+            )
+            cosine = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=max(1, lock_start - cosine_start), eta_min=eta_min,
+            )
+            lock = optim.lr_scheduler.ConstantLR(
+                optimizer, factor=eta_min / max(base_lr, 1e-12),
+                total_iters=max(1, num_epochs - lock_start),
+            )
+            return optim.lr_scheduler.SequentialLR(
+                optimizer, [constant1, cosine, lock],
+                milestones=[cosine_start, lock_start],
+            )
         if self.optim_dict["optimizer"] in ['SGD', 'Adam']:
             return optim.lr_scheduler.MultiStepLR(optimizer, milestones=milestones, gamma=0.1)
         raise ValueError()
