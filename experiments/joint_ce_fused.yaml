@@ -1,0 +1,84 @@
+phase: train
+work_dir: ./work_dir/joint_cnxxl_rawc1/
+num_epoch: 25
+batch_size: 4
+test_batch_size: 4
+num_worker: 8
+device: 0
+log_interval: 50
+eval_interval: 1
+save_interval: 5
+framesize: 32
+pts_size: 172
+dynamic_pts_size: false
+dataloader: nvidia_dataloader.NvidiaLoader
+train_loader_args:
+  phase: train
+  framerate: 32
+test_loader_args:
+  phase: test
+  framerate: 32
+cnxxl_model: models.motion_cleanest_quat_head.MotionCleanestLinXLQuatHead
+cnxxl_ckpt: ./work_dir/cn_xxl_quat_head/epoch106_model.pt
+cnxxl_args:
+  pts_size: 172
+  num_classes: 25
+  knn:
+  - 32
+  - 24
+  - 48
+  - 24
+  topk: 8
+  multi_scale_num_scales: 5
+  lxl_hidden_dim: 256
+  lxl_mlp_dim: 512
+  lxl_num_layers: 4
+  lxl_dropout: 0.3
+  lxl_bidirectional: true
+  lxl_residual_scale: 0.7
+  quat_head_hidden: 128
+  quat_head_scale: 0.3
+cnxxl_backbone_lr: 0.0
+cnxxl_head_lr: 0.0
+rawc1_model: models.motion_cleanest_stqnet_c1.MotionCleanestLinXLSTQNetC1
+rawc1_ckpt: ./work_dir/cn_xxl_quat_head_stqnet_c1/epoch117_model.pt
+rawc1_args:
+  pts_size: 172
+  num_classes: 25
+  knn:
+  - 32
+  - 24
+  - 48
+  - 24
+  topk: 8
+  multi_scale_num_scales: 5
+  lxl_hidden_dim: 256
+  lxl_mlp_dim: 512
+  lxl_num_layers: 4
+  lxl_dropout: 0.3
+  lxl_bidirectional: true
+  lxl_residual_scale: 0.7
+  quat_head_hidden: 128
+  quat_head_scale: 0.3
+  K: 6
+  lambda_cycle: 0.0
+  lambda_recon: 0.0
+  lambda_balance: 0.0
+  cluster_feat_dim: 256
+  cluster_hidden: 64
+  cluster_alpha_mode: time_stable
+rawc1_backbone_lr: 3.0e-05
+rawc1_aux_lr: 0.0001
+weight_decay: 0.0001
+label_smoothing: 0.1
+lambda_aux: 0.0
+fusion_lambda: 0.5
+eta_min: 1.0e-07
+cnxxl_min_solo: 89.5
+dsn_logits: /notebooks/Anemon/dsn_official_valid_logits.npz
+dsn_temp: 9.5
+m_logits: /notebooks/Anemon/external_ckpts/umdr_M_test_logits.npz
+grad_clip: 1.0
+lambda_div: 0.0
+loss_mode: boost
+boost_factor: 2.0

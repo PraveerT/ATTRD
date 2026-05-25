@@ -44,7 +44,7 @@ class Processor:
         self.loss = self.criterion()
         self.augmentor = GpuAugmentor()
         self.device.model_to_device(self.augmentor)
-        self.best_accuracy = 0.0
+        self.best_accuracy = float(getattr(self.arg, "min_best_acc", 0.0))
         self.use_static_pts = ('--pts-size' in sys.argv) or (
             not getattr(self.arg, 'dynamic_pts_size', True)
         )
@@ -92,15 +92,20 @@ class Processor:
                 optimizer.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
             except (ValueError, RuntimeError) as e:
                 self.recoder.print_log(f'optimizer state restore skipped: {e}')
-        if 'scheduler_state_dict' in ckpt:
-            try:
-                optimizer.scheduler.load_state_dict(ckpt['scheduler_state_dict'])
-            except (ValueError, RuntimeError):
-                pass
+        # Skip loading scheduler_state_dict: ckpts trained with a different
+        # scheduler structure (e.g. 2-phase -> 3-phase) silently fail to load
+        # and the new scheduler then starts at step 0, producing base_lr instead
+        # of the intended phase. Build it fresh, then advance to start_epoch.
         if 'epoch' in ckpt:
             self.arg.optimizer_args['start_epoch'] = ckpt['epoch'] + 1
             self.recoder.print_log(
                 f'Resuming from checkpoint: epoch {self.arg.optimizer_args["start_epoch"]}'
+            )
+            for _ in range(self.arg.optimizer_args['start_epoch']):
+                optimizer.scheduler.step()
+            cur_lr = optimizer.optimizer.param_groups[0]['lr']
+            self.recoder.print_log(
+                f'Scheduler advanced to epoch {self.arg.optimizer_args["start_epoch"]}: lr={cur_lr:.2e}'
             )
 
     # ---------------------------------------------------------------- data

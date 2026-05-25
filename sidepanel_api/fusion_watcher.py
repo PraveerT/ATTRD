@@ -1,12 +1,28 @@
-"""Background process: poll best_model.pt mtime; on change, refresh the
-test-logits dump for the current stqnet_c1 run and recompute the honest
-softmax fusion against cnxxlquat + DSN. Result cached as
-sidepanel_api/state/fusion_cache.json so server.py can serve it cheaply.
+"""Background process: poll the active training run's test_logits.npz and
+recompute the honest softmax fusion across 4 model slots.
+
+Slots (no 'cur' abstraction — explicit by model name):
+  - cnxxl:  our depth point cloud model (MotionCleanestLinXLQuatHead)
+  - raw_c1: our cluster-cycle variant (MotionCleanestLinXLSTQNetC1)
+  - dsn:    UMDR's depth model (Zhou et al. TPAMI'23), K modality
+  - m:      UMDR's RGB model (Zhou et al. TPAMI'23), M modality
+
+For cnxxl and raw_c1 we have BOTH a frozen snapshot AND a possibly-live
+work_dir/test_logits.npz. The live file wins if the corresponding work_dir
+log shows training is in progress (mtime is newer than the snapshot).
+
+Cache is written to sidepanel_api/state/fusion_cache.json so server.py serves
+it cheaply, and the published payload exposes:
+  - solo: {cnxxl, raw_c1, dsn, m}
+  - live: 'cnxxl' | 'raw_c1' | None        (which slot is being trained)
+  - live_epoch: int                         (epoch of the live model)
+  - fusion: {cnxxl_dsn, cnxxl_raw, cnxxl_dsn_raw, cnxxl_dsn_raw_m}
+  - oracle: same keys
+  - history: list of per-eval rows (deepest 60).
 """
 import json
 import os
 import re
-import subprocess
 import sys
 import time
 
@@ -15,18 +31,24 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE_DIR = os.path.join(HERE, 'state')
 CACHE = os.path.join(STATE_DIR, 'fusion_cache.json')
-WATCH_DIR = '/notebooks/Anemon/experiments/work_dir/cn_xxl_quat_head_stqnet_c1'
-BEST_PT = os.path.join(WATCH_DIR, 'best_model.pt')
-LOGITS_CUR = os.path.join(WATCH_DIR, 'test_logits.npz')
-# main.py writes test_logits.npz at the end of every test eval. The watcher
-# fires on every change of that file (free CPU math, no GPU contention).
-WATCH_FILE = LOGITS_CUR
-LOGITS_CNXXL = '/notebooks/Anemon/experiments/work_dir/cn_xxl_quat_head/test_logits.npz'
-LOGITS_DSN = '/notebooks/Anemon/dsn_official_valid_logits.npz'
-LOGITS_UMDR_M = '/notebooks/Anemon/external_ckpts/umdr_M_test_logits.npz'
-DUMP_SCRIPT = '/notebooks/Anemon/experiments/dump_raw_c1.py'
 
-DSN_T = 9.5  # train-calibrated logit scale for DSN (multiply pre-softmax)
+# Work dirs whose test_logits.npz we read live.
+LIVE_DIRS = {
+    'cnxxl':  '/notebooks/Anemon/experiments/work_dir/cn_xxl_quat_head',
+    # raw_c1 slot now points at the lambda_cycle=0 ablation training so the
+    # sidepanel shows its progress live. Original raw_c1 ckpts remain on
+    # disk under cn_xxl_quat_head_stqnet_c1/ (not overwritten).
+    'raw_c1': '/notebooks/Anemon/experiments/work_dir/cn_xxl_quat_head_stqnet_c1',
+}
+SNAPSHOTS = {
+    'cnxxl':  '/notebooks/Anemon/external_ckpts/cnxxl_ep141_91.29_test_logits.npz',
+    'raw_c1': '/notebooks/Anemon/external_ckpts/cnxxl_ep141_91.29_test_logits.npz',
+}
+LOGITS_DSN = '/notebooks/Anemon/dsn_official_valid_logits.npz'
+LOGITS_M = '/notebooks/Anemon/external_ckpts/umdr_M_test_logits.npz'
+
+DSN_T = 9.5  # train-calibrated logit scale for DSN
+HISTORY_LIMIT = 60
 
 
 def softmax(x, axis=-1):
@@ -53,7 +75,7 @@ def load_logits(p):
 
 
 def load_epoch_marker(p):
-    """Return the eval epoch stored in the npz, or None if absent."""
+    """Return the eval epoch baked into the npz (main.py writes this) or None."""
     try:
         A = np.load(p, allow_pickle=True)
         if 'epoch' in A.files:
@@ -65,10 +87,8 @@ def load_epoch_marker(p):
 
 
 def aligned(ref_sigs, ref_lab, logits, labels, sigs):
-    """Align logits to reference sample order. Labels are NOT checked because
-    different dumps (e.g. path-derived vs splits-file derived) may disagree on
-    a handful of NvGesture samples whose folder name differs from their actual
-    label. ref_lab is always the source of truth."""
+    """Align other logits to reference sample order. Ignores label mismatches;
+    ref_lab is the source of truth."""
     by = {s: i for i, s in enumerate(sigs)}
     order = np.array([by[s] for s in ref_sigs])
     return logits[order]
@@ -79,98 +99,103 @@ def accuracy(probs, labels):
 
 
 def fuse_uniform(probs_list, labels):
-    avg = np.mean(probs_list, axis=0)
-    return accuracy(avg, labels)
+    return accuracy(np.mean(probs_list, axis=0), labels)
 
 
-def oracle_pair(p_a, p_b, labels):
-    """Oracle: at each sample, take the model that was correct (either one)."""
-    cor_a = p_a.argmax(1) == labels
-    cor_b = p_b.argmax(1) == labels
-    return float((cor_a | cor_b).mean() * 100.0)
-
-
-def oracle_triple(p_a, p_b, p_c, labels):
-    cor_a = p_a.argmax(1) == labels
-    cor_b = p_b.argmax(1) == labels
-    cor_c = p_c.argmax(1) == labels
-    return float((cor_a | cor_b | cor_c).mean() * 100.0)
-
-
-def dump_current():
-    """main.py now writes test_logits.npz at the end of each test eval; we
-    only need to check the file is present. Kept as a no-op so the rest of the
-    watcher logic (which gates on dump success) still works."""
-    return os.path.isfile(LOGITS_CUR)
-
-
-def get_ckpt_epoch():
-    """Read current best_model.pt's recorded epoch index. main.py stores it
-    1-indexed (matches 'Epoch N, Test, Evaluation' log lines)."""
-    try:
-        import torch
-        d = torch.load(BEST_PT, map_location='cpu')
-        ep = d.get('epoch')
-        return int(ep) if ep is not None else None
-    except Exception:
-        return None
-
-
-def oracle_quad(p_a, p_b, p_c, p_d, labels):
-    cor = (p_a.argmax(1) == labels) | (p_b.argmax(1) == labels) \
-        | (p_c.argmax(1) == labels) | (p_d.argmax(1) == labels)
+def oracle_any(*probs_list, labels):
+    cor = np.zeros_like(labels, dtype=bool)
+    for p in probs_list:
+        cor |= (p.argmax(1) == labels)
     return float(cor.mean() * 100.0)
 
 
+def _resolve_slot_logits(name):
+    """Return (path, is_live, epoch_marker) for a slot. Prefer live file
+    if the live test_logits.npz is newer than the snapshot."""
+    snap = SNAPSHOTS[name]
+    live = os.path.join(LIVE_DIRS[name], 'test_logits.npz')
+    snap_mt = os.path.getmtime(snap) if os.path.isfile(snap) else 0
+    live_mt = os.path.getmtime(live) if os.path.isfile(live) else 0
+    if live_mt > snap_mt:
+        ep = load_epoch_marker(live)
+        return live, True, ep
+    return snap, False, None
+
+
+def latest_live_slot():
+    """Which of {cnxxl, raw_c1} has the freshest live test_logits.npz."""
+    best = None
+    for name in LIVE_DIRS:
+        live = os.path.join(LIVE_DIRS[name], 'test_logits.npz')
+        if not os.path.isfile(live):
+            continue
+        mt = os.path.getmtime(live)
+        snap_mt = os.path.getmtime(SNAPSHOTS[name]) if os.path.isfile(SNAPSHOTS[name]) else 0
+        if mt <= snap_mt:
+            continue  # live not newer than snapshot
+        if best is None or mt > best[1]:
+            best = (name, mt, live)
+    return best
+
+
 def compute_fusion():
-    """Load logits, align, compute solo + 2/3/4-way + oracle. Returns dict."""
-    cur = load_logits(LOGITS_CUR)
-    cnxxl = load_logits(LOGITS_CNXXL)
-    dsn = load_logits(LOGITS_DSN)
-    ref_log, ref_lab, ref_sigs = cur
+    """Resolve all 4 slots, compute solo + fusion + oracle. ref-aligned by cnxxl."""
+    cnxxl_path, cnxxl_live, cnxxl_ep = _resolve_slot_logits('cnxxl')
+    raw_path,   raw_live,   raw_ep   = _resolve_slot_logits('raw_c1')
+    cnxxl_log, cnxxl_lab, cnxxl_sigs = load_logits(cnxxl_path)
+    raw_log,   raw_lab,   raw_sigs   = load_logits(raw_path)
 
-    p_cur = softmax(ref_log)
-    p_cnxxl = softmax(aligned(ref_sigs, ref_lab, *cnxxl))
-    p_dsn = softmax(aligned(ref_sigs, ref_lab, *dsn) * DSN_T)
+    # Use cnxxl as the reference order. raw_c1, dsn, m all align to it.
+    ref_sigs, ref_lab = cnxxl_sigs, cnxxl_lab
+    p_cnxxl = softmax(cnxxl_log)
+    p_raw   = softmax(aligned(ref_sigs, ref_lab, raw_log, raw_lab, raw_sigs))
 
-    # UMDR-M (rgb modality) — optional, only if file present.
+    dsn_log, dsn_lab, dsn_sigs = load_logits(LOGITS_DSN)
+    p_dsn = softmax(aligned(ref_sigs, ref_lab, dsn_log, dsn_lab, dsn_sigs) * DSN_T)
+
     p_m = None
-    if os.path.isfile(LOGITS_UMDR_M):
+    if os.path.isfile(LOGITS_M):
         try:
-            m = load_logits(LOGITS_UMDR_M)
-            p_m = softmax(aligned(ref_sigs, ref_lab, *m))
+            m_log, m_lab, m_sigs = load_logits(LOGITS_M)
+            p_m = softmax(aligned(ref_sigs, ref_lab, m_log, m_lab, m_sigs))
         except Exception as e:
-            print(f'[watcher] UMDR-M align failed: {e}', flush=True)
-            p_m = None
+            print(f'[watcher] M align failed: {e}', flush=True)
 
     out = {
         'solo': {
-            'cur': round(accuracy(p_cur, ref_lab), 2),
-            'cnxxl': round(accuracy(p_cnxxl, ref_lab), 2),
-            'dsn': round(accuracy(p_dsn, ref_lab), 2),
+            'cnxxl':  round(accuracy(p_cnxxl, ref_lab), 2),
+            'raw_c1': round(accuracy(p_raw,   ref_lab), 2),
+            'dsn':    round(accuracy(p_dsn,   ref_lab), 2),
         },
         'fusion': {
-            'cnxxl_cur': round(fuse_uniform([p_cnxxl, p_cur], ref_lab), 2),
-            'cnxxl_dsn': round(fuse_uniform([p_cnxxl, p_dsn], ref_lab), 2),
-            'cnxxl_dsn_cur': round(fuse_uniform([p_cnxxl, p_dsn, p_cur], ref_lab), 2),
+            'cnxxl_dsn':         round(fuse_uniform([p_cnxxl, p_dsn], ref_lab), 2),
+            'cnxxl_raw':         round(fuse_uniform([p_cnxxl, p_raw], ref_lab), 2),
+            'cnxxl_dsn_raw':     round(fuse_uniform([p_cnxxl, p_dsn, p_raw], ref_lab), 2),
         },
         'oracle': {
-            'cnxxl_cur': round(oracle_pair(p_cnxxl, p_cur, ref_lab), 2),
-            'cnxxl_dsn': round(oracle_pair(p_cnxxl, p_dsn, ref_lab), 2),
-            'cnxxl_dsn_cur': round(oracle_triple(p_cnxxl, p_dsn, p_cur, ref_lab), 2),
+            'cnxxl_dsn':         round(oracle_any(p_cnxxl, p_dsn, labels=ref_lab), 2),
+            'cnxxl_raw':         round(oracle_any(p_cnxxl, p_raw, labels=ref_lab), 2),
+            'cnxxl_dsn_raw':     round(oracle_any(p_cnxxl, p_dsn, p_raw, labels=ref_lab), 2),
         },
     }
     if p_m is not None:
         out['solo']['m'] = round(accuracy(p_m, ref_lab), 2)
-        out['fusion']['cnxxl_m'] = round(fuse_uniform([p_cnxxl, p_m], ref_lab), 2)
-        out['fusion']['cnxxl_dsn_m'] = round(fuse_uniform([p_cnxxl, p_dsn, p_m], ref_lab), 2)
-        out['fusion']['cnxxl_dsn_m_cur'] = round(fuse_uniform([p_cnxxl, p_dsn, p_m, p_cur], ref_lab), 2)
-        out['oracle']['cnxxl_dsn_m'] = round(oracle_triple(p_cnxxl, p_dsn, p_m, ref_lab), 2)
-        out['oracle']['cnxxl_dsn_m_cur'] = round(oracle_quad(p_cnxxl, p_dsn, p_m, p_cur, ref_lab), 2)
+        out['fusion']['cnxxl_dsn_raw_m'] = round(fuse_uniform([p_cnxxl, p_dsn, p_raw, p_m], ref_lab), 2)
+        out['oracle']['cnxxl_dsn_raw_m'] = round(oracle_any(p_cnxxl, p_dsn, p_raw, p_m, labels=ref_lab), 2)
+
+    # Live-slot annotation.
+    if cnxxl_live and raw_live:
+        # both newer than snapshot — pick whichever is fresher.
+        live_name = 'cnxxl' if os.path.getmtime(cnxxl_path) >= os.path.getmtime(raw_path) else 'raw_c1'
+    elif cnxxl_live:
+        live_name = 'cnxxl'
+    elif raw_live:
+        live_name = 'raw_c1'
+    else:
+        live_name = None
+    out['live'] = live_name
+    out['live_epoch'] = cnxxl_ep if live_name == 'cnxxl' else (raw_ep if live_name == 'raw_c1' else None)
     return out
-
-
-HISTORY_LIMIT = 60
 
 
 def load_cache():
@@ -192,26 +217,28 @@ def write_cache(payload):
 
 
 def append_history(latest):
-    """Append a single-line per-epoch summary row to the history list and
-    persist back to the cache. Returns the merged cache dict."""
+    """Build a one-row summary keyed by live_epoch; replace same-epoch dupes."""
     prev = load_cache() or {}
     history = list(prev.get('history') or [])
     row = {
-        'epoch': latest.get('epoch'),
+        'epoch': latest.get('live_epoch'),
         'ts': latest.get('ts'),
-        'cur': latest['solo']['cur'],
-        'cnxxl_cur': latest['fusion']['cnxxl_cur'],
-        'cnxxl_dsn': latest['fusion']['cnxxl_dsn'],
-        'three_way': latest['fusion']['cnxxl_dsn_cur'],
-        'orc_two': latest['oracle']['cnxxl_cur'],
-        'orc_three': latest['oracle']['cnxxl_dsn_cur'],
+        'live': latest.get('live'),
+        # solo of each slot at this tick
+        'cnxxl':  latest['solo'].get('cnxxl'),
+        'raw_c1': latest['solo'].get('raw_c1'),
+        'dsn':    latest['solo'].get('dsn'),
+        'm':      latest['solo'].get('m'),
+        # fusion
+        'cnxxl_dsn':         latest['fusion'].get('cnxxl_dsn'),
+        'cnxxl_raw':         latest['fusion'].get('cnxxl_raw'),
+        'cnxxl_dsn_raw':     latest['fusion'].get('cnxxl_dsn_raw'),
+        'cnxxl_dsn_raw_m':   latest['fusion'].get('cnxxl_dsn_raw_m'),
+        # oracle (3-way + 4-way most useful)
+        'orc_cnxxl_dsn_raw': latest['oracle'].get('cnxxl_dsn_raw'),
+        'orc_cnxxl_dsn_raw_m': latest['oracle'].get('cnxxl_dsn_raw_m'),
     }
-    if 'cnxxl_dsn_m_cur' in latest.get('fusion', {}):
-        row['four_way'] = latest['fusion']['cnxxl_dsn_m_cur']
-        row['cnxxl_dsn_m'] = latest['fusion']['cnxxl_dsn_m']
-        row['orc_four'] = latest['oracle'].get('cnxxl_dsn_m_cur')
-    # Skip dup: same epoch as last row → replace, not append.
-    if history and history[-1].get('epoch') == row['epoch']:
+    if history and history[-1].get('epoch') == row['epoch'] and history[-1].get('live') == row['live']:
         history[-1] = row
     else:
         history.append(row)
@@ -222,24 +249,21 @@ def append_history(latest):
 
 
 def step(last_mtime):
-    if not os.path.isfile(WATCH_FILE):
+    live = latest_live_slot()
+    if live is None:
         return last_mtime
-    mtime = os.path.getmtime(WATCH_FILE)
+    name, mtime, path = live
     if mtime == last_mtime:
         return last_mtime
-    print(f'[watcher] test_logits.npz changed (mtime={mtime})', flush=True)
+    print(f'[watcher] {name} test_logits changed (mtime={mtime})', flush=True)
     try:
-        # Prefer the epoch marker baked into test_logits.npz (= eval epoch).
-        # Falls back to best_model.pt's recorded epoch (only useful while
-        # tests pre-date the marker patch).
-        ep = load_epoch_marker(WATCH_FILE) or get_ckpt_epoch()
         fus = compute_fusion()
-        fus['epoch'] = ep
         fus['ts'] = time.strftime('%Y-%m-%d %H:%M:%S')
         merged = append_history(fus)
         write_cache(merged)
-        print(f'[watcher] cache updated for ep={ep}: {fus["solo"]} '
-              f'(history n={len(merged.get("history") or [])})', flush=True)
+        print(f"[watcher] cache updated live={fus.get('live')} ep={fus.get('live_epoch')} "
+              f"solo={fus['solo']} (history n={len(merged.get('history') or [])})",
+              flush=True)
     except Exception as e:
         print(f'[watcher] fusion error: {e}', flush=True)
         return last_mtime
@@ -248,14 +272,15 @@ def step(last_mtime):
 
 def main():
     interval = int(sys.argv[1]) if len(sys.argv) > 1 else 60
-    print(f'[watcher] watching {WATCH_FILE} every {interval}s', flush=True)
+    print(f'[watcher] polling live dirs every {interval}s: {list(LIVE_DIRS)}', flush=True)
     last = 0.0
-    if os.path.isfile(WATCH_FILE):
-        # On startup, prime the cache only if it's missing/stale.
-        if not os.path.isfile(CACHE) or os.path.getmtime(CACHE) < os.path.getmtime(WATCH_FILE):
+    initial = latest_live_slot()
+    if initial:
+        # On startup, recompute only if cache is missing or stale.
+        if not os.path.isfile(CACHE) or os.path.getmtime(CACHE) < initial[1]:
             last = step(0.0)
         else:
-            last = os.path.getmtime(WATCH_FILE)
+            last = initial[1]
     while True:
         try:
             last = step(last)

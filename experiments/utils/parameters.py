@@ -148,6 +148,11 @@ def get_parser():
         default=False,
         help='resume optimizer, scheduler, and RNG state from --weights checkpoint')
     parser.add_argument(
+        '--min-best-acc',
+        type=float,
+        default=0.0,
+        help='floor for best_accuracy on resume: best_model.pt only overwritten when test_acc exceeds this')
+    parser.add_argument(
         '--strict-load',
         type=str2bool,
         default=True,

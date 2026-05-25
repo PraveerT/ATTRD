@@ -3,7 +3,7 @@ import sys, os, re, numpy as np, torch, yaml, importlib
 sys.path.insert(0, '/notebooks/Anemon/experiments')
 os.chdir('/notebooks/Anemon/experiments')
 
-CKPT = './work_dir/cn_xxl_quat_head/epoch100_model.pt'
+CKPT = './work_dir/cn_xxl_quat_head/best_model.pt'
 CFG  = './cn_xxl_quat_head.yaml'
 OUT  = './work_dir/cn_xxl_quat_head/test_logits.npz'
 

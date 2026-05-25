@@ -1,7 +1,3 @@
-# raw + ST-QNet-C1 mechanism, K=26 finger-joint count.
-# Schedule: constant LR ep1-74, cosine decay ep75-100 to eta_min, lock at
-# eta_min ep100-150. Single-yaml replaces the old run-then-lock-resume flow.
-
 dataloader: nvidia_dataloader.NvidiaLoader
 phase: train
 num_epoch: 150
@@ -13,13 +9,11 @@ device: 0
 log_interval: 50
 eval_interval: 1
 save_interval: 5
-
 framesize: 32
 pts_size: 172
 dynamic_pts_size: true
 strict_load: false
 weights: null
-
 optimizer_args:
   scheduler: constant_then_cosine_then_lock
   cosine_start: 75
@@ -28,19 +22,28 @@ optimizer_args:
   optimizer: Adam
   base_lr: 0.00012
   eta_min_ratio: 0.01
-  step: [60, 70, 75]
+  step:
+  - 60
+  - 70
+  - 75
   weight_decay: 0.03
   start_epoch: 0
   nesterov: false
-
-train_loader_args: {phase: train, framerate: 32}
-test_loader_args:  {phase: test,  framerate: 32}
-
+train_loader_args:
+  phase: train
+  framerate: 32
+test_loader_args:
+  phase: test
+  framerate: 32
 model: models.motion_cleanest_stqnet_c1.MotionCleanestLinXLSTQNetC1
 model_args:
   pts_size: 172
   num_classes: 25
-  knn: [32, 24, 48, 24]
+  knn:
+  - 32
+  - 24
+  - 48
+  - 24
   topk: 8
   multi_scale_num_scales: 5
   lxl_hidden_dim: 256
@@ -58,4 +61,3 @@ model_args:
   cluster_feat_dim: 256
   cluster_hidden: 64
   cluster_alpha_mode: time_stable
-  gumbel_tau: 0.5

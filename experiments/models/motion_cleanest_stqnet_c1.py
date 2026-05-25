@@ -152,6 +152,9 @@ class MotionCleanestLinXLSTQNetC1(MotionCleanestLinXLQuatHead):
         cov = torch.einsum('btpkd,btpke->btkde', weighted, xyz_centered) \
               / mass.unsqueeze(-1).unsqueeze(-1)
 
+        # Tikhonov regularization: degenerate clusters produce singular
+        # cov whose eigh has NaN backward. Adding eps*I stabilizes it.
+        cov = cov + 1e-4 * torch.eye(3, device=cov.device, dtype=cov.dtype)
         # Principal axis + angle from eigh
         try:
             eigvals, eigvecs = torch.linalg.eigh(cov)         # ascending

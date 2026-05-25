@@ -61,11 +61,17 @@ def parse_log(path):
                     ep = int(m.group(1))
                     p1 = float(m.group(2))
                     p5 = float(m.group(3))
-                    epochs.append({
+                    row = {
                         'ep': ep, 'tr_acc': ta, 'tr_loss': tl,
                         'aux_loss': al,
                         'te_p1': round(p1, 2), 'te_p5': round(p5, 2),
-                    })
+                    }
+                    # Same epoch logged twice (stdout + file logger): replace
+                    # in place instead of appending a duplicate row.
+                    if epochs and epochs[-1].get('ep') == ep:
+                        epochs[-1] = row
+                    else:
+                        epochs.append(row)
                     if best is None or p1 > best['p1']:
                         best = {'ep': ep, 'p1': round(p1, 2)}
     except FileNotFoundError:
