@@ -1,7 +1,7 @@
 """Background process: poll the active training run's test_logits.npz and
 recompute the honest softmax fusion across 4 model slots.
 
-Slots (no 'cur' abstraction — explicit by model name):
+Slots (no 'cur' abstraction � explicit by model name):
   - cnxxl:  our depth point cloud model (MotionCleanestLinXLQuatHead)
   - raw_c1: our cluster-cycle variant (MotionCleanestLinXLSTQNetC1)
   - dsn:    UMDR's depth model (Zhou et al. TPAMI'23), K modality
@@ -35,10 +35,9 @@ CACHE = os.path.join(STATE_DIR, 'fusion_cache.json')
 # Work dirs whose test_logits.npz we read live.
 LIVE_DIRS = {
     'cnxxl':  '/notebooks/Anemon/experiments/work_dir/cn_xxl_quat_head',
-    # raw_c1 slot now points at the lambda_cycle=0 ablation training so the
-    # sidepanel shows its progress live. Original raw_c1 ckpts remain on
-    # disk under cn_xxl_quat_head_stqnet_c1/ (not overwritten).
-    'raw_c1': '/notebooks/Anemon/experiments/work_dir/cn_xxl_quat_head_stqnet_c1',
+    # raw_c1 slot now points at the z-rotation augmentation fine-tune
+    # of cnxxl. Slot keeps its name for sidepanel back-compat.
+    'raw_c1': '/notebooks/Anemon/experiments/work_dir/cn_xxl_quat_head_rotaug_scratch',
 }
 SNAPSHOTS = {
     'cnxxl':  '/notebooks/Anemon/external_ckpts/cnxxl_ep141_91.29_test_logits.npz',
@@ -185,7 +184,7 @@ def compute_fusion():
 
     # Live-slot annotation.
     if cnxxl_live and raw_live:
-        # both newer than snapshot — pick whichever is fresher.
+        # both newer than snapshot � pick whichever is fresher.
         live_name = 'cnxxl' if os.path.getmtime(cnxxl_path) >= os.path.getmtime(raw_path) else 'raw_c1'
     elif cnxxl_live:
         live_name = 'cnxxl'
