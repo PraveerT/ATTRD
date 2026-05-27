@@ -37,7 +37,7 @@ LIVE_DIRS = {
     'cnxxl':  '/notebooks/Anemon/experiments/work_dir/cn_xxl_quat_head',
     # raw_c1 slot now points at the z-rotation augmentation fine-tune
     # of cnxxl. Slot keeps its name for sidepanel back-compat.
-    'raw_c1': '/notebooks/Anemon/experiments/work_dir/cn_xxl_quat_head_rotaug_scratch',
+    'raw_c1': '/notebooks/Anemon/experiments/work_dir/cn_xxl_quat_head_rotaug_warm',
 }
 SNAPSHOTS = {
     'cnxxl':  '/notebooks/Anemon/external_ckpts/cnxxl_ep141_91.29_test_logits.npz',
