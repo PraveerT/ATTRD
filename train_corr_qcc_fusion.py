@@ -62,9 +62,11 @@ class CorrQCCNet(nn.Module):
         temporal_hidden=192,
         layers=2,
         dropout=0.25,
+        quat_inject=False,
     ):
         super().__init__()
         self.frames = int(frames)
+        self.quat_inject = bool(quat_inject)
         self.point_mlp = nn.Sequential(
             nn.Linear(9, point_hidden),
             nn.GELU(),
@@ -92,13 +94,16 @@ class CorrQCCNet(nn.Module):
             nn.Tanh(),
             nn.Linear(temporal_hidden // 2, 1),
         )
-        qdim = (self.frames - 1) * 4 + (self.frames - 2) * 4 + (self.frames - 2) * 4 + (self.frames - 2)
-        self.quat_proj = nn.Sequential(
-            nn.Linear(qdim, temporal_hidden),
-            nn.GELU(),
-            nn.LayerNorm(temporal_hidden),
-            nn.Dropout(dropout),
-        )
+        if self.quat_inject:
+            qdim = (self.frames - 1) * 4 + (self.frames - 2) * 4 + (self.frames - 2) * 4 + (self.frames - 2)
+            self.quat_proj = nn.Sequential(
+                nn.Linear(qdim, temporal_hidden),
+                nn.GELU(),
+                nn.LayerNorm(temporal_hidden),
+                nn.Dropout(dropout),
+            )
+        else:
+            self.quat_proj = None
         self.classifier = nn.Sequential(
             nn.LayerNorm(temporal_hidden),
             nn.Linear(temporal_hidden, temporal_hidden),
@@ -123,17 +128,18 @@ class CorrQCCNet(nn.Module):
         attn = torch.softmax(self.attn(h).squeeze(-1), dim=1)
         pooled = (h * attn.unsqueeze(-1)).sum(dim=1)
 
-        with torch.no_grad():
-            tgt_step, tgt_skip = target_corr_quats(x)
-            cyc = quat_mul(tgt_step[:, 1:], tgt_step[:, :-1])
-            cyc_err = 1.0 - (cyc * tgt_skip).sum(dim=-1).abs().clamp(0.0, 1.0)
-            qvec = torch.cat([
-                tgt_step.reshape(x.size(0), -1),
-                tgt_skip.reshape(x.size(0), -1),
-                cyc.reshape(x.size(0), -1),
-                cyc_err.reshape(x.size(0), -1),
-            ], dim=1)
-        pooled = pooled + self.quat_proj(qvec)
+        if self.quat_proj is not None:
+            with torch.no_grad():
+                tgt_step, tgt_skip = target_corr_quats(x)
+                cyc = quat_mul(tgt_step[:, 1:], tgt_step[:, :-1])
+                cyc_err = 1.0 - (cyc * tgt_skip).sum(dim=-1).abs().clamp(0.0, 1.0)
+                qvec = torch.cat([
+                    tgt_step.reshape(x.size(0), -1),
+                    tgt_skip.reshape(x.size(0), -1),
+                    cyc.reshape(x.size(0), -1),
+                    cyc_err.reshape(x.size(0), -1),
+                ], dim=1)
+            pooled = pooled + self.quat_proj(qvec)
         logits = self.classifier(pooled)
 
         step_pair = torch.cat([h[:, :-1], h[:, 1:], h[:, 1:] - h[:, :-1]], dim=-1)
@@ -231,14 +237,15 @@ def parse_args():
     ap.add_argument("--wd", type=float, default=0.04)
     ap.add_argument("--ema-decay", type=float, default=0.995)
     ap.add_argument("--label-smoothing", type=float, default=0.08)
-    ap.add_argument("--qcc-weight", type=float, default=0.04)
-    ap.add_argument("--cycle-weight", type=float, default=0.04)
+    ap.add_argument("--qcc-weight", type=float, default=0.0)
+    ap.add_argument("--cycle-weight", type=float, default=0.0)
     ap.add_argument("--dropout", type=float, default=0.30)
     ap.add_argument("--point-hidden", type=int, default=128)
     ap.add_argument("--temporal-hidden", type=int, default=192)
     ap.add_argument("--layers", type=int, default=2)
     ap.add_argument("--jitter", type=float, default=0.006)
     ap.add_argument("--point-drop", type=float, default=0.08)
+    ap.add_argument("--quat-inject", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--seed", type=int, default=23)
     ap.add_argument("--no-amp", action="store_true")
     ap.add_argument("--publish-active", action=argparse.BooleanOptionalAction, default=True)
@@ -296,6 +303,7 @@ def main():
         temporal_hidden=args.temporal_hidden,
         layers=args.layers,
         dropout=args.dropout,
+        quat_inject=args.quat_inject,
     ).to(device)
     ema = copy.deepcopy(model).to(device)
     for p in ema.parameters():
@@ -315,7 +323,7 @@ def main():
     params_m = sum(p.numel() for p in model.parameters()) / 1e6
     write(f"CorrQCCNet params={params_m:.3f}M train={len(train_ds)} valid={len(valid_ds)} frames={args.frames} points={args.points}")
     write(f"lr={args.lr:g} min_lr={args.min_lr:g} warmup={args.warmup_epochs} wd={args.wd:g} ema={args.ema_decay:g} qcc={args.qcc_weight:g} cycle={args.cycle_weight:g}")
-    write(f"dropout={args.dropout:g} point_hidden={args.point_hidden} temporal_hidden={args.temporal_hidden} layers={args.layers} jitter={args.jitter:g} point_drop={args.point_drop:g}")
+    write(f"dropout={args.dropout:g} point_hidden={args.point_hidden} temporal_hidden={args.temporal_hidden} layers={args.layers} jitter={args.jitter:g} point_drop={args.point_drop:g} quat_inject={args.quat_inject}")
 
     best_branch = 0.0
     best_fused = log_prob_fusion(base_logits, np.zeros_like(base_logits), valid_labels)
