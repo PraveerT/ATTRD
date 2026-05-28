@@ -84,6 +84,38 @@ This mechanism is classifier-tied. Unlike the earlier auxiliary QCC head, the
 cycle loss directly constrains the class evidence under quaternion rotation
 cycles, so it cannot improve unless the classifier benefits.
 
+
+## Matched Seed Stability Check
+
+The `+0.41pp` active-run improvement was tested with four additional matched
+clean/q-rotation-cycle seeds. These runs used the same f16/p128 correspondence
+architecture, no old QCC auxiliary loss, no old cycle loss, and no Kabsch-quat
+feature injection. The q-rotation-cycle condition only adds:
+
+- `--rot-cycle-weight 0.02`
+- `--rot-aug-ce-weight 0.0`
+- `--rot-cycle-prob 1.0`
+
+Results from `/notebooks/Anemon/experiments/work_dir/qrot_seed_ablation_results.json`:
+
+| Seed | Clean fused | Q-rot-cycle fused | Delta |
+| ---: | ---: | ---: | ---: |
+| `31` | `85.477` | `86.100` | `+0.622` |
+| `37` | `85.062` | `85.270` | `+0.207` |
+| `43` | `85.477` | `86.307` | `+0.830` |
+| `47` | `85.477` | `85.685` | `+0.207` |
+
+Aggregate over the four added seeds:
+
+- Mean fused improvement: `+0.467pp`.
+- Sample standard deviation: `0.311pp`.
+- Direction: `4/4` seeds positive.
+
+Including the original seed-29 active/control pair gives `5/5` positive seeds
+and about `+0.456pp` mean fused improvement. Because the validation split has
+482 samples, one corrected sample is about `0.207pp`; the observed effect is
+small but consistently positive across the matched runs.
+
 ## Files
 
 - `train_corr_qcc_fusion.py`
@@ -153,12 +185,14 @@ For the clean best run:
 ## Current Goal
 
 The current target is to improve beyond `85.89` while keeping the clean `85.48`
-control as the ablation baseline.
+control as the ablation baseline. The matched multi-seed check is now complete
+and supports a small but repeatable q-rotation-cycle gain.
 
-Next controls to run before any paper claim:
+Remaining controls before any paper claim:
 
-1. Repeat the light q-rot cycle run with at least one additional seed.
-2. Run a matched random-rotation augmentation without the inverse-cycle KL term.
-3. Run a matched consistency term without quaternion rotations, if possible.
-4. Lock fusion parameters on a calibration split before reporting held-out
+1. Run a matched random-rotation augmentation without the inverse-cycle KL term.
+2. Run a matched consistency term without quaternion rotations, if possible.
+3. Lock fusion parameters on a calibration split before reporting held-out
    accuracy.
+4. Scale the correspondence encoder cautiously while preserving the verified
+   q-rotation-cycle ablation path.
