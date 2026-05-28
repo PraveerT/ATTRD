@@ -53,6 +53,49 @@ def normalize_corr(x):
     return centered / scale
 
 
+def quat_conj(q):
+    return torch.cat([q[..., :1], -q[..., 1:]], dim=-1)
+
+
+def random_unit_quat(batch, device, dtype):
+    u1 = torch.rand(batch, device=device, dtype=dtype)
+    u2 = torch.rand(batch, device=device, dtype=dtype)
+    u3 = torch.rand(batch, device=device, dtype=dtype)
+    two_pi = 2.0 * math.pi
+    q = torch.stack([
+        torch.sqrt(1.0 - u1) * torch.sin(two_pi * u2),
+        torch.sqrt(1.0 - u1) * torch.cos(two_pi * u2),
+        torch.sqrt(u1) * torch.sin(two_pi * u3),
+        torch.sqrt(u1) * torch.cos(two_pi * u3),
+    ], dim=-1)
+    # Return scalar-first convention used by the rest of this file.
+    return torch.stack([q[:, 3], q[:, 0], q[:, 1], q[:, 2]], dim=-1)
+
+
+def quat_to_rotmat(q):
+    q = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    w, x, y, z = q.unbind(dim=-1)
+    ww, xx, yy, zz = w * w, x * x, y * y, z * z
+    wx, wy, wz = w * x, w * y, w * z
+    xy, xz, yz = x * y, x * z, y * z
+    return torch.stack([
+        ww + xx - yy - zz, 2 * (xy - wz), 2 * (xz + wy),
+        2 * (xy + wz), ww - xx + yy - zz, 2 * (yz - wx),
+        2 * (xz - wy), 2 * (yz + wx), ww - xx - yy + zz,
+    ], dim=-1).view(q.size(0), 3, 3)
+
+
+def rotate_corr(corr, q):
+    rot = quat_to_rotmat(q).to(dtype=corr.dtype)
+    return torch.einsum("btpc,bcd->btpd", corr, rot)
+
+
+def consistency_kl(student_logits, teacher_logits):
+    teacher = F.softmax(teacher_logits.detach().float(), dim=1)
+    log_student = F.log_softmax(student_logits.float(), dim=1)
+    return F.kl_div(log_student, teacher, reduction="batchmean")
+
+
 class CorrQCCNet(nn.Module):
     def __init__(
         self,
@@ -239,6 +282,9 @@ def parse_args():
     ap.add_argument("--label-smoothing", type=float, default=0.08)
     ap.add_argument("--qcc-weight", type=float, default=0.0)
     ap.add_argument("--cycle-weight", type=float, default=0.0)
+    ap.add_argument("--rot-cycle-weight", type=float, default=0.0)
+    ap.add_argument("--rot-aug-ce-weight", type=float, default=0.0)
+    ap.add_argument("--rot-cycle-prob", type=float, default=1.0)
     ap.add_argument("--dropout", type=float, default=0.30)
     ap.add_argument("--point-hidden", type=int, default=128)
     ap.add_argument("--temporal-hidden", type=int, default=192)
@@ -322,7 +368,7 @@ def main():
 
     params_m = sum(p.numel() for p in model.parameters()) / 1e6
     write(f"CorrQCCNet params={params_m:.3f}M train={len(train_ds)} valid={len(valid_ds)} frames={args.frames} points={args.points}")
-    write(f"lr={args.lr:g} min_lr={args.min_lr:g} warmup={args.warmup_epochs} wd={args.wd:g} ema={args.ema_decay:g} qcc={args.qcc_weight:g} cycle={args.cycle_weight:g}")
+    write(f"lr={args.lr:g} min_lr={args.min_lr:g} warmup={args.warmup_epochs} wd={args.wd:g} ema={args.ema_decay:g} qcc={args.qcc_weight:g} cycle={args.cycle_weight:g} rot_cycle={args.rot_cycle_weight:g} rot_aug_ce={args.rot_aug_ce_weight:g} rot_prob={args.rot_cycle_prob:g}")
     write(f"dropout={args.dropout:g} point_hidden={args.point_hidden} temporal_hidden={args.temporal_hidden} layers={args.layers} jitter={args.jitter:g} point_drop={args.point_drop:g} quat_inject={args.quat_inject}")
 
     best_branch = 0.0
@@ -337,7 +383,7 @@ def main():
             group["lr"] = lr
         model.train()
         t0 = time.time()
-        total_loss = total_ce = total_q = total_c = 0.0
+        total_loss = total_ce = total_q = total_c = total_rot = 0.0
         correct = seen = 0
         for bi, (corr, labels, _sigs) in enumerate(train_loader, 1):
             corr = corr.to(device, non_blocking=True)
@@ -348,6 +394,25 @@ def main():
                 ce = loss_fn(logits, labels)
                 qloss, closs = qcc_loss(step, skip, corr)
                 loss = ce + args.qcc_weight * qloss + args.cycle_weight * closs
+                rot_loss = torch.zeros((), device=device, dtype=loss.dtype)
+                if (
+                    (args.rot_cycle_weight > 0.0 or args.rot_aug_ce_weight > 0.0)
+                    and random.random() < args.rot_cycle_prob
+                ):
+                    qrot = random_unit_quat(corr.size(0), corr.device, corr.dtype)
+                    corr_rot = rotate_corr(corr, qrot)
+                    corr_cycle = rotate_corr(corr_rot, quat_conj(qrot))
+                    rot_logits = model(corr_rot)[0]
+                    cycle_logits = model(corr_cycle)[0]
+                    if args.rot_aug_ce_weight > 0.0:
+                        rot_loss = rot_loss + args.rot_aug_ce_weight * loss_fn(rot_logits, labels)
+                    if args.rot_cycle_weight > 0.0:
+                        rot_loss = rot_loss + args.rot_cycle_weight * (
+                            consistency_kl(rot_logits, logits)
+                            + consistency_kl(cycle_logits, logits)
+                            + consistency_kl(cycle_logits, rot_logits)
+                        ) / 3.0
+                    loss = loss + rot_loss
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
@@ -359,6 +424,7 @@ def main():
             total_ce += ce.detach().float().item() * bs
             total_q += qloss.detach().float().item() * bs
             total_c += closs.detach().float().item() * bs
+            total_rot += rot_loss.detach().float().item() * bs
             correct += (logits.argmax(dim=1) == labels).sum().item()
             seen += bs
             if bi == total_batches or bi % 10 == 0:
@@ -369,7 +435,7 @@ def main():
         train_acc = correct / max(1, seen) * 100.0
         write(
             f"ep{ep:3d} tr_loss={total_loss/max(1,seen):.4f} ce={total_ce/max(1,seen):.4f} "
-            f"q={total_q/max(1,seen):.4f} cyc={total_c/max(1,seen):.4f} tr_acc={train_acc:.2f}% "
+            f"q={total_q/max(1,seen):.4f} cyc={total_c/max(1,seen):.4f} rot={total_rot/max(1,seen):.4f} tr_acc={train_acc:.2f}% "
             f"branch={branch_p1:.2f}%/{branch_p5:.2f}% fused={fused['top1']:.2f}%/{fused['top5']:.2f}% "
             f"w={fused['w']:.2f} tb={fused['tb']:.2f} tc={fused['tc']:.2f} "
             f"best_fused={best_fused['top1']:.2f}% @ ep{best_ep} dt={time.time()-t0:.1f}s"

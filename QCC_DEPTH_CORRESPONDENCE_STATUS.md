@@ -1,33 +1,34 @@
-# Depth Correspondence Control Status
+# Depth Correspondence Quaternion-Cycle Status
 
 Date: 2026-05-28
 
 ## Current State
 
-The clean depth-correspondence control is now the active depth-side result.
+The quaternion rotation-cycle correspondence run is now the active depth-side
+result. It is the first quaternion/cycle mechanism in this line of experiments
+that beats the clean correspondence control.
 
 - Active app logits:
   - `/notebooks/Anemon/experiments/work_dir/depth_small/best_logits.npz`
   - `/notebooks/Anemon/experiments/work_dir/depth_small/test_logits.npz`
-- Source clean run:
-  - `/notebooks/Anemon/experiments/work_dir/depth_corr_qcc_f16p128_ceonly_noqinject/best_fused_logits.npz`
-  - `/notebooks/Anemon/experiments/work_dir/depth_corr_qcc_f16p128_ceonly_noqinject/best_model.pt`
-  - `/notebooks/Anemon/experiments/work_dir/depth_corr_qcc_f16p128_ceonly_noqinject/log.txt`
+- Source active run:
+  - `/notebooks/Anemon/experiments/work_dir/depth_corr_qrotcycle_f16p128_w002_ce0/best_fused_logits.npz`
+  - `/notebooks/Anemon/experiments/work_dir/depth_corr_qrotcycle_f16p128_w002_ce0/best_model.pt`
+  - `/notebooks/Anemon/experiments/work_dir/depth_corr_qrotcycle_f16p128_w002_ce0/log.txt`
 - Public status endpoint:
   - `https://viz-qcc-production.up.railway.app/api/anemon-status`
 
 Current active result:
 
 - Depth fg83 baseline: `83.61` top-1, `96.47` top-5.
-- Clean correspondence branch alone: `67.01` top-1, `86.31` top-5.
-- fg83 depth + clean correspondence fusion: `85.48` top-1, `96.06` top-5.
-- Best fused epoch: `202`.
-- Branch size: `0.689M` parameters with Kabsch-quat injection disabled.
+- Quaternion-cycle branch alone: `64.73` top-1, `87.97` top-5.
+- fg83 depth + quaternion-cycle fusion: `85.89` top-1, `96.06` top-5.
+- Best fused epoch: `117`.
+- Branch size: `0.814M` parameters.
 
-This is the clean baseline to keep. It uses the depth-derived correspondence
-pointcloud sequence and the GRU/attention branch, but it does not use the
-decorative QCC loss and does not inject Kabsch quaternion target features into
-the classifier.
+The clean `85.48` correspondence branch remains the control baseline. The
+current active model adds a small quaternion rotation-cycle consistency loss
+over classifier outputs and improves fused accuracy by `+0.41pp`.
 
 ## What The Controls Showed
 
@@ -58,14 +59,43 @@ Loss behavior:
   the cycle term was mostly enforcing an internally consistent but non-useful
   quaternion solution.
 
+## Quaternion-Cycle Improvement
+
+The successful follow-up is `depth_corr_qrotcycle_f16p128_w002_ce0`.
+
+| Run | Rot-cycle weight | Rotated CE weight | Branch solo | Fused | Delta vs clean |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Clean control | `0` | `0` | `67.01` | `85.48` | `0.00` |
+| Heavy q-rot cycle | `0.05` | `0.25` | `63.69` | `85.48` | `0.00` |
+| Light q-rot cycle | `0.02` | `0` | `64.73` | `85.89` | `+0.41` |
+
+Mechanism:
+
+1. Sample a random unit quaternion.
+2. Rotate the 3D correspondence cloud by that quaternion.
+3. Rotate the transformed cloud back by the inverse quaternion, forming a
+   rotation cycle.
+4. Penalize KL prediction drift across original, rotated, and inverse-cycled
+   views.
+5. Do not add rotated-view cross entropy for the best run; the heavy rotated CE
+   variant hurt branch accuracy and only tied the clean fused result.
+
+This mechanism is classifier-tied. Unlike the earlier auxiliary QCC head, the
+cycle loss directly constrains the class evidence under quaternion rotation
+cycles, so it cannot improve unless the classifier benefits.
+
 ## Files
 
 - `train_corr_qcc_fusion.py`
   - Current clean branch trainer.
-  - Defaults now match the clean baseline:
+  - Defaults still match the clean baseline:
     - `--qcc-weight 0`
     - `--cycle-weight 0`
     - `--no-quat-inject`
+  - Quaternion rotation-cycle consistency is available through:
+    - `--rot-cycle-weight`
+    - `--rot-aug-ce-weight`
+    - `--rot-cycle-prob`
   - The old QCC loss and Kabsch injection options remain available as explicit
     ablation flags, but they are not the default path.
 
@@ -122,25 +152,13 @@ For the clean best run:
 
 ## Current Goal
 
-We still need a real quaternion/cycle contribution. The next experiments should
-start from the clean `85.48` branch and add quaternion/cycle structure only if
-it improves over this control.
+The current target is to improve beyond `85.89` while keeping the clean `85.48`
+control as the ablation baseline.
 
-Acceptable next target:
+Next controls to run before any paper claim:
 
-- `>85.48` fused while preserving the same validation protocol.
-- The improvement must disappear or shrink in a matched ablation without the
-  proposed quaternion/cycle mechanism.
-
-Near-term direction:
-
-1. Keep the clean branch as the baseline.
-2. Add a non-degenerate quaternion cycle objective that cannot be satisfied by
-   near-identity quaternions.
-3. Tie quaternion predictions to class evidence or feature transport, not just
-   an auxiliary head.
-4. Report both the full model and matched controls:
-   - clean CE branch
-   - quaternion feature only
-   - cycle objective only
-   - full quaternion+cycle mechanism
+1. Repeat the light q-rot cycle run with at least one additional seed.
+2. Run a matched random-rotation augmentation without the inverse-cycle KL term.
+3. Run a matched consistency term without quaternion rotations, if possible.
+4. Lock fusion parameters on a calibration split before reporting held-out
+   accuracy.
