@@ -72,6 +72,29 @@ def random_unit_quat(batch, device, dtype):
     return torch.stack([q[:, 3], q[:, 0], q[:, 1], q[:, 2]], dim=-1)
 
 
+def sample_rotation_quat(batch, device, dtype, mode="uniform", max_angle_deg=20.0):
+    mode = str(mode).lower()
+    if mode == "uniform":
+        return random_unit_quat(batch, device, dtype)
+    angle = (torch.rand(batch, device=device, dtype=dtype) * 2.0 - 1.0)
+    angle = angle * math.radians(float(max_angle_deg))
+    if mode == "z":
+        axis = torch.zeros(batch, 3, device=device, dtype=dtype)
+        axis[:, 2] = 1.0
+    elif mode == "y":
+        axis = torch.zeros(batch, 3, device=device, dtype=dtype)
+        axis[:, 1] = 1.0
+    elif mode == "x":
+        axis = torch.zeros(batch, 3, device=device, dtype=dtype)
+        axis[:, 0] = 1.0
+    elif mode == "small-so3":
+        axis = torch.randn(batch, 3, device=device, dtype=dtype)
+        axis = axis / axis.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    else:
+        raise ValueError(f"unknown rot mode: {mode}")
+    return axis_angle_to_quat(axis * angle.unsqueeze(-1))
+
+
 def quat_to_rotmat(q):
     q = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-8)
     w, x, y, z = q.unbind(dim=-1)
@@ -90,10 +113,21 @@ def rotate_corr(corr, q):
     return torch.einsum("btpc,bcd->btpd", corr, rot)
 
 
-def consistency_kl(student_logits, teacher_logits):
+def consistency_kl(student_logits, teacher_logits, conf_thresh=0.0, conf_power=0.0):
     teacher = F.softmax(teacher_logits.detach().float(), dim=1)
     log_student = F.log_softmax(student_logits.float(), dim=1)
-    return F.kl_div(log_student, teacher, reduction="batchmean")
+    per_sample = F.kl_div(log_student, teacher, reduction="none").sum(dim=1)
+    weight = None
+    conf = teacher.max(dim=1).values
+    if conf_thresh > 0.0:
+        weight = (conf >= float(conf_thresh)).float()
+    if conf_power > 0.0:
+        conf_weight = conf.clamp_min(1e-6).pow(float(conf_power))
+        weight = conf_weight if weight is None else weight * conf_weight
+    if weight is not None:
+        return (per_sample * weight).sum() / weight.sum().clamp_min(1.0)
+    return per_sample.mean()
+
 
 
 class CorrQCCNet(nn.Module):
@@ -285,6 +319,10 @@ def parse_args():
     ap.add_argument("--rot-cycle-weight", type=float, default=0.0)
     ap.add_argument("--rot-aug-ce-weight", type=float, default=0.0)
     ap.add_argument("--rot-cycle-prob", type=float, default=1.0)
+    ap.add_argument("--rot-mode", choices=["uniform", "small-so3", "x", "y", "z"], default="uniform")
+    ap.add_argument("--rot-max-angle-deg", type=float, default=20.0)
+    ap.add_argument("--rot-conf-thresh", type=float, default=0.0)
+    ap.add_argument("--rot-conf-power", type=float, default=0.0)
     ap.add_argument("--dropout", type=float, default=0.30)
     ap.add_argument("--point-hidden", type=int, default=128)
     ap.add_argument("--temporal-hidden", type=int, default=192)
@@ -369,6 +407,7 @@ def main():
     params_m = sum(p.numel() for p in model.parameters()) / 1e6
     write(f"CorrQCCNet params={params_m:.3f}M train={len(train_ds)} valid={len(valid_ds)} frames={args.frames} points={args.points}")
     write(f"lr={args.lr:g} min_lr={args.min_lr:g} warmup={args.warmup_epochs} wd={args.wd:g} ema={args.ema_decay:g} qcc={args.qcc_weight:g} cycle={args.cycle_weight:g} rot_cycle={args.rot_cycle_weight:g} rot_aug_ce={args.rot_aug_ce_weight:g} rot_prob={args.rot_cycle_prob:g}")
+    write(f"rot_mode={args.rot_mode} rot_max_angle_deg={args.rot_max_angle_deg:g} rot_conf_thresh={args.rot_conf_thresh:g} rot_conf_power={args.rot_conf_power:g}")
     write(f"dropout={args.dropout:g} point_hidden={args.point_hidden} temporal_hidden={args.temporal_hidden} layers={args.layers} jitter={args.jitter:g} point_drop={args.point_drop:g} quat_inject={args.quat_inject}")
 
     best_branch = 0.0
@@ -399,7 +438,13 @@ def main():
                     (args.rot_cycle_weight > 0.0 or args.rot_aug_ce_weight > 0.0)
                     and random.random() < args.rot_cycle_prob
                 ):
-                    qrot = random_unit_quat(corr.size(0), corr.device, corr.dtype)
+                    qrot = sample_rotation_quat(
+                        corr.size(0),
+                        corr.device,
+                        corr.dtype,
+                        mode=args.rot_mode,
+                        max_angle_deg=args.rot_max_angle_deg,
+                    )
                     corr_rot = rotate_corr(corr, qrot)
                     corr_cycle = rotate_corr(corr_rot, quat_conj(qrot))
                     rot_logits = model(corr_rot)[0]
@@ -408,9 +453,9 @@ def main():
                         rot_loss = rot_loss + args.rot_aug_ce_weight * loss_fn(rot_logits, labels)
                     if args.rot_cycle_weight > 0.0:
                         rot_loss = rot_loss + args.rot_cycle_weight * (
-                            consistency_kl(rot_logits, logits)
-                            + consistency_kl(cycle_logits, logits)
-                            + consistency_kl(cycle_logits, rot_logits)
+                            consistency_kl(rot_logits, logits, args.rot_conf_thresh, args.rot_conf_power)
+                            + consistency_kl(cycle_logits, logits, args.rot_conf_thresh, args.rot_conf_power)
+                            + consistency_kl(cycle_logits, rot_logits, args.rot_conf_thresh, args.rot_conf_power)
                         ) / 3.0
                     loss = loss + rot_loss
             scaler.scale(loss).backward()
